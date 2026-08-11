@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Cross-window speaker linking for a MOSS windowed run.
+
+Pipeline
+  1. aggregate the per-segment WeSpeaker embeddings into one vector per
+     (window, local_speaker)  -- plain centroid of L2-normalised vectors,
+     re-normalised: the strategy that won the enrollment sweep.
+  2. cluster the CORE aggregates (>= --min-core seconds of embedded speech)
+     with agglomerative average-linkage on cosine distance, cut at a distance
+     threshold.  k is whatever falls out; MOSS's count and the true count are
+     never used.
+  3. optionally refine: recompute global centroids, reassign every aggregate to
+     its nearest centroid, iterate.
+  4. weak aggregates (below --min-core, or with no embeddable segment at all)
+     are attached to the nearest global centroid.
+  5. write the run back out with a `global` field per segment.
+
+k is also estimated independently by eigengap and by silhouette, purely as a
+cross-check on the threshold-based k.
+"""
+import argparse, json, os, sys
+import numpy as np
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+
+_here = os.path.dirname(os.path.abspath(__file__))
+for _p in (_here, os.path.dirname(_here), os.path.dirname(os.path.dirname(_here))):
+    sys.path.insert(0, _p)
+import cluster_speakers
+
+
+def load(run_path, npz_path):
+    R = json.load(open(run_path))
+    z = np.load(npz_path, allow_pickle=True)
+    E = z["emb"]
+    seg_idx = z["seg_idx"]
+    meta = json.loads(str(z["meta"]))
+    return R, E, seg_idx, meta
+
+
+def load_prosody(npz_path):
+    """Per-segment pitch/spectral descriptors, or None for a pre-prosody npz."""
+    z = np.load(npz_path, allow_pickle=True)
+    return z["pros"] if "pros" in z.files else None
+
+
+def aggregate(R, E, seg_idx, meta):
+    """-> keys, A (n_keys,D), secs, nsegs, key_of_segment(list per segment)."""
+    pos = {int(s): i for i, s in enumerate(seg_idx)}
+    buckets, secs, nseg = {}, {}, {}
+    key_of = []
+    for m in meta:
+        k = (m["window"], m["local"])
+        key_of.append(k)
+        secs.setdefault(k, 0.0)
+        nseg.setdefault(k, 0)
+        if m["idx"] in pos:
+            buckets.setdefault(k, []).append(pos[m["idx"]])
+            secs[k] += m["dur_used"]
+            nseg[k] += 1
+    keys = sorted(secs)
+    A = np.zeros((len(keys), E.shape[1]), dtype=np.float64)
+    for i, k in enumerate(keys):
+        if k in buckets:
+            v = E[buckets[k]].astype(np.float64).mean(0)
+            nv = np.linalg.norm(v)
+            A[i] = v / nv if nv > 0 else 0.0
+    return keys, A, np.array([secs[k] for k in keys]), np.array([nseg[k] for k in keys]), key_of
+
+
+def eigengap_k(S, kmax=15):
+    """Spectral eigengap on the row-normalised affinity."""
+    Aff = np.clip(S, 0, None)
+    np.fill_diagonal(Aff, 0.0)
+    d = Aff.sum(1)
+    d[d <= 0] = 1e-9
+    L = np.eye(len(Aff)) - (Aff / np.sqrt(np.outer(d, d)))
+    w = np.linalg.eigvalsh(L)[: kmax + 1]
+    gaps = np.diff(w[: kmax + 1])
+    return int(np.argmax(gaps[: kmax]) + 1), w[: kmax + 1]
+
+
+def silhouette_k(D, kmax=15):
+    from sklearn.metrics import silhouette_score
+    Z = linkage(squareform(D, checks=False), method="average")
+    best, scores = None, {}
+    for k in range(2, min(kmax, len(D) - 1) + 1):
+        lab = fcluster(Z, k, criterion="maxclust")
+        if len(set(lab)) < 2:
+            continue
+        s = silhouette_score(D, lab, metric="precomputed")
+        scores[k] = float(s)
+        if best is None or s > scores[best]:
+            best = k
+    return best, scores
+
+
+def cluster(A, secs, thr_cos, min_core, refine_iters):
+    core = np.where(secs >= min_core)[0]
+    Ac = A[core]
+    S = Ac @ Ac.T
+    D = np.clip(1.0 - S, 0, 2)
+    np.fill_diagonal(D, 0.0)
+    Z = linkage(squareform(D, checks=False), method="average")
+    lab_core = fcluster(Z, 1.0 - thr_cos, criterion="distance")
+    labs = sorted(set(lab_core))
+    remap = {l: i for i, l in enumerate(labs)}
+    lab_core = np.array([remap[l] for l in lab_core])
+    k = len(labs)
+
+    def centroids(idx, lab, kk):
+        C = np.zeros((kk, A.shape[1]))
+        for c in range(kk):
+            sel = idx[lab == c]
+            if len(sel):
+                v = A[sel].mean(0)
+                nv = np.linalg.norm(v)
+                C[c] = v / nv if nv > 0 else 0.0
+        return C
+
+    C = centroids(core, lab_core, k)
+    for _ in range(refine_iters):
+        lab_core = np.argmax(Ac @ C.T, axis=1)
+        C = centroids(core, lab_core, k)
+
+    lab = np.full(len(A), -1, dtype=int)
+    lab[core] = lab_core
+    weak = np.where(secs < min_core)[0]
+    for i in weak:
+        lab[i] = int(np.argmax(A[i] @ C.T)) if np.linalg.norm(A[i]) > 0 else -1
+    # final centroids over every assigned aggregate, weighted by embedded seconds
+    Cf = np.zeros_like(C)
+    for c in range(k):
+        sel = np.where(lab == c)[0]
+        sel = sel[np.linalg.norm(A[sel], axis=1) > 0]
+        if len(sel):
+            v = (A[sel] * secs[sel, None]).sum(0) / max(secs[sel].sum(), 1e-9)
+            nv = np.linalg.norm(v)
+            Cf[c] = v / nv if nv > 0 else 0.0
+    return lab, k, core, weak, S, D, Cf
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run", required=True)
+    ap.add_argument("--npz", required=True)
+    ap.add_argument("--ref", default=None)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--thr", default="auto",
+                    help="cosine cut, or 'auto' to self-calibrate per meeting "
+                         "(constrained AHC + max merge-gap; see cluster_speakers.py)")
+    ap.add_argument("--min-core", type=float, default=2.0)
+    ap.add_argument("--refine", type=int, default=3)
+    ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--tag", default="")
+    args = ap.parse_args()
+    fixed_thr = None if str(args.thr).lower() == "auto" else float(args.thr)
+
+    R, E, seg_idx, meta = load(args.run, args.npz)
+    keys, A, secs, nseg, key_of = aggregate(R, E, seg_idx, meta)
+    name = R["audio"].split("/")[-1].replace(".wav", "")
+    empty = int((nseg == 0).sum())
+    print(f"AGG meeting={name} n_local_labels={len(keys)} embeddable={int((nseg>0).sum())} "
+          f"empty={empty} core(>={args.min_core}s)={int((secs>=args.min_core).sum())} "
+          f"median_secs={np.median(secs):.1f} total_secs={secs.sum():.0f}")
+
+    if args.sweep:
+        core = np.where(secs >= args.min_core)[0]
+        Ac = A[core]
+        Sc = Ac @ Ac.T
+        Dc = np.clip(1.0 - Sc, 0, 2); np.fill_diagonal(Dc, 0)
+        ke, w = eigengap_k(Sc.copy())
+        ks, sc = silhouette_k(Dc)
+        print(f"KEST meeting={name} eigengap_k={ke} silhouette_k={ks} "
+              f"sil_scores={ {k: round(v,3) for k,v in sc.items()} }")
+        for t in [0.10, 0.15, 0.20, 0.2656, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]:
+            lab, k, *_ = cluster(A, secs, t, args.min_core, args.refine)
+            print(f"SWEEP meeting={name} thr={t:.4f} k={k}")
+
+    praw = load_prosody(args.npz)
+    P = cluster_speakers.aggregate_prosody(praw, seg_idx, meta, keys)
+    if P is None:
+        print(f"NOTE meeting={name} npz has no prosody -- embedding only. "
+              f"Re-run embed_batched.py to enable pitch fusion.")
+    lab, k, core, weak, S, D, Cf, info = cluster_speakers.cluster(
+        A, secs, keys, min_core=args.min_core, refine_iters=args.refine,
+        thr=fixed_thr, pros=P)
+    sizes = {int(c): float(secs[lab == c].sum()) for c in sorted(set(lab))}
+    tshow = "n/a" if info["threshold"] is None else f"{info['threshold']:.4f}"
+    print(f"CLUSTER meeting={name} prosody={'yes' if P is not None else 'no'} "
+          f"thr={tshow} mode={info['mode']} "
+          f"min_core={args.min_core} refine={args.refine} k_est={k} "
+          f"cannot_link={info['n_cannot_link']} min_k_floor={info['floor']} "
+          f"cluster_secs={ {c: round(v) for c, v in sorted(sizes.items(), key=lambda x:-x[1])} }")
+    if not info["floor_ok"]:
+        # MOSS heard more people at once than the clustering produced. Something
+        # is wrong -- do not let it pass as a clean transcript.
+        print(f"FLOOR-VIOLATION meeting={name} k_est={k} < min_k_floor={info['floor']}: "
+              f"MOSS labelled {info['floor']} distinct speakers inside one window, so "
+              f"the clustering has collapsed people together.")
+
+    lab_of_key = {kk: int(lab[i]) for i, kk in enumerate(keys)}
+    for i, s in enumerate(R["segments"]):
+        s["global"] = f"G{lab_of_key[key_of[i]]:02d}"
+    if args.out:
+        json.dump(R, open(args.out, "w"))
+        print(f"WROTE {args.out}")
+        cs = np.array([secs[lab == c].sum() for c in range(k)])
+        np.savez(args.out.replace(".json", "_clusters.npz"),
+                 centroid=Cf.astype(np.float32),
+                 cluster=np.array([f"G{c:02d}" for c in range(k)]),
+                 secs=cs.astype(np.float32), meeting=np.array(name))
+
+    if args.ref:
+        ref = json.load(open(args.ref))
+        # dominant reference speaker per local aggregate, by time overlap
+        rs = sorted({t["speaker"] for t in ref})
+        ridx = {s: i for i, s in enumerate(rs)}
+        ov = {kk: np.zeros(len(rs)) for kk in keys}
+        segtime = {kk: 0.0 for kk in keys}
+        for i, s in enumerate(R["segments"]):
+            kk = key_of[i]
+            segtime[kk] += s["end"] - s["start"]
+            for t in ref:
+                a, b = max(s["start"], t["start"]), min(s["end"], t["end"])
+                if b > a:
+                    ov[kk][ridx[t["speaker"]]] += b - a
+        pure_local = []
+        # row k is the UNASSIGNED bucket (aggregates with no embeddable segment)
+        conf = np.zeros((k + 1, len(rs)))
+        nospeech = np.zeros(k + 1)   # segment time that overlaps no reference turn
+        for i, kk in enumerate(keys):
+            o = ov[kk]
+            row = lab_of_key[kk] if lab_of_key[kk] >= 0 else k
+            if o.sum() > 0:
+                pure_local.append(o.max() / o.sum())
+                conf[row, int(np.argmax(o))] += o.sum()
+            nospeech[row] += max(0.0, segtime[kk] - o.sum())
+        print(f"LOCALPURITY meeting={name} mean={np.mean(pure_local):.3f} "
+              f"median={np.median(pure_local):.3f} frac_below_0.8={np.mean(np.array(pure_local)<0.8):.3f}")
+        print(f"CONF meeting={name} rows=clusters cols={rs} (secs = reference-overlap seconds)")
+        for c in range(k + 1):
+            row = conf[c]
+            nm = f"G{c:02d}" if c < k else "UNASSIGNED"
+            if row.sum() == 0 and nospeech[c] == 0:
+                continue
+            pur = row.max() / row.sum() if row.sum() > 0 else float("nan")
+            top = rs[int(np.argmax(row))] if row.sum() > 0 else "-"
+            print(f"  {nm} ref_secs={row.sum():6.0f} offref_secs={nospeech[c]:5.0f} "
+                  f"purity={pur:.3f} top={top} "
+                  + " ".join(f"{rs[j]}:{row[j]:.0f}" for j in range(len(rs)) if row[j] > 0))
+        # reference-side recall: how much of each speaker landed in its best cluster
+        for j, sp in enumerate(rs):
+            col = conf[:, j]
+            tot = sum(t["end"] - t["start"] for t in ref if t["speaker"] == sp)
+            print(f"  REFSPK {sp} ref_secs={tot:6.0f} captured={col.sum():6.0f} "
+                  f"best_cluster={'G%02d'%int(np.argmax(col)) if int(np.argmax(col))<k else 'UNASSIGNED'} "
+                  f"best_frac={(col.max()/col.sum() if col.sum()>0 else 0):.3f}")
+
+
+if __name__ == "__main__":
+    main()

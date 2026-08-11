@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.npz
+*.json
+!package.json
+*.txt
+!glossary.txt.example
+!requirements.txt
+out/
+inbox/
+runs/

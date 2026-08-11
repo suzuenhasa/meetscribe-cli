@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Transcribe a meeting on the GPU box and drop the transcript in the current directory.
+#
+#   ./transcribe "Product Marketing Meeting.mp3"
+#   ./transcribe podcast.mp3 --overlap 0     # disable window context (default 5s)
+#   ./transcribe podcast.mp3 --glossary "Sreeram Kannan,EigenCloud,EigenDA"
+#   ./transcribe meeting.m4a --thr 0.70     # pin the cut by hand (rarely needed)
+#
+# On --glossary: names the model has never heard come out as the nearest familiar
+# English -- "I'm Sreeram" was transcribed "I'm sure I'm a, I'm", and "EigenCloud"
+# as "Igen Club". Post-hoc search-and-replace cannot fix that safely because the
+# output is valid English, so the words have to reach the decoder. Measured: fixes
+# both, inserts nothing into audio that lacks the terms, and leaves the rest of the
+# transcript 98%% identical. Terms are also read from ./glossary.txt if present, one
+# per line, so you do not have to retype them.
+#
+# Uploads, runs transcribe -> embed -> link -> transcript, brings back the .txt and .json.
+#
+# On --thr: the clustering cut used to be a constant you had to guess per recording setup,
+# and guessing wrong silently merged every speaker into one. It is now self-calibrated per
+# meeting (--thr auto, the default) from MOSS's own within-window speaker labels; see
+# bench/cluster_speakers.py. Pass a number only to override it.
+set -euo pipefail
+
+HOST="${MS_HOST:-msbox}"
+REMOTE="${MS_REMOTE:-${MS_WORK:-/workspace}}"
+THR="auto"
+WINDOW="30"
+OVERLAP="5"
+SRC=""
+GLOSSARY=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --thr)      THR="$2"; shift 2 ;;
+    --glossary) GLOSSARY="$2"; shift 2 ;;
+    --window)  WINDOW="$2"; shift 2 ;;
+    --overlap) OVERLAP="$2"; shift 2 ;;
+    --host)   HOST="$2"; shift 2 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *)        SRC="$1"; shift ;;
+  esac
+done
+[ -f "$SRC" ] || { echo "usage: transcribe <audio-file> [--glossary \"Name,Term\"] [--window 30] [--thr auto]" >&2; exit 2; }
+
+# ./glossary.txt (one term per line, # comments ok) is merged in automatically.
+if [ -f "./glossary.txt" ]; then
+  FILE_TERMS="$(grep -vE '^\s*(#|$)' ./glossary.txt | paste -sd, -)"
+  [ -n "$FILE_TERMS" ] && GLOSSARY="${GLOSSARY:+$GLOSSARY,}$FILE_TERMS"
+fi
+[ -n "$GLOSSARY" ] && echo "==> glossary: $GLOSSARY"
+
+# safe remote name: no spaces or parens to fight with over ssh
+BASE="$(basename "${SRC%.*}")"
+SAFE="$(echo "$BASE" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
+EXT="${SRC##*.}"
+
+echo "==> $BASE"
+ssh "$HOST" "mkdir -p '$REMOTE/inbox' '$REMOTE/out'; supervisorctl stop ray >/dev/null 2>&1 || true"
+
+echo "==> uploading $(du -h "$SRC" | cut -f1)"
+rsync -a --partial "$SRC" "$HOST:$REMOTE/inbox/$SAFE.$EXT"
+
+echo "==> transcribing"
+ssh "$HOST" "
+  set -euo pipefail
+  cd '$REMOTE'
+  export HF_HOME='$REMOTE/.hf_home' OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+         VLLM_LOGGING_LEVEL=WARNING PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+  python3 transcribe_meeting.py '$REMOTE/inbox/$SAFE.$EXT' --window $WINDOW \
+      --overlap $OVERLAP --glossary '$GLOSSARY' \
+      --out '$REMOTE/out/${SAFE}_raw.json' 2>&1 \
+    | grep -E '^gen |silence gate|repetition|windows of' || true
+
+  echo '==> embedding speakers'
+  OMP_NUM_THREADS=4 python3 '$REMOTE/link/embed_batched.py' \
+      --run '$REMOTE/out/${SAFE}_raw.json' --wav '$REMOTE/inbox/$SAFE.$EXT' \
+      --out '$REMOTE/out/${SAFE}_emb.npz' 2>&1 | tail -1
+
+  echo '==> linking speakers (threshold: $THR)'
+  OMP_NUM_THREADS=4 python3 '$REMOTE/link/link.py' --run '$REMOTE/out/${SAFE}_raw.json' \
+      --npz '$REMOTE/out/${SAFE}_emb.npz' --thr $THR \
+      --out '$REMOTE/out/${SAFE}_linked.json' 2>&1 \
+    | grep -E 'k_est=|FLOOR-VIOLATION' || true
+
+  python3 '$REMOTE/mktxt.py' '$REMOTE/out/${SAFE}_linked.json' '$REMOTE/out/${SAFE}_raw.json' \
+      '$REMOTE/out/${SAFE}.txt' '$BASE'
+" 2>&1 | grep -v '^Welcome to vast\|^Have fun\|^AI agents:'
+
+echo "==> retrieving"
+rsync -a "$HOST:$REMOTE/out/${SAFE}.txt" "./${BASE}.txt"
+rsync -a "$HOST:$REMOTE/out/${SAFE}_linked.json" "./${BASE}.json"
+echo "    $(pwd)/${BASE}.txt"
+echo "    $(pwd)/${BASE}.json"
