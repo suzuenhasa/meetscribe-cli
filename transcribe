@@ -2,6 +2,7 @@
 # Transcribe a meeting on the GPU box and drop the transcript in the current directory.
 #
 #   ./transcribe "Product Marketing Meeting.mp3"
+#   ./transcribe ~/recordings/              a whole folder — engine loads ONCE
 #   ./transcribe podcast.mp3 --overlap 0     # disable window context (default 5s)
 #   ./transcribe podcast.mp3 --glossary "Sreeram Kannan,EigenCloud,EigenDA"
 #   ./transcribe standup.mp3 --name G01="Bob Smith"    remember this voice, by name
@@ -47,6 +48,48 @@ while [ $# -gt 0 ]; do
     *)        SRC="$1"; shift ;;
   esac
 done
+# A directory means batch: the engine loads once instead of per file (~66s each),
+# and embedding overlaps the next file's transcription.
+if [ -d "$SRC" ]; then
+  mapfile -t BATCH < <(find "$SRC" -maxdepth 1 -type f \( -iname '*.wav' -o -iname '*.mp3' \
+      -o -iname '*.m4a' -o -iname '*.flac' -o -iname '*.ogg' -o -iname '*.mp4' \
+      -o -iname '*.webm' \) | sort)
+  [ ${#BATCH[@]} -gt 0 ] || { echo "no audio files in $SRC" >&2; exit 2; }
+  echo "==> ${#BATCH[@]} files in $(basename "$SRC")"
+  if [ -f "./glossary.txt" ]; then
+    FILE_TERMS="$(grep -vE '^\s*(#|$)' ./glossary.txt | paste -sd, -)"
+    [ -n "$FILE_TERMS" ] && GLOSSARY="${GLOSSARY:+$GLOSSARY,}$FILE_TERMS"
+  fi
+  [ -n "$GLOSSARY" ] && echo "==> glossary: $GLOSSARY"
+  ssh "$HOST" "mkdir -p '$REMOTE/inbox' '$REMOTE/out'"
+  REMOTE_ARGS=()
+  for f in "${BATCH[@]}"; do
+    b="$(basename "${f%.*}")"; e="${f##*.}"
+    sf="$(echo "$b" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
+    echo "    uploading $(basename "$f")"
+    rsync -a --partial "$f" "$HOST:$REMOTE/inbox/$sf.$e"
+    REMOTE_ARGS+=("$REMOTE/inbox/$sf.$e")
+  done
+  ssh "$HOST" "
+    set -euo pipefail
+    export HF_HOME='$REMOTE/.hf_home' MS_WORK='$REMOTE' OMP_NUM_THREADS=8 \
+           TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
+    cd '$REMOTE'
+    python3 '$REMOTE/batch.py' ${REMOTE_ARGS[*]@Q} --out-dir '$REMOTE/out' \
+      --window $WINDOW --overlap $OVERLAP --thr $THR \
+      --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER")
+  " 2>&1 | grep -v '^Welcome to vast\|^Have fun\|^AI agents:'
+  echo "==> retrieving"
+  for f in "${BATCH[@]}"; do
+    b="$(basename "${f%.*}")"
+    sf="$(echo "$b" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
+    rsync -a "$HOST:$REMOTE/out/${sf}.txt" "./${b}.txt" 2>/dev/null || true
+    rsync -a "$HOST:$REMOTE/out/${sf}_linked.json" "./${b}.json" 2>/dev/null || true
+  done
+  echo "    $(pwd)"
+  exit 0
+fi
+
 [ -f "$SRC" ] || { echo "usage: transcribe <audio-file> [--glossary \"Name,Term\"] [--window 30] [--thr auto]" >&2; exit 2; }
 
 # ./glossary.txt (one term per line, # comments ok) is merged in automatically.

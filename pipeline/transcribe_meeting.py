@@ -18,80 +18,72 @@ SR = 16000
 SILENCE_GATE_DB = -70.0
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("audio")
-    ap.add_argument("--window", type=float, default=30.0)
-    ap.add_argument("--overlap", type=float, default=5.0,
-                    help="seconds of extra audio given to each window on BOTH sides as "
-                         "context. Segments are still only kept from the window's own "
-                         "core, so nothing is duplicated -- this only buys the decoder "
-                         "context across a boundary. A name landing right on a boundary "
-                         "is the known residual failure of --glossary.")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--glossary", default="",
-                    help="comma-separated proper nouns to bias decoding toward, "
-                         "e.g. 'Sreeram Kannan,EigenLayer,EigenCloud'")
-    ap.add_argument("--no-silence-gate", action="store_true",
-                    help="keep segments that sit in digital silence")
-    args = ap.parse_args()
+def build_prompt(glossary=""):
+    """The chat-template prompt, with an optional proper-noun glossary appended.
 
+    Names the model has never seen come out as the nearest familiar English --
+    "I'm Sreeram" was transcribed "I'm sure I'm a, I'm". Post-hoc correction
+    cannot fix that safely because the output is valid English, so the
+    vocabulary has to reach the decoder.
+    """
     proc = AutoProcessor.from_pretrained(MODEL, trust_remote_code=True)
     prompt = DEFAULT_PROMPT
-    if args.glossary:
-        terms = [t.strip() for t in args.glossary.split(",") if t.strip()]
-        if terms:
-            # Names the model has never seen come out as the nearest familiar
-            # English -- "I'm Sreeram" was transcribed "I'm sure I'm a, I'm".
-            # Post-hoc correction cannot fix that safely because the output is
-            # valid English, so the vocabulary has to reach the decoder.
-            prompt += ("\n专有名词表（音频中若出现这些名称，请使用以下拼写）/ "
-                       "Proper nouns that may occur; use exactly these spellings: "
-                       + ", ".join(terms) + ".")
+    terms = [t.strip() for t in (glossary or "").split(",") if t.strip()]
+    if terms:
+        prompt += ("\n专有名词表（音频中若出现这些名称，请使用以下拼写）/ "
+                   "Proper nouns that may occur; use exactly these spellings: "
+                   + ", ".join(terms) + ".")
     msgs = [{"role": "user", "content": [{"type": "audio", "audio": "x"},
                                          {"type": "text", "text": prompt}]}]
-    ptxt = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    return proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
-    wav = load_audio_item(args.audio, sampling_rate=SR)
-    dur = len(wav) / SR
-    print(f"{args.audio}: {dur/60:.2f} min", flush=True)
 
-    w = int(args.window * SR)                 # stride: the core each window owns
-    ctx = int(args.overlap * SR)
+def build_engine(gpu_frac=0.90):
+    """Load vLLM. ~66s, so a batch loads it once and keeps it resident."""
+    t0 = time.time()
+    llm = LLM(model=MODEL, trust_remote_code=True, dtype="bfloat16",
+              gpu_memory_utilization=gpu_frac, max_model_len=8192,
+              limit_mm_per_prompt={"audio": 4})
+    print(f"engine up in {time.time()-t0:.1f}s", flush=True)
+    return llm
+
+
+def plan_windows(wav, ptxt, window, overlap):
+    """-> reqs, offsets, cores. Each window is decoded with `overlap` seconds of
+    context on both sides but only owns the segments whose midpoint lands in its
+    own core, so nothing is duplicated."""
+    w = int(window * SR)
+    ctx = int(overlap * SR)
     reqs, offsets, cores = [], [], []
     for i in range(0, len(wav), w):
         if len(wav[i:i + w]) < SR:
             break
-        a = max(0, i - ctx)                   # context-padded slice actually decoded
+        a = max(0, i - ctx)
         b = min(len(wav), i + w + ctx)
         c = wav[a:b]
         offsets.append(a / SR)
-        # core region in window-local seconds; segments outside it belong to a neighbour
         lo = (i - a) / SR
         hi = lo + w / SR
         if i == 0:
-            lo = 0.0                          # first window owns its own head
+            lo = 0.0
         if i + w >= len(wav):
-            hi = len(c) / SR                  # last window owns the tail
+            hi = len(c) / SR
         cores.append((lo, hi))
         need = w + 2 * ctx
         if len(c) < need:
             c = np.pad(c, (0, need - len(c)))
         reqs.append({"prompt": ptxt, "multi_modal_data": {"audio": (c, SR)}})
-    print(f"{len(reqs)} windows of {args.window:.0f}s"
-          + (f" (+{args.overlap:.0f}s context each side)" if ctx else ""), flush=True)
+    return reqs, offsets, cores
 
-    t0 = time.time()
-    llm = LLM(model=MODEL, trust_remote_code=True, dtype="bfloat16",
-              gpu_memory_utilization=0.90, max_model_len=8192,
-              limit_mm_per_prompt={"audio": 4})
-    print(f"engine up in {time.time()-t0:.1f}s", flush=True)
 
-    mt = int((args.window + 2 * args.overlap) * 20)
-    t1 = time.time()
-    outs = llm.generate(reqs, SamplingParams(temperature=0.0, max_tokens=mt))
-    gen = time.time() - t1
+def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
+    """Turn raw window generations into the final segment list.
 
+    Owns every correctness guard measured for this model: context-padding
+    dedup, seam trimming, the repetition guard, coverage, and the silence
+    gate. Shared by the single-file path and batch.py so the two cannot
+    drift apart.  -> (segments, coverage, capped_windows)
+    """
     capped = [i for i, o in enumerate(outs) if o.outputs[0].finish_reason == "length"]
     if capped:
         print(f"WARNING: {len(capped)} windows hit the token cap: {capped}", flush=True)
@@ -187,7 +179,7 @@ def main():
     # coherent block of speech over nothing -- 123 s of it on ICSI Bed014, worth
     # 3.7 DER points. Swept -80..-45 dB: -70 is the knee. Below it you start
     # trading false alarm for miss and the net goes positive on clean meetings.
-    if not args.no_silence_gate:
+    if not no_silence_gate:
         hop = int(0.01 * SR)
         nf = len(wav) // hop
         rms = np.sqrt((wav[: nf * hop].reshape(nf, hop) ** 2).mean(1) + 1e-12)
@@ -201,6 +193,47 @@ def main():
         if dropped:
             print(f"silence gate ({SILENCE_GATE_DB} dB): dropped {dropped} segments", flush=True)
         segments = kept
+    return segments, cov, capped
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("audio")
+    ap.add_argument("--window", type=float, default=30.0)
+    ap.add_argument("--overlap", type=float, default=5.0,
+                    help="seconds of extra audio given to each window on BOTH sides as "
+                         "context. Segments are still only kept from the window's own "
+                         "core, so nothing is duplicated -- this only buys the decoder "
+                         "context across a boundary. A name landing right on a boundary "
+                         "is the known residual failure of --glossary.")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--glossary", default="",
+                    help="comma-separated proper nouns to bias decoding toward, "
+                         "e.g. 'Sreeram Kannan,EigenLayer,EigenCloud'")
+    ap.add_argument("--no-silence-gate", action="store_true",
+                    help="keep segments that sit in digital silence")
+    args = ap.parse_args()
+
+    ptxt = build_prompt(args.glossary)
+
+    wav = load_audio_item(args.audio, sampling_rate=SR)
+    dur = len(wav) / SR
+    print(f"{args.audio}: {dur/60:.2f} min", flush=True)
+
+    ctx = int(args.overlap * SR)
+    reqs, offsets, cores = plan_windows(wav, ptxt, args.window, args.overlap)
+    print(f"{len(reqs)} windows of {args.window:.0f}s"
+          + (f" (+{args.overlap:.0f}s context each side)" if ctx else ""), flush=True)
+
+    llm = build_engine()
+
+    mt = int((args.window + 2 * args.overlap) * 20)
+    t1 = time.time()
+    outs = llm.generate(reqs, SamplingParams(temperature=0.0, max_tokens=mt))
+    gen = time.time() - t1
+
+    segments, cov, capped = assemble(
+        outs, offsets, cores, wav, dur, args.no_silence_gate)
 
     print(f"\ngen {gen:.1f}s | {len(segments)} segments | coverage {cov:.1%} of speech | "
           f"{dur/gen:.1f}x realtime", flush=True)

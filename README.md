@@ -90,6 +90,28 @@ Writes `weekly sync.txt` and `weekly sync.json` into the current directory. The
 JSON has every segment with start/end times and speaker, for anything you want
 to build on top.
 
+### A whole folder
+
+```bash
+transcribe ~/recordings/
+```
+
+The engine costs ~66 s to load and that is paid **once** for the batch instead of
+once per file, and embedding each meeting overlaps the next one's transcription
+(measured to cost vLLM about 2%, since the two bottleneck on different things).
+Ten short meetings go from ~11 minutes of pure startup to about one.
+
+```
+engine resident after 69.3s — 2 meetings queued
+
+  wrapper test.mp3        3.0 min  transcribed  2.1s   38 segs  coverage 100%
+  later meeting.mp3       2.0 min  transcribed  1.6s   33 segs  coverage 100%
+
+2 meetings, 5 min of audio
+  startup            69.3s  (once, not per meeting)
+  transcribe+embed    7.6s  [overlapped]
+```
+
 Make it a single word — in `~/.bashrc`:
 
 ```bash
