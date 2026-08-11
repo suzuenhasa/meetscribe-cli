@@ -39,6 +39,8 @@ recognised in every meeting after that.
 ./transcribe m.mp3 --roster "Bob Smith,Jane Doe"
 ./transcribe m.mp3 --name G02="Bob Smith"
 
+./speakers who "meeting.json"             the voices, and what each said
+./speakers play "meeting.json" G02        HEAR that voice
 ./speakers list                           who is on file
 ./speakers meetings                       what you can name voices from
 ./speakers name <meeting> G02 "Bob Smith"
@@ -183,8 +185,48 @@ speakers name standup G02 "Bob Smith"       # remember that voice
 transcribe "next week.mp3"                  # Bob Smith
 ```
 
-The cluster IDs (`G02`) are in the `.json`, and `speakers meetings` lists what
-you can name voices from.
+### Working out who G02 is
+
+You cannot name a voice you have not heard. `who` shows every voice with what
+they actually said:
+
+```bash
+speakers who "wrapper test.json"
+```
+
+```
+wrapper test   3.0 min   3 voices
+audio: wrapper test.mp3
+
+  G02     2.0 min   32 turns
+       [0:01:55] And what Ethereum did is expand or modularize the system so that anybody...
+       [0:02:43] year old kid in India from a random like place. He wrote this DeFi program...
+
+  G00     0.3 min   3 turns
+       [0:00:10] Welcome to CSX Week 3. This is Infrastructure Week and we have a lot of...
+
+  G01     0.3 min   5 turns
+       [0:00:34] It's great to talk about what you're up to and also about your journey...
+```
+
+Often the text alone gives it away. When it doesn't, listen — it plays the
+clearest few clips of that voice straight from your audio:
+
+```bash
+speakers play "wrapper test.json" G02        # 3 clips
+speakers play "wrapper test.json" G02 6      # 6 clips
+speakers clips "wrapper test.json" G02       # just the timestamps, no playback
+```
+
+Then name them:
+
+```bash
+speakers name "wrapper test" G02 "Sreeram Kannan"
+```
+
+`who` and `play` read your local transcript and audio, so keep the recording
+beside the `.json`. They need `ffplay` or `mpv` for playback; `ffmpeg` provides
+`ffplay`.
 
 Each run reports what it recognised:
 
@@ -327,7 +369,8 @@ every speaker into one on real-world audio, without any error.
 
 ```
 transcribe              one file or a folder, on the machine with your audio
-speakers                name, rename, forget voices
+speakers                who / play / name / rename / forget
+preview.py              reads the transcript + audio for who / play / clips
 setup.sh                installs everything, locally or onto a box over ssh
 glossary.txt.example    copy to glossary.txt beside your recordings
 
