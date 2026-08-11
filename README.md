@@ -1,9 +1,9 @@
 # meetscribe
 
-Meeting audio in, speaker-attributed transcript out.
+Meeting audio in, speaker-attributed transcript out. Runs on your own hardware.
 
 ```bash
-./transcribe "Product Marketing Meeting (weekly) 2021-06-28.mp3"
+./transcribe "product sync.mp3"
 ```
 
 ```
@@ -21,74 +21,101 @@ Product Marketing Meeting (weekly) 2021-06-28
   I thought we had in Slack sort of farmed each one of them out.
 ```
 
-Runs on your own hardware. A 74-minute recording takes about 25 seconds. Name a
-voice once and it is recognised in every meeting after that.
+A 74-minute recording takes about 25 seconds. Name a voice once and it is
+recognised in every meeting after that.
 
 ---
 
-## What it does
+## Commands
 
-Transcription is [MOSS-Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize)
-on vLLM. That gives text plus speaker labels *within* each 30-second window — but
-window 4's "S01" and window 5's "S01" are not necessarily the same person.
+```bash
+./setup.sh msbox                          install onto a GPU box over ssh
+./setup.sh                                install on this machine (needs the GPU)
+./setup.sh --check                        verify an install, change nothing
 
-Linking them is the other half: [WeSpeaker ResNet293-LM](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet293-LM)
-produces a voice embedding per speech segment, and those are clustered into
-actual speakers across the whole recording.
+./transcribe "meeting.mp3"                one file
+./transcribe ~/recordings/                a folder — engine loads once
+./transcribe m.mp3 --glossary "Acme,Bob Smith"
+./transcribe m.mp3 --roster "Bob Smith,Jane Doe"
+./transcribe m.mp3 --name G02="Bob Smith"
 
-```
-audio ──► MOSS (vLLM)  ──►  text + per-window speaker labels
-             │
-             ▼
-      WeSpeaker ResNet293-LM  ──►  voice embedding per segment
-             │
-             ▼
-      constrained clustering  ──►  Speaker 1, Speaker 2, …
+./speakers list                           who is on file
+./speakers meetings                       what you can name voices from
+./speakers name <meeting> G02 "Bob Smith"
+./speakers rename <id> "New Name"
+./speakers forget <id>
 ```
 
 ---
 
-## Install
+## Setup
 
 You need a machine with an NVIDIA GPU (12 GB VRAM is the practical floor) and
 `ffmpeg`. Everything else installs itself.
 
-**Renting a GPU box** (audio stays on your laptop, only the file being
-transcribed is uploaded):
+### Onto a rented GPU box
+
+Your audio stays on your laptop; only the file being transcribed is uploaded.
+Add the box to `~/.ssh/config`:
+
+```
+Host msbox
+    HostName 203.0.113.42
+    Port 12345
+    User root
+    IdentityFile ~/.ssh/id_rsa
+```
+
+Check it works, then install:
 
 ```bash
-# add the box to ~/.ssh/config as e.g. `msbox`, then:
+ssh msbox 'nvidia-smi --query-gpu=name,memory.total --format=csv,noheader'
 ./setup.sh msbox
 ```
 
-**Installing on the machine you're sitting at**, if it has the GPU:
+### On the machine you're sitting at
+
+If that machine has the GPU:
 
 ```bash
 ./setup.sh
 ```
 
-Either takes about ten minutes, mostly downloading ~2 GB of weights. It is
-idempotent — re-run it any time, and after a container recycle if you're on a
-rented box that wipes `/workspace`.
+Either way it takes about ten minutes, mostly downloading ~2 GB of weights, and
+installs vLLM, MOSS-Transcribe-Diarize, WeSpeaker ResNet293-LM, the pipeline
+scripts, and an empty speaker database.
 
-Verify an install without changing anything:
+It is idempotent — re-run it any time, and after a container recycle if you're on
+a rented box that wipes `/workspace`.
 
 ```bash
-./setup.sh --check
+./setup.sh --check          # verifies everything, changes nothing
 ```
+
+Set `MS_WORK` to install somewhere other than `/workspace`.
 
 ---
 
-## Use
+## Transcribing
 
 ```bash
 cd ~/recordings
 transcribe "weekly sync.mp3"
 ```
 
-Writes `weekly sync.txt` and `weekly sync.json` into the current directory. The
-JSON has every segment with start/end times and speaker, for anything you want
-to build on top.
+Writes `weekly sync.txt` and `weekly sync.json` into the **current directory**.
+The JSON has every segment with start/end times and speaker, for anything you
+want to build on top.
+
+Formats: `wav`, `mp3`, `m4a`, `flac`, `ogg`, `mp4`, `webm`. Any sample rate — it
+resamples.
+
+Make it a single word — in `~/.bashrc`:
+
+```bash
+alias transcribe='~/meetscribe-cli/transcribe'
+alias speakers='~/meetscribe-cli/speakers'
+```
 
 ### A whole folder
 
@@ -96,32 +123,26 @@ to build on top.
 transcribe ~/recordings/
 ```
 
-The engine costs ~66 s to load and that is paid **once** for the batch instead of
-once per file, and embedding each meeting overlaps the next one's transcription
-(measured to cost vLLM about 2%, since the two bottleneck on different things).
-Ten short meetings go from ~11 minutes of pure startup to about one.
-
 ```
-engine resident after 69.3s — 2 meetings queued
+engine resident after 68.9s — 2 meetings queued
 
   wrapper test.mp3        3.0 min  transcribed  2.1s   38 segs  coverage 100%
   later meeting.mp3       2.0 min  transcribed  1.6s   33 segs  coverage 100%
 
 2 meetings, 5 min of audio
-  startup            69.3s  (once, not per meeting)
-  transcribe+embed    7.6s  [overlapped]
+  startup            68.9s  (once, not per meeting)
+  transcribe+embed    7.7s  [overlapped]
 ```
 
-Make it a single word — in `~/.bashrc`:
+The engine costs ~66 s to load and that is paid **once** for the batch rather
+than once per file, and each meeting's embedding overlaps the next one's
+transcription — measured to cost vLLM about 2%, because the two bottleneck on
+different things. Ten short meetings go from about eleven minutes of pure startup
+to one.
 
-```bash
-alias transcribe='~/meetscribe-cli/transcribe'
-```
+---
 
-Formats: `wav`, `mp3`, `m4a`, `flac`, `ogg`, `mp4`, `webm`. Any sample rate —
-it resamples.
-
-### Names it has never heard
+## Names it has never heard
 
 Proper nouns the model doesn't know are not misspelled, they are **replaced by
 similar-sounding English**. `"I'm Sreeram"` came out as `"I'm sure I'm a, I'm"`;
@@ -129,17 +150,18 @@ similar-sounding English**. `"I'm Sreeram"` came out as `"I'm sure I'm a, I'm"`;
 because the output is valid English.
 
 Tell the decoder the words exist. Drop a `glossary.txt` in the directory you run
-from — picked up automatically, no flag:
+from — it is picked up automatically, no flag:
 
 ```
-# one term per line
+# one term per line, # for comments
 Sreeram Kannan
 EigenCloud
 EigenLayer
 ```
 
 On a 32-minute podcast this took proper nouns from almost all wrong to 51 of 52
-correct. It does not insert the terms into audio that lacks them.
+correct. It does not insert the terms into audio that lacks them — that was
+checked against a recording containing none of them.
 
 Or inline, for a one-off:
 
@@ -153,13 +175,18 @@ transcribe podcast.mp3 --glossary "Sreeram Kannan,EigenCloud"
 
 By default everyone is `Speaker 1`, `Speaker 2` — correct within one recording,
 but Monday's "Speaker 1" has nothing to do with Tuesday's. Name someone once and
-they are recognised in every meeting after that.
+they are recognised from then on.
 
 ```bash
-transcribe standup.mp3            # Speaker 1, Speaker 2, Speaker 3
-speakers name standup G02 "Bob Smith"
-transcribe "next week.mp3"        # Bob Smith
+transcribe standup.mp3                      # Speaker 1, Speaker 2, Speaker 3
+speakers name standup G02 "Bob Smith"       # remember that voice
+transcribe "next week.mp3"                  # Bob Smith
 ```
+
+The cluster IDs (`G02`) are in the `.json`, and `speakers meetings` lists what
+you can name voices from.
+
+Each run reports what it recognised:
 
 ```
 identify: 4 voices in this meeting, 3 enrolled candidates
@@ -169,20 +196,12 @@ identify: 4 voices in this meeting, 3 enrolled candidates
     G03       31s  -                      0.201
 ```
 
-`=` recognised, `?` too close to call, blank is nobody on file. A voice is only
-matched if it clears **0.55** *and* beats the runner-up by **0.10**; between 0.40
-and 0.55 a person decides; below that it is treated as new. Those numbers are
-measured for centroid-to-centroid comparison and are not valid at any other
+`=` recognised, `?` too close to call, blank is nobody on file. A voice is
+matched only if it clears **0.55** *and* beats the runner-up by **0.10**; between
+0.40 and 0.55 a person decides; below that it is treated as new. Those numbers
+are measured for centroid-to-centroid comparison and are not valid at any other
 level — a threshold fitted on clip-to-clip produced 8 false accepts out of 30
 when applied here.
-
-```bash
-speakers list                       # who is on file
-speakers meetings                   # what you can name voices from
-speakers name <meeting> G02 "Name"
-speakers rename <id> "New Name"
-speakers forget <id>                # delete a person and their voiceprints
-```
 
 Acceptance is a max over the whole gallery, so false accepts grow with its size.
 If you know who is in the room, say so — scoring 3 people is far safer than 500:
@@ -197,11 +216,19 @@ You can also name someone during the run:
 transcribe standup.mp3 --name G02="Bob Smith"
 ```
 
+Managing the store:
+
+```bash
+speakers list                     # id, name, sessions, speech on file
+speakers rename 3 "Robert Smith"
+speakers forget 3                 # delete a person and their voiceprints
+```
+
 The store is one SQLite file, `speakers.db`, created by `setup.sh` beside the
 pipeline. It holds one voiceprint per person — a 256-dimension centroid averaged
 over every meeting they have been named in — plus a log of every match decision.
-It is the only state here that cannot be rebuilt from the audio, because it holds
-the names a person typed. Back it up.
+**It is the only state here that cannot be rebuilt from the audio**, because it
+holds the names a person typed. Back it up.
 
 ---
 
@@ -212,21 +239,50 @@ The defaults are measured. Change them only with a reason.
 | flag | default | |
 |---|---|---|
 | `--glossary` | — | proper nouns, comma-separated |
+| `--roster` | — | restrict matching to these people |
+| `--name` | — | `G02="Bob Smith"` — remember this voice |
 | `--window` | `30` | seconds per transcription window |
 | `--overlap` | `5` | context each side of a window |
 | `--thr` | `auto` | speaker-clustering cut |
-| `--roster` | — | restrict matching to these people |
-| `--name` | — | `G02="Bob Smith"` — remember this voice |
 | `--host` | `msbox` | which box to use |
 
 **`--window`**: longer is *slower* and no more accurate. 60 s and 90 s were both
-measured — they lose throughput (437× realtime → 315× and 254×) and fix nothing.
-Fewer, longer prompts batch worse.
+measured — throughput falls from 437× realtime to 315× and 254×, and neither
+fixes anything. Fewer, longer prompts batch worse.
 
 **`--thr`**: this used to be a hardcoded constant, and a wrong value merged every
 speaker into one *silently* — a confident, wrong, single-speaker transcript. It
 now derives itself per recording from the model's own within-window labels.
 Pinning it by hand re-introduces that failure.
+
+Environment: `MS_WORK` (install location), `MS_HOST` (default box),
+`MS_SPEAKER_DB` (profile store path).
+
+---
+
+## What it does
+
+Transcription is [MOSS-Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize)
+on vLLM. That gives text plus speaker labels *within* each 30-second window — but
+window 4's "S01" and window 5's "S01" are not necessarily the same person.
+
+Linking them is the other half: [WeSpeaker ResNet293-LM](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet293-LM)
+produces a voice embedding per speech segment, those are clustered into actual
+speakers across the recording, and each cluster is matched against the profile
+store to put a name on it.
+
+```
+audio ──► MOSS (vLLM)  ──►  text + per-window speaker labels
+             │
+             ▼
+      WeSpeaker ResNet293-LM  ──►  voice embedding per segment
+             │
+             ▼
+      constrained clustering  ──►  Speaker 1, Speaker 2, …
+             │
+             ▼
+      profile store (sqlite)  ──►  Bob Smith, Jane Doe
+```
 
 ---
 
@@ -239,6 +295,10 @@ once — a real bug, not a tuning problem.
 
 **A name is mangled.** Add it to `glossary.txt`. If it's still wrong and falls
 near a 30-second boundary, try `--overlap 10`.
+
+**Someone is recognised as the wrong person.** Use `--roster` to limit
+candidates. If two people genuinely score close, the run marks it `?` and leaves
+them numbered rather than guessing.
 
 **vLLM won't start**, with an opaque engine error. Usually the process budget;
 `setup.sh` handles it, but if it recurs: `ssh msbox 'supervisorctl stop ray'`.
@@ -266,16 +326,18 @@ every speaker into one on real-world audio, without any error.
 ## Layout
 
 ```
-transcribe              the command you run, on the machine with your audio
+transcribe              one file or a folder, on the machine with your audio
+speakers                name, rename, forget voices
 setup.sh                installs everything, locally or onto a box over ssh
 glossary.txt.example    copy to glossary.txt beside your recordings
+
 pipeline/               deployed to the GPU machine by setup.sh
-  transcribe_meeting.py   MOSS on vLLM, windowed
+  transcribe_meeting.py   MOSS on vLLM, windowed, one file
+  batch.py                a queue, engine resident, embedding overlapped
   cluster_speakers.py     constrained clustering + self-calibrated cut
+  speakers.py             the profile store (sqlite)
+  identify.py             match a meeting's voices against it
   mktxt.py                readable transcript
   link/embed_batched.py   WeSpeaker embeddings, batched
   link/link.py            segments -> global speakers
-  speakers.py             the profile store (sqlite)
-  identify.py             match a meeting's voices against it
-speakers                the command for naming, renaming, forgetting
 ```
