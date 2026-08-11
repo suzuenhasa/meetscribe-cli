@@ -160,6 +160,22 @@ if [ ! -d "$WORK/wespeaker_src/wespeaker" ]; then
 fi
 ok "wespeaker source"
 
+# Import the embedder for real. wespeaker/__init__.py pulls in its CLI, which
+# wants silero_vad; the embedder sidesteps that, but a checkpoint or torch
+# mismatch still only shows up at import time. Catching it here beats discovering
+# it after a batch has already spent minutes transcribing.
+MS_WORK="$WORK" "$PY" -c "
+import os, sys, importlib.util as u
+spec = u.spec_from_file_location('eb', '$WORK/link/embed_batched.py')
+m = u.module_from_spec(spec)
+sys.argv = ['x']
+try:
+    spec.loader.exec_module(m)
+except SystemExit:
+    pass
+" 2>/dev/null || die "embed_batched.py cannot import — see $WORK/link/embed_batched.py"
+ok "embedder imports"
+
 # ------------------------------------------------------------------- scripts
 say "Pipeline"
 if [ "$CHECK" -eq 1 ]; then

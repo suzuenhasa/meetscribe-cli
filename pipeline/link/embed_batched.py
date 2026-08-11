@@ -22,7 +22,22 @@ import yaml
 # MS_WORK lets the pipeline live anywhere; /workspace is only the default because
 # that is where a rented GPU box puts its scratch volume.
 WORK = os.environ.get("MS_WORK", "/workspace")
-sys.path.insert(0, os.path.join(WORK, "wespeaker_src"))
+_WSP = os.path.join(WORK, "wespeaker_src")
+sys.path.insert(0, _WSP)
+
+# Import the ResNet definitions WITHOUT executing wespeaker/__init__.py. That
+# init pulls in wespeaker.cli.speaker, which imports silero_vad, which drags in
+# onnxruntime -- none of which this script uses. Registering stub packages that
+# carry only __path__ lets the submodule resolve while the real inits never run.
+# Without this the embedder dies with ModuleNotFoundError: silero_vad on any box
+# where that happens not to be installed, long after transcription succeeded.
+import types
+for _name, _sub in (("wespeaker", ""), ("wespeaker.models", "models")):
+    if _name not in sys.modules:
+        _m = types.ModuleType(_name)
+        _m.__path__ = [os.path.join(_WSP, "wespeaker", _sub) if _sub
+                       else os.path.join(_WSP, "wespeaker")]
+        sys.modules[_name] = _m
 import wespeaker.models.resnet as m_resnet
 
 INSET, MIN_DUR, MAX_DUR = 0.20, 0.50, 20.0
