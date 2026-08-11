@@ -30,10 +30,32 @@ REMOTE="${MS_REMOTE:-${MS_WORK:-/workspace}}"
 THR="auto"
 ROSTER=""
 ENROLL=""
+# Running ON the machine that has the pipeline? Then there is nothing to ssh to.
+# Set MS_FORCE_REMOTE to use the box even when a local install exists.
+LOCAL=0
+[ -f "${MS_REMOTE:-${MS_WORK:-/workspace}}/transcribe_meeting.py" ] \
+  && [ -z "${MS_FORCE_REMOTE:-}" ] && LOCAL=1
 WINDOW="30"
 OVERLAP="5"
 SRC=""
 GLOSSARY=""
+
+rrun() {   # execute a shell snippet where the pipeline lives
+  if [ "$LOCAL" -eq 1 ]; then bash -c "$1"
+  else
+    # `|| true`: grep exits 1 when it filters every line away (a command with no
+    # output, e.g. mkdir), and under `set -e` that would kill the run.
+    ssh "$HOST" "$1" 2>&1 | { grep -v '^Welcome to vast\|^Have fun\|^AI agents:' || true; }
+  fi
+}
+rput() {   # local file -> pipeline machine
+  if [ "$LOCAL" -eq 1 ]; then [ "$1" = "$2" ] || cp -f "$1" "$2"
+  else rsync -a --partial "$1" "$HOST:$2"; fi
+}
+rget() {   # pipeline machine -> here
+  if [ "$LOCAL" -eq 1 ]; then cp -f "$1" "$2" 2>/dev/null || true
+  else rsync -a "$HOST:$1" "$2" 2>/dev/null || true; fi
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -48,6 +70,19 @@ while [ $# -gt 0 ]; do
     *)        SRC="$1"; shift ;;
   esac
 done
+# setup.sh installs into whichever interpreter already owns torch and records it
+# in env.sh as MS_PY. Bare `python3` is frequently a DIFFERENT interpreter with none
+# of the dependencies -- the failure is ModuleNotFoundError: numpy, which looks like
+# a broken install rather than the wrong python. Resolve it ONCE, here, and pass the
+# literal path down; computing it inside each remote snippet turns into a quoting
+# fight with no upside.
+if [ "$LOCAL" -eq 1 ]; then
+  PY="$(. "$REMOTE/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
+else
+  PY="$(ssh "$HOST" ". '$REMOTE/env.sh' 2>/dev/null; echo \"\${MS_PY:-python3}\"" 2>/dev/null | tail -1)"
+  [ -n "$PY" ] || PY=python3
+fi
+
 # A directory means batch: the engine loads once instead of per file (~66s each),
 # and embedding overlaps the next file's transcription.
 if [ -d "$SRC" ]; then
@@ -61,35 +96,35 @@ if [ -d "$SRC" ]; then
     [ -n "$FILE_TERMS" ] && GLOSSARY="${GLOSSARY:+$GLOSSARY,}$FILE_TERMS"
   fi
   [ -n "$GLOSSARY" ] && echo "==> glossary: $GLOSSARY"
-  ssh "$HOST" "mkdir -p '$REMOTE/inbox' '$REMOTE/out'"
+  rrun "mkdir -p '$REMOTE/inbox' '$REMOTE/out'"
   REMOTE_ARGS=(); TITLES="$(mktemp)"; printf '{' > "$TITLES"; FIRST=1
   for f in "${BATCH[@]}"; do
     b="$(basename "${f%.*}")"; e="${f##*.}"
     sf="$(echo "$b" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
-    echo "    uploading $(basename "$f")"
-    rsync -a --partial "$f" "$HOST:$REMOTE/inbox/$sf.$e"
+    [ "$LOCAL" -eq 1 ] || echo "    uploading $(basename "$f")"
+    rput "$f" "$REMOTE/inbox/$sf.$e"
     REMOTE_ARGS+=("$REMOTE/inbox/$sf.$e")
     [ $FIRST -eq 0 ] && printf ',' >> "$TITLES"; FIRST=0
     python3 -c 'import json,sys; print(json.dumps(sys.argv[1])+":"+json.dumps(sys.argv[2]), end="")' "$sf" "$b" >> "$TITLES"
   done
   printf '}' >> "$TITLES"
-  rsync -a "$TITLES" "$HOST:$REMOTE/out/_titles.json"; rm -f "$TITLES"
-  ssh "$HOST" "
+  rput "$TITLES" "$REMOTE/out/_titles.json"; rm -f "$TITLES"
+  rrun "
     set -euo pipefail
     export HF_HOME='$REMOTE/.hf_home' MS_WORK='$REMOTE' OMP_NUM_THREADS=8 \
            TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
     cd '$REMOTE'
-    python3 '$REMOTE/batch.py' ${REMOTE_ARGS[*]@Q} --out-dir '$REMOTE/out' \
+    "$PY" '$REMOTE/batch.py' ${REMOTE_ARGS[*]@Q} --out-dir '$REMOTE/out' \
       --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \\
       --titles '$REMOTE/out/_titles.json'
-  " 2>&1 | grep -v '^Welcome to vast\|^Have fun\|^AI agents:'
+  "
   echo "==> retrieving"
   for f in "${BATCH[@]}"; do
     b="$(basename "${f%.*}")"
     sf="$(echo "$b" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
-    rsync -a "$HOST:$REMOTE/out/${sf}.txt" "./${b}.txt" 2>/dev/null || true
-    rsync -a "$HOST:$REMOTE/out/${sf}_linked.json" "./${b}.json" 2>/dev/null || true
+    rget "$REMOTE/out/${sf}.txt" "./${b}.txt"
+    rget "$REMOTE/out/${sf}_linked.json" "./${b}.json"
   done
   echo "    $(pwd)"
   exit 0
@@ -110,45 +145,45 @@ SAFE="$(echo "$BASE" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
 EXT="${SRC##*.}"
 
 echo "==> $BASE"
-ssh "$HOST" "mkdir -p '$REMOTE/inbox' '$REMOTE/out'; supervisorctl stop ray >/dev/null 2>&1 || true"
+rrun "mkdir -p '$REMOTE/inbox' '$REMOTE/out'; supervisorctl stop ray >/dev/null 2>&1 || true"
 
-echo "==> uploading $(du -h "$SRC" | cut -f1)"
-rsync -a --partial "$SRC" "$HOST:$REMOTE/inbox/$SAFE.$EXT"
+[ "$LOCAL" -eq 1 ] || echo "==> uploading $(du -h "$SRC" | cut -f1)"
+rput "$SRC" "$REMOTE/inbox/$SAFE.$EXT"
 
 echo "==> transcribing"
-ssh "$HOST" "
+rrun "
   set -euo pipefail
   cd '$REMOTE'
   export HF_HOME='$REMOTE/.hf_home' OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
          VLLM_LOGGING_LEVEL=WARNING PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-  python3 transcribe_meeting.py '$REMOTE/inbox/$SAFE.$EXT' --window $WINDOW \
+  "$PY" transcribe_meeting.py '$REMOTE/inbox/$SAFE.$EXT' --window $WINDOW \
       --overlap $OVERLAP --glossary '$GLOSSARY' \
       --out '$REMOTE/out/${SAFE}_raw.json' 2>&1 \
     | grep -E '^gen |silence gate|repetition|windows of' || true
 
   echo '==> embedding speakers'
-  OMP_NUM_THREADS=4 python3 '$REMOTE/link/embed_batched.py' \
+  OMP_NUM_THREADS=4 "$PY" '$REMOTE/link/embed_batched.py' \
       --run '$REMOTE/out/${SAFE}_raw.json' --wav '$REMOTE/inbox/$SAFE.$EXT' \
       --out '$REMOTE/out/${SAFE}_emb.npz' 2>&1 | tail -1
 
   echo '==> linking speakers (threshold: $THR)'
-  OMP_NUM_THREADS=4 python3 '$REMOTE/link/link.py' --run '$REMOTE/out/${SAFE}_raw.json' \
+  OMP_NUM_THREADS=4 "$PY" '$REMOTE/link/link.py' --run '$REMOTE/out/${SAFE}_raw.json' \
       --npz '$REMOTE/out/${SAFE}_emb.npz' --thr $THR \
       --out '$REMOTE/out/${SAFE}_linked.json' 2>&1 \
     | grep -E 'k_est=|FLOOR-VIOLATION' || true
 
   echo '==> identifying speakers'
-  MS_WORK='$REMOTE' python3 '$REMOTE/identify.py' \
+  MS_WORK='$REMOTE' "$PY" '$REMOTE/identify.py' \
       --clusters '$REMOTE/out/${SAFE}_linked_clusters.npz' --meeting '$SAFE' \
       --roster '$ROSTER' --names '$REMOTE/out/${SAFE}_names.json' $ENROLL
 
-  python3 '$REMOTE/mktxt.py' '$REMOTE/out/${SAFE}_linked.json' '$REMOTE/out/${SAFE}_raw.json' \
+  "$PY" '$REMOTE/mktxt.py' '$REMOTE/out/${SAFE}_linked.json' '$REMOTE/out/${SAFE}_raw.json' \
       '$REMOTE/out/${SAFE}.txt' '$BASE' '$REMOTE/out/${SAFE}_names.json'
-" 2>&1 | grep -v '^Welcome to vast\|^Have fun\|^AI agents:'
+"
 
 echo "==> retrieving"
-rsync -a "$HOST:$REMOTE/out/${SAFE}.txt" "./${BASE}.txt"
-rsync -a "$HOST:$REMOTE/out/${SAFE}_linked.json" "./${BASE}.json"
+rget "$REMOTE/out/${SAFE}.txt" "./${BASE}.txt"
+rget "$REMOTE/out/${SAFE}_linked.json" "./${BASE}.json"
 echo "    $(pwd)/${BASE}.txt"
 echo "    $(pwd)/${BASE}.json"

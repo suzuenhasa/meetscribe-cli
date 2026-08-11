@@ -96,6 +96,27 @@ a rented box that wipes `/workspace`.
 
 Set `MS_WORK` to install somewhere other than `/workspace`.
 
+### Running on the box itself
+
+`transcribe` and `speakers` detect a local install and skip ssh entirely, so
+the same commands work whether you are on your laptop or on the box:
+
+```bash
+cd /workspace/meetscribe-cli
+./transcribe /workspace/inbox/          # a folder
+./speakers list
+```
+
+If you call the pipeline scripts directly instead, use the interpreter `setup.sh`
+chose — it installs into whichever python already owns torch, and bare `python3`
+is frequently a different one with none of the dependencies (the symptom is
+`ModuleNotFoundError: numpy`):
+
+```bash
+source /workspace/env.sh
+"$MS_PY" /workspace/batch.py /workspace/inbox/*.mp3 --out-dir /workspace/out
+```
+
 ---
 
 ## Transcribing

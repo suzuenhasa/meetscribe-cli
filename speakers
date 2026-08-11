@@ -18,14 +18,20 @@ REMOTE="${MS_REMOTE:-${MS_WORK:-/workspace}}"
 LOCAL=0
 [ -f "$REMOTE/speakers.py" ] && [ -z "${MS_FORCE_REMOTE:-}" ] && LOCAL=1
 
+# setup.sh installs into whichever interpreter already owns torch and records it
+# in env.sh as MS_PY. Bare `python3` is often a different interpreter with none of
+# the dependencies installed.
 run() {  # run a command where the pipeline lives
   if [ "$LOCAL" -eq 1 ]; then
-    MS_WORK="$REMOTE" python3 "$@"
+    # shellcheck disable=SC1090
+    local PY; PY="$(. "$REMOTE/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
+    MS_WORK="$REMOTE" "$PY" "$@"
   else
     local q=""
     for a in "$@"; do q="$q $(printf '%q' "$a")"; done
-    ssh "$HOST" "MS_WORK='$REMOTE' python3$q" 2>&1 \
-      | grep -v '^Welcome to vast\|^Have fun\|^AI agents:'
+    ssh "$HOST" "PY=\"\$(. '$REMOTE/env.sh' 2>/dev/null; echo \"\${MS_PY:-python3}\")\"; \
+                 MS_WORK='$REMOTE' \"\$PY\"$q" 2>&1 \
+      | { grep -v '^Welcome to vast\|^Have fun\|^AI agents:' || true; }
   fi
 }
 
