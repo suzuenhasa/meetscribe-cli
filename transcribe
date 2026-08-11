@@ -62,14 +62,18 @@ if [ -d "$SRC" ]; then
   fi
   [ -n "$GLOSSARY" ] && echo "==> glossary: $GLOSSARY"
   ssh "$HOST" "mkdir -p '$REMOTE/inbox' '$REMOTE/out'"
-  REMOTE_ARGS=()
+  REMOTE_ARGS=(); TITLES="$(mktemp)"; printf '{' > "$TITLES"; FIRST=1
   for f in "${BATCH[@]}"; do
     b="$(basename "${f%.*}")"; e="${f##*.}"
     sf="$(echo "$b" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
     echo "    uploading $(basename "$f")"
     rsync -a --partial "$f" "$HOST:$REMOTE/inbox/$sf.$e"
     REMOTE_ARGS+=("$REMOTE/inbox/$sf.$e")
+    [ $FIRST -eq 0 ] && printf ',' >> "$TITLES"; FIRST=0
+    python3 -c 'import json,sys; print(json.dumps(sys.argv[1])+":"+json.dumps(sys.argv[2]), end="")' "$sf" "$b" >> "$TITLES"
   done
+  printf '}' >> "$TITLES"
+  rsync -a "$TITLES" "$HOST:$REMOTE/out/_titles.json"; rm -f "$TITLES"
   ssh "$HOST" "
     set -euo pipefail
     export HF_HOME='$REMOTE/.hf_home' MS_WORK='$REMOTE' OMP_NUM_THREADS=8 \
@@ -77,7 +81,8 @@ if [ -d "$SRC" ]; then
     cd '$REMOTE'
     python3 '$REMOTE/batch.py' ${REMOTE_ARGS[*]@Q} --out-dir '$REMOTE/out' \
       --window $WINDOW --overlap $OVERLAP --thr $THR \
-      --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER")
+      --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \\
+      --titles '$REMOTE/out/_titles.json'
   " 2>&1 | grep -v '^Welcome to vast\|^Have fun\|^AI agents:'
   echo "==> retrieving"
   for f in "${BATCH[@]}"; do

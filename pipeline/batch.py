@@ -42,6 +42,10 @@ def main():
     ap.add_argument("--overlap", type=float, default=5.0)
     ap.add_argument("--glossary", default="")
     ap.add_argument("--roster", default="")
+    ap.add_argument("--titles", default="",
+                    help="JSON {safe_name: original title}. Filenames are "
+                         "sanitised for the trip over ssh; this restores what "
+                         "the human actually called the meeting.")
     ap.add_argument("--thr", default="auto")
     ap.add_argument("--gpu-frac", type=float, default=0.72,
                     help="vLLM's pool. The rest is headroom for the concurrent "
@@ -56,6 +60,9 @@ def main():
     files = [Path(f) for f in a.audio if Path(f).is_file()]
     if not files:
         raise SystemExit("no readable audio files")
+    titles = {}
+    if a.titles and Path(a.titles).is_file():
+        titles = json.load(open(a.titles))
 
     t_start = time.time()
     ptxt = TM.build_prompt(a.glossary)
@@ -120,7 +127,8 @@ def main():
                         "--names", str(out / f"{name}_names.json")], env=env)
         subprocess.run([PY, f"{WORK}/mktxt.py", str(out / f"{name}_linked.json"),
                         str(out / f"{name}_raw.json"), str(out / f"{name}.txt"),
-                        f.stem, str(out / f"{name}_names.json")], env=env)
+                        titles.get(name, f.stem),
+                        str(out / f"{name}_names.json")], env=env)
         print(flush=True)
 
     total = time.time() - t_start
