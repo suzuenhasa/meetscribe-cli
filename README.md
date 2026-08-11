@@ -62,10 +62,10 @@ Add the box to `~/.ssh/config`:
 
 ```
 Host msbox
-    HostName 203.0.113.42
-    Port 12345
+    HostName 203.0.113.42          # your instance's IP
+    Port 12345                     # and its ssh port
     User root
-    IdentityFile ~/.ssh/id_rsa
+    IdentityFile ~/.ssh/id_rsa     # whatever key the provider gave you
 ```
 
 Check it works, then install:
