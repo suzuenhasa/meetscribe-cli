@@ -132,25 +132,43 @@ TORCH_AFTER=$("$PY" -c "import torch; print(torch.__version__)")
 ok "torch unchanged"
 
 # ------------------------------------------------------------------- weights
-say "Models"
+say "Models (~2 GB on a cold box — this is the slow part)"
 mkdir -p "$HF_HOME" "$WORK/runs" "$WORK/out" "$WORK/inbox" "$WORK/wsp_ckpt/resnet293"
 if [ "$CHECK" -eq 1 ]; then
   "$PY" -c "
 from huggingface_hub import snapshot_download as d; d('$MODEL', local_files_only=True)" >/dev/null 2>&1 \
     && ok "MOSS cached" || die "MOSS weights not downloaded"
 else
-  "$PY" -c "from huggingface_hub import snapshot_download as d; d('$MODEL')" >/dev/null
-  ok "MOSS-Transcribe-Diarize (1.8 GB)"
+  # Show the progress bars. Sending this to /dev/null made setup sit silent for
+  # several minutes on a cold box, which reads as "it is not downloading the
+  # weights" -- and then the first run looks like it fetched them instead.
+  if "$PY" -c "
+import sys
+from huggingface_hub import snapshot_download
+p = snapshot_download('$MODEL')
+print(p)
+" ; then
+    ok "MOSS-Transcribe-Diarize"
+  else
+    die "MOSS download failed (network? disk? HF_HOME=$HF_HOME)"
+  fi
+  # Prove it landed, rather than trusting the exit code.
+  "$PY" -c "
+from huggingface_hub import snapshot_download
+snapshot_download('$MODEL', local_files_only=True)" >/dev/null 2>&1 \
+    || die "MOSS reported success but is not in the cache at $HF_HOME"
 fi
 
 if [ ! -f "$WORK/wsp_ckpt/resnet293/avg_model.pt" ]; then
   [ "$CHECK" -eq 1 ] && die "WeSpeaker checkpoint missing"
-  "$PY" - <<EOF
+  warn "downloading WeSpeaker ResNet293-LM (~134 MB)"
+  "$PY" - <<EOF || die "WeSpeaker download failed"
 from huggingface_hub import hf_hub_download
 import shutil
 for f in ("avg_model.pt", "config.yaml"):
     shutil.copy(hf_hub_download("$WSP_REPO", f), "$WORK/wsp_ckpt/resnet293/" + f)
 EOF
+  [ -s "$WORK/wsp_ckpt/resnet293/avg_model.pt" ] || die "WeSpeaker checkpoint is empty"
 fi
 ok "WeSpeaker ResNet293-LM ($(du -h "$WORK/wsp_ckpt/resnet293/avg_model.pt" | cut -f1))"
 
