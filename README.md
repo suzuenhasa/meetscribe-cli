@@ -3,19 +3,22 @@
 Meeting audio in, speaker-attributed transcript out.
 
 ```bash
-./transcribe "product sync.mp3"
+./transcribe "Product Marketing Meeting (weekly) 2021-06-28.mp3"
 ```
 
 ```
-product sync
+Product Marketing Meeting (weekly) 2021-06-28
 42.7 min · 612 turns · 7 speakers
 ==================================================================
 
-[0:00:31] Speaker 2
-  Sharam, thank you so much for joining us today.
+[0:00:00] Speaker 1
+  I can record.
+  And we don't have a ton of items to get to.
+  So corporate events. I put this in Slack and I saw a little bit of kind of
+  noise around it, which was good.
 
-[0:00:33] Speaker 1
-  Thank you so much, Ali. My pleasure.
+[0:01:12] Speaker 3
+  I thought we had in Slack sort of farmed each one of them out.
 ```
 
 Runs on your own hardware. A 74-minute recording takes about 25 seconds.
