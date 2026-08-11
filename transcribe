@@ -4,6 +4,8 @@
 #   ./transcribe "Product Marketing Meeting.mp3"
 #   ./transcribe podcast.mp3 --overlap 0     # disable window context (default 5s)
 #   ./transcribe podcast.mp3 --glossary "Sreeram Kannan,EigenCloud,EigenDA"
+#   ./transcribe standup.mp3 --name G01="Bob Smith"    remember this voice, by name
+#   ./transcribe standup.mp3 --roster "Bob Smith,Jane Doe"   only score these people
 #   ./transcribe meeting.m4a --thr 0.70     # pin the cut by hand (rarely needed)
 #
 # On --glossary: names the model has never heard come out as the nearest familiar
@@ -25,6 +27,8 @@ set -euo pipefail
 HOST="${MS_HOST:-msbox}"
 REMOTE="${MS_REMOTE:-${MS_WORK:-/workspace}}"
 THR="auto"
+ROSTER=""
+ENROLL=""
 WINDOW="30"
 OVERLAP="5"
 SRC=""
@@ -34,6 +38,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --thr)      THR="$2"; shift 2 ;;
     --glossary) GLOSSARY="$2"; shift 2 ;;
+    --roster)   ROSTER="$2"; shift 2 ;;
+    --name)     ENROLL="$ENROLL --enroll $2"; shift 2 ;;
     --window)  WINDOW="$2"; shift 2 ;;
     --overlap) OVERLAP="$2"; shift 2 ;;
     --host)   HOST="$2"; shift 2 ;;
@@ -84,8 +90,13 @@ ssh "$HOST" "
       --out '$REMOTE/out/${SAFE}_linked.json' 2>&1 \
     | grep -E 'k_est=|FLOOR-VIOLATION' || true
 
+  echo '==> identifying speakers'
+  MS_WORK='$REMOTE' python3 '$REMOTE/identify.py' \
+      --clusters '$REMOTE/out/${SAFE}_linked_clusters.npz' --meeting '$SAFE' \
+      --roster '$ROSTER' --names '$REMOTE/out/${SAFE}_names.json' $ENROLL
+
   python3 '$REMOTE/mktxt.py' '$REMOTE/out/${SAFE}_linked.json' '$REMOTE/out/${SAFE}_raw.json' \
-      '$REMOTE/out/${SAFE}.txt' '$BASE'
+      '$REMOTE/out/${SAFE}.txt' '$BASE' '$REMOTE/out/${SAFE}_names.json'
 " 2>&1 | grep -v '^Welcome to vast\|^Have fun\|^AI agents:'
 
 echo "==> retrieving"

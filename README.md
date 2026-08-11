@@ -21,7 +21,8 @@ Product Marketing Meeting (weekly) 2021-06-28
   I thought we had in Slack sort of farmed each one of them out.
 ```
 
-Runs on your own hardware. A 74-minute recording takes about 25 seconds.
+Runs on your own hardware. A 74-minute recording takes about 25 seconds. Name a
+voice once and it is recognised in every meeting after that.
 
 ---
 
@@ -126,6 +127,62 @@ transcribe podcast.mp3 --glossary "Sreeram Kannan,EigenCloud"
 
 ---
 
+## Naming voices
+
+By default everyone is `Speaker 1`, `Speaker 2` — correct within one recording,
+but Monday's "Speaker 1" has nothing to do with Tuesday's. Name someone once and
+they are recognised in every meeting after that.
+
+```bash
+transcribe standup.mp3            # Speaker 1, Speaker 2, Speaker 3
+speakers name standup G02 "Bob Smith"
+transcribe "next week.mp3"        # Bob Smith
+```
+
+```
+identify: 4 voices in this meeting, 3 enrolled candidates
+  = G00      612s  Bob Smith              0.952
+  = G02      388s  Jane Doe               0.871
+  ? G01       74s  Ravi Patel             0.478  (2nd 0.443)
+    G03       31s  -                      0.201
+```
+
+`=` recognised, `?` too close to call, blank is nobody on file. A voice is only
+matched if it clears **0.55** *and* beats the runner-up by **0.10**; between 0.40
+and 0.55 a person decides; below that it is treated as new. Those numbers are
+measured for centroid-to-centroid comparison and are not valid at any other
+level — a threshold fitted on clip-to-clip produced 8 false accepts out of 30
+when applied here.
+
+```bash
+speakers list                       # who is on file
+speakers meetings                   # what you can name voices from
+speakers name <meeting> G02 "Name"
+speakers rename <id> "New Name"
+speakers forget <id>                # delete a person and their voiceprints
+```
+
+Acceptance is a max over the whole gallery, so false accepts grow with its size.
+If you know who is in the room, say so — scoring 3 people is far safer than 500:
+
+```bash
+transcribe standup.mp3 --roster "Bob Smith,Jane Doe,Ravi Patel"
+```
+
+You can also name someone during the run:
+
+```bash
+transcribe standup.mp3 --name G02="Bob Smith"
+```
+
+The store is one SQLite file, `speakers.db`, created by `setup.sh` beside the
+pipeline. It holds one voiceprint per person — a 256-dimension centroid averaged
+over every meeting they have been named in — plus a log of every match decision.
+It is the only state here that cannot be rebuilt from the audio, because it holds
+the names a person typed. Back it up.
+
+---
+
 ## Options
 
 The defaults are measured. Change them only with a reason.
@@ -136,6 +193,8 @@ The defaults are measured. Change them only with a reason.
 | `--window` | `30` | seconds per transcription window |
 | `--overlap` | `5` | context each side of a window |
 | `--thr` | `auto` | speaker-clustering cut |
+| `--roster` | — | restrict matching to these people |
+| `--name` | — | `G02="Bob Smith"` — remember this voice |
 | `--host` | `msbox` | which box to use |
 
 **`--window`**: longer is *slower* and no more accurate. 60 s and 90 s were both
@@ -194,4 +253,7 @@ pipeline/               deployed to the GPU machine by setup.sh
   mktxt.py                readable transcript
   link/embed_batched.py   WeSpeaker embeddings, batched
   link/link.py            segments -> global speakers
+  speakers.py             the profile store (sqlite)
+  identify.py             match a meeting's voices against it
+speakers                the command for naming, renaming, forgetting
 ```

@@ -163,10 +163,14 @@ ok "wespeaker source"
 # ------------------------------------------------------------------- scripts
 say "Pipeline"
 if [ "$CHECK" -eq 1 ]; then
-  for f in transcribe_meeting.py cluster_speakers.py mktxt.py link/link.py link/embed_batched.py; do
+  for f in transcribe_meeting.py cluster_speakers.py mktxt.py speakers.py identify.py \
+           link/link.py link/embed_batched.py; do
     [ -f "$WORK/$f" ] || die "missing $WORK/$f"
   done
   ok "scripts in place"
+  [ -f "$WORK/speakers.db" ] || die "speaker database missing ($WORK/speakers.db)"
+  ok "speaker database ($("$PY" -c "
+import sqlite3;print(sqlite3.connect('$WORK/speakers.db').execute('select count(*) from speakers').fetchone()[0])" 2>/dev/null || echo 0) voices enrolled)"
 else
   mkdir -p "$WORK/link"
   cp "$HERE"/pipeline/*.py "$WORK/"
@@ -180,6 +184,18 @@ export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
 export MS_PY="$PY"
 EOF
   ok "wrote $WORK/env.sh"
+
+  # The profile store. Created empty and left in place on re-runs: it is the one
+  # piece of state here that cannot be rebuilt from the audio, because it holds
+  # the names a person typed.
+  MS_WORK="$WORK" "$PY" -c "
+import os, sys
+sys.path.insert(0, '$WORK')
+import speakers
+c = speakers.db(); c.commit()
+n = c.execute('select count(*) from speakers').fetchone()[0]
+print('   \033[32mok\033[0m  speaker database %s (%d voice%s enrolled)'
+      % (speakers.DB, n, '' if n == 1 else 's'))"
 fi
 
 say "Ready"

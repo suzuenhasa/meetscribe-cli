@@ -2,6 +2,14 @@ import json, sys
 from collections import defaultdict
 
 linked, raw, out_path, title = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+# optional 5th arg: {cluster: "Real Name"} from identify.py. Clusters it does not
+# name keep their positional label, so no store means the old behaviour exactly.
+named = {}
+if len(sys.argv) > 5 and sys.argv[5]:
+    try:
+        named = json.load(open(sys.argv[5]))
+    except Exception:
+        named = {}
 d = json.load(open(linked))
 segs = d["segments"] if isinstance(d, dict) else d
 dur = json.load(open(raw))["duration_s"]
@@ -14,6 +22,8 @@ order = {g: i for i, g in enumerate(sorted(real, key=lambda g: -secs[g]))}
 
 
 def who(g):
+    if g in named:
+        return named[g]
     return f"Speaker {order[g] + 1}" if g in order else "UNKNOWN"
 
 
@@ -21,8 +31,11 @@ def hms(t):
     return f"{int(t//3600)}:{int(t%3600//60):02d}:{int(t%60):02d}"
 
 
+n_named = sum(1 for g in real if g in named)
+tally = (f"{len(real)} speakers" if not n_named
+         else f"{len(real)} speakers, {n_named} named")
 lines = [title,
-         f"{dur/60:.1f} min · {len(segs)} turns · {len(real)} speakers",
+         f"{dur/60:.1f} min · {len(segs)} turns · {tally}",
          "=" * 66]
 last = None
 for s in segs:
@@ -35,5 +48,5 @@ open(out_path, "w").write("\n".join(lines) + "\n")
 
 print("speech time by speaker:")
 for g in sorted(secs, key=lambda g: -secs[g]):
-    print(f"  {who(g):12} {secs[g]/60:5.1f} min")
+    print(f"  {who(g):22} {secs[g]/60:5.1f} min")
 print(f"\nwrote {out_path}")

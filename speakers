@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Manage the voice profile store. A voice named once is recognised in every
+# later meeting, so this is where naming happens.
+#
+#   ./speakers list                                   who is on file
+#   ./speakers name <meeting> <cluster> "Bob Smith"   remember this voice
+#   ./speakers rename <id> "New Name"
+#   ./speakers forget <id>                            delete a person + voiceprints
+#
+# <meeting> is the safe name printed when you transcribed — the basename with
+# spaces turned into dashes. `./speakers meetings` lists what is available.
+set -euo pipefail
+
+HOST="${MS_HOST:-msbox}"
+REMOTE="${MS_REMOTE:-${MS_WORK:-/workspace}}"
+LOCAL=0
+[ -f "$REMOTE/speakers.py" ] && [ -z "${MS_FORCE_REMOTE:-}" ] && LOCAL=1
+
+run() {  # run a command where the pipeline lives
+  if [ "$LOCAL" -eq 1 ]; then
+    MS_WORK="$REMOTE" python3 "$@"
+  else
+    local q=""
+    for a in "$@"; do q="$q $(printf '%q' "$a")"; done
+    ssh "$HOST" "MS_WORK='$REMOTE' python3$q" 2>&1 \
+      | grep -v '^Welcome to vast\|^Have fun\|^AI agents:'
+  fi
+}
+
+CMD="${1:-list}"; shift || true
+case "$CMD" in
+  list)
+    run "$REMOTE/speakers.py" list
+    ;;
+  meetings)
+    if [ "$LOCAL" -eq 1 ]; then ls -1 "$REMOTE"/out/*_linked_clusters.npz 2>/dev/null
+    else ssh "$HOST" "ls -1 '$REMOTE'/out/*_linked_clusters.npz 2>/dev/null"; fi \
+      | sed 's#.*/##; s/_linked_clusters\.npz$//' | sed 's/^/  /'
+    ;;
+  name)
+    [ $# -ge 3 ] || { echo 'usage: ./speakers name <meeting> <cluster> "Full Name"' >&2; exit 2; }
+    MEETING="$1"; CLUSTER="$2"; NAME="$3"
+    run "$REMOTE/identify.py" --clusters "$REMOTE/out/${MEETING}_linked_clusters.npz" \
+        --meeting "$MEETING" --enroll "${CLUSTER}=${NAME}"
+    echo
+    echo "  Re-run transcribe on that meeting to see the name in the transcript,"
+    echo "  or just transcribe the next one — they are recognised from now on."
+    ;;
+  rename)
+    [ $# -ge 2 ] || { echo 'usage: ./speakers rename <id> "New Name"' >&2; exit 2; }
+    run "$REMOTE/speakers.py" rename "$1" "$2"
+    ;;
+  forget)
+    [ $# -ge 1 ] || { echo 'usage: ./speakers forget <id>' >&2; exit 2; }
+    run "$REMOTE/speakers.py" forget "$1"
+    ;;
+  -h|--help|help)
+    sed -n '2,11p' "$0"
+    ;;
+  *)
+    echo "unknown command: $CMD" >&2; sed -n '2,11p' "$0" >&2; exit 2
+    ;;
+esac
