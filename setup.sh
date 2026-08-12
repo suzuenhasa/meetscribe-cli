@@ -130,13 +130,38 @@ fi
 
 # vLLM before the torch checks: a freshly created venv has neither, and vLLM
 # brings a matching torch with it.
+#
+# The wheel on PyPI is built against CUDA 13, whose runtime a 12.x driver cannot
+# load -- torch installs fine and then `import vllm` dies on
+# "libcudart.so.13: cannot open shared object file". vLLM also publishes a +cu129
+# wheel per release, and CUDA 12.x has minor-version compatibility, so that one
+# runs on any 12.x driver. Pick by the driver.
 if ! "$PY" -c "import vllm" >/dev/null 2>&1; then
   [ "$CHECK" -eq 1 ] && die "vLLM not installed in $PY"
   warn "installing vLLM (~2-3 GB, several minutes — progress below)"
-  "${PIPI[@]}" vllm || die "vLLM install failed. Output is above; the usual causes are
+  VLLM_SPEC=vllm
+  case "$DRV_CUDA" in
+    12.*)
+      VER="$(curl -fsSL https://api.github.com/repos/vllm-project/vllm/releases/latest 2>/dev/null \
+             | grep -m1 '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')"
+      ARCH="$(uname -m)"
+      if [ -n "$VER" ]; then
+        CAND="https://github.com/vllm-project/vllm/releases/download/v${VER}/vllm-${VER}+cu129-cp38-abi3-manylinux_2_28_${ARCH}.whl"
+        if curl -fsI "$CAND" >/dev/null 2>&1; then
+          VLLM_SPEC="$CAND"
+          ok "driver is CUDA $DRV_CUDA — using the cu129 build of vLLM $VER"
+        else
+          warn "no cu129 wheel published for vLLM $VER; trying the default build"
+        fi
+      fi
+      ;;
+  esac
+  "${PIPI[@]}" "$VLLM_SPEC" || die "vLLM install failed. Output is above; the usual causes are
        disk space, and a CUDA/torch combination no published wheel matches."
-  "$PY" -c "import vllm" >/dev/null 2>&1 \
-    || die "pip reported success but vLLM still will not import into $PY"
+  "$PY" -c "import vllm" >/dev/null 2>&1 || die "vLLM installed but will not import into
+       $PY. If the error mentions libcudart.so.13, the wheel wants CUDA 13 and this
+       driver is CUDA $DRV_CUDA — either update the NVIDIA driver, or install the
+       +cu129 wheel for your vLLM version from the project's GitHub releases."
 fi
 
 TORCH_BEFORE=$("$PY" -c "import torch; print(torch.__version__)" 2>/dev/null) \
