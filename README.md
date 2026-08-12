@@ -32,6 +32,9 @@ cd meetscribe-cli
 ./setup.sh
 ```
 
+It installs into `/workspace` when that is writable — the convention on rented
+GPU boxes — and `~/meetscribe` otherwise. Set `MS_WORK` to choose.
+
 Ten minutes or so, mostly downloading ~2 GB of weights. It installs vLLM,
 MOSS-Transcribe-Diarize, WeSpeaker ResNet293-LM, the pipeline, and an empty
 speaker database.
@@ -60,9 +63,8 @@ on a 2070.
 ## Use
 
 ```bash
-mkdir -p /workspace/inbox        # put your audio here
-cd /workspace/inbox
-/workspace/meetscribe-cli/transcribe .
+cd ~/recordings          # wherever your audio is
+~/meetscribe-cli/transcribe .
 ```
 
 Transcripts land in the directory you run from — a `.txt` to read and a `.json`

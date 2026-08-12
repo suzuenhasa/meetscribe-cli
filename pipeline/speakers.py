@@ -26,7 +26,18 @@ import argparse, json, os, sqlite3, time
 
 import numpy as np
 
-WORK = os.environ.get("MS_WORK", "/workspace")
+def _default_work():
+    """/workspace when it is actually writable (the rented-GPU-box convention),
+    otherwise the home directory. Matches default_work() in setup.sh."""
+    import os
+    if os.environ.get("MS_WORK"):
+        return os.environ["MS_WORK"]
+    if os.path.isdir("/workspace") and os.access("/workspace", os.W_OK):
+        return "/workspace"
+    return os.path.join(os.path.expanduser("~"), "meetscribe")
+
+
+WORK = _default_work()
 DB = os.environ.get("MS_SPEAKER_DB", os.path.join(WORK, "speakers.db"))
 EMBED_MODEL = "wespeaker-resnet293-LM"
 

@@ -10,7 +10,17 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK="${MS_WORK:-/workspace}"
+# Where the pipeline lives. /workspace is the rented-GPU-box convention and is
+# used when it is actually writable; on your own machine the filesystem root is
+# not, so fall back to the home directory rather than failing with a permission
+# error on the first mkdir.
+default_work() {
+  if [ -n "${MS_WORK:-}" ]; then printf '%s' "$MS_WORK"; return; fi
+  if [ -d /workspace ] && [ -w /workspace ]; then printf '/workspace'; return; fi
+  if [ ! -e /workspace ] && [ -w / ]; then printf '/workspace'; return; fi
+  printf '%s/meetscribe' "$HOME"
+}
+WORK="$(default_work)"
 MODEL="OpenMOSS-Team/MOSS-Transcribe-Diarize"
 WSP_REPO="Wespeaker/wespeaker-voxceleb-resnet293-LM"
 export HF_HOME="${HF_HOME:-$WORK/.hf_home}"
