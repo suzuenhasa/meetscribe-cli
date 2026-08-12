@@ -25,11 +25,16 @@
 # bench/cluster_speakers.py. Pass a number only to override it.
 set -euo pipefail
 
-HOST="${MS_HOST:-msbox}"
+# No default: a remote box only exists if you name one, via --host or MS_HOST.
+HOST="${MS_HOST:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Everything lives inside the checkout unless told otherwise.
 REMOTE="${MS_REMOTE:-${MS_WORK:-$HERE}}"
 PIPE="$REMOTE/pipeline"
+need_host() {
+  [ -n "$HOST" ] || { echo "no pipeline at $PIPE, and no --host given." >&2
+    echo "Either run ./setup.sh here, or point at a box: --host <sshhost>" >&2; exit 2; }
+}
 THR="auto"
 ROSTER=""
 ENROLL=""
@@ -45,6 +50,7 @@ GLOSSARY=""
 
 rrun() {   # execute a shell snippet where the pipeline lives
   if [ "$LOCAL" -eq 1 ]; then bash -c "$1"
+  elif [ -z "$HOST" ]; then need_host
   else
     # `|| true`: grep exits 1 when it filters every line away (a command with no
     # output, e.g. mkdir), and under `set -e` that would kill the run.

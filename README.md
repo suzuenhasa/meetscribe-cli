@@ -56,8 +56,7 @@ on an ephemeral box.
 so 8 GB works — pass `--gpu-frac 0.80` for a single file, `0.65` for a folder, so
 the concurrent embedder has room. Pre-Ampere cards (GTX 10xx, RTX 20xx, compute
 capability under 8.0) cannot do bfloat16; the engine detects that and uses
-float16, which costs nothing here. Expect roughly a third of a 3090's throughput
-on a 2070.
+float16, which costs nothing here. Throughput scales with the card.
 
 ---
 

@@ -13,7 +13,8 @@
 # spaces turned into dashes. `./speakers meetings` lists what is available.
 set -euo pipefail
 
-HOST="${MS_HOST:-msbox}"
+# No default: a remote box only exists if you name one, via --host or MS_HOST.
+HOST="${MS_HOST:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Everything lives inside the checkout unless told otherwise.
 REMOTE="${MS_REMOTE:-${MS_WORK:-$HERE}}"
@@ -29,6 +30,9 @@ run() {  # run a command where the pipeline lives
     # shellcheck disable=SC1090
     local PY; PY="$(. "$REMOTE/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
     MS_WORK="$REMOTE" "$PY" "$@"
+  elif [ -z "$HOST" ]; then
+    echo "no pipeline at $PIPE, and no --host/MS_HOST set. Run ./setup.sh here first." >&2
+    exit 2
   else
     local q=""
     for a in "$@"; do q="$q $(printf '%q' "$a")"; done

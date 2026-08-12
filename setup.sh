@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the meetscribe pipeline.
 #
-#   ./setup.sh msbox        from your laptop: copy this repo to the box and install there
+#   ./setup.sh <sshhost>    copy this repo to a remote box and install there
 #   ./setup.sh              on the machine that has the GPU: install here
 #   ./setup.sh --check      verify an existing install, change nothing
 #
