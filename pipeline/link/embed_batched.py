@@ -9,7 +9,7 @@ zeros into the speaker vector.
   python3 embed_batched.py --run runs/X_v2.json --wav data/icsi/X.wav \\
       --out link/X.npz [--batch 32] [--per-speaker 2] [--verify link/seq.npz]
 """
-import argparse, json, os, sys, time
+import argparse, json, os, sys, time, traceback
 from collections import defaultdict
 
 import numpy as np
@@ -87,11 +87,80 @@ def load_backend(name):
     return None, True
 
 
+def load_model(args):
+    """Put the embedding backend on the GPU. -> (model, fp16, scale_pcm)
+
+    Split out from embed_file so --serve can pay this once for a whole batch.
+    Measured on a 32-minute recording: 2.0s of actual embedding against ~5s of
+    torch import, checkpoint read and CUDA init. Per file that is invisible when
+    the files are hour-long meetings and dominant when they are short ones.
+    """
+    scale_pcm = args.backend != "eres2net"
+    fp16 = args.fp16
+    if args.backend == "eres2net":
+        model, _ = load_backend("eres2net")
+        model = model.cuda().eval()
+        fp16 = False               # not validated in half precision for this one
+    else:
+        cfg = yaml.load(open(args.config), Loader=yaml.FullLoader)
+        model = getattr(m_resnet, cfg["model"])(**cfg["model_args"])
+        sd = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        sd = sd.get("state_dict", sd)
+        sd = {k[7:] if k.startswith("module.") else k: v for k, v in sd.items()}
+        model.load_state_dict(sd, strict=False)
+        model = model.cuda().eval()
+        # ResNet293 is compute-bound (90 clips/s fp32 vs ECAPA's 907 -- it convolves
+        # the spectrogram in 2D). fp16 measured 1.8x with no accuracy cost here.
+        if fp16:
+            model = model.half()
+    return model, fp16, scale_pcm
+
+
+def serve(args):
+    """Embed recordings named on stdin, one JSON job per line, until EOF.
+
+    Exists because a process per recording does not survive a large batch. The
+    caller used to spawn one embedder per transcription and only reap them after
+    the whole loop, so in-flight embedders equalled the file count; with short
+    recordings they arrive faster than they initialise and a 122-file run died
+    after 16, taking the inference engine with it. One resident worker bounds
+    that to a single CUDA context no matter how long the queue is.
+
+      in   {"run": ..., "wav": ..., "out": ...}
+      out  {"out": ..., "ok": true|false, "err": ...}
+
+    stdout carries acks and nothing else -- diagnostics go to stderr, or they
+    would corrupt the channel.
+    """
+    model, fp16, scale_pcm = load_model(args)
+    print("SERVE ready", file=sys.stderr, flush=True)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        job = json.loads(line)
+        ack = {"out": job["out"], "ok": True}
+        try:
+            msg = embed_file(model, fp16, scale_pcm, args,
+                             job["run"], job["wav"], job["out"])
+            print(msg, file=sys.stderr, flush=True)
+        except Exception as e:
+            # One bad recording must not take the worker down: the queue behind
+            # it is still good. Report and keep serving.
+            ack = {"out": job["out"], "ok": False,
+                   "err": f"{type(e).__name__}: {e}"}
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+        print(json.dumps(ack), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True)
-    ap.add_argument("--wav", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--run")
+    ap.add_argument("--wav")
+    ap.add_argument("--out")
+    ap.add_argument("--serve", action="store_true",
+                    help="read jobs from stdin until EOF, keeping the model loaded")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--fp16", action="store_true", default=True)
     ap.add_argument("--fp32", dest="fp16", action="store_false")
@@ -107,26 +176,17 @@ def main():
     ap.add_argument("--config", default=os.path.join(WORK, "wsp_ckpt/resnet293/config.yaml"))
     ap.add_argument("--ckpt", default=os.path.join(WORK, "wsp_ckpt/resnet293/avg_model.pt"))
     args = ap.parse_args()
+    if args.serve:
+        return serve(args)
+    if not (args.run and args.wav and args.out):
+        ap.error("--run, --wav and --out are required unless --serve is given")
+    model, fp16, scale_pcm = load_model(args)
+    print(embed_file(model, fp16, scale_pcm, args, args.run, args.wav, args.out))
 
-    scale_pcm = args.backend != "eres2net"
-    if args.backend == "eres2net":
-        model, _ = load_backend("eres2net")
-        model = model.cuda().eval()
-        args.fp16 = False          # not validated in half precision for this one
-    else:
-        cfg = yaml.load(open(args.config), Loader=yaml.FullLoader)
-        model = getattr(m_resnet, cfg["model"])(**cfg["model_args"])
-        sd = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-        sd = sd.get("state_dict", sd)
-        sd = {k[7:] if k.startswith("module.") else k: v for k, v in sd.items()}
-        model.load_state_dict(sd, strict=False)
-        model = model.cuda().eval()
-        # ResNet293 is compute-bound (90 clips/s fp32 vs ECAPA's 907 -- it convolves
-        # the spectrogram in 2D). fp16 measured 1.8x with no accuracy cost here.
-        if args.fp16:
-            model = model.half()
 
-    audio, sr = sf.read(args.wav, dtype="float32", always_2d=False)
+def embed_file(model, fp16, scale_pcm, args, run, wav_path, out_path):
+    """Embed one recording and write its npz. -> the WROTE summary line."""
+    audio, sr = sf.read(wav_path, dtype="float32", always_2d=False)
     if audio.ndim > 1:
         audio = audio.mean(1)          # mix, do not discard a channel
     if sr != 16000:
@@ -139,7 +199,7 @@ def main():
             torch.from_numpy(audio), sr, 16000).numpy()
         sr = 16000
     audio = np.ascontiguousarray(audio)
-    segs = json.load(open(args.run))["segments"]
+    segs = json.load(open(run))["segments"]
 
     by = defaultdict(list)
     for i, s in enumerate(segs):
@@ -190,7 +250,7 @@ def main():
 
     with torch.no_grad():
         pz = torch.zeros(1, 200, 80).cuda()
-        probe = model(pz.half() if args.fp16 else pz)
+        probe = model(pz.half() if fp16 else pz)
         probe = probe[-1] if isinstance(probe, (tuple, list)) else probe
         emb_dim = int(probe.shape[-1])
     embs = np.zeros((len(feats), emb_dim), dtype=np.float32)
@@ -202,26 +262,27 @@ def main():
             for r, k in enumerate(chunk):
                 batch[r, :feats[k].shape[0]] = feats[k]
             xb = batch.cuda()
-            out = model(xb.half() if args.fp16 else xb)
+            out = model(xb.half() if fp16 else xb)
             out = out[-1] if isinstance(out, (tuple, list)) else out
             out = torch.nn.functional.normalize(out.float(), dim=1).cpu().numpy()
             for r, k in enumerate(chunk):
                 embs[k] = out[r]
     gpu = time.time() - t1
 
-    np.savez(args.out, emb=embs, seg_idx=np.array(ids, dtype=np.int64),
+    np.savez(out_path, emb=embs, seg_idx=np.array(ids, dtype=np.int64),
              meta=np.array(json.dumps(meta)))
-    print(f"WROTE {args.out} backend={args.backend} dim={emb_dim} "
-          f"n_segments={len(segs)} embedded={len(ids)} "
-          f"prep={prep:.1f}s gpu={gpu:.1f}s total={prep+gpu:.1f}s batches={len(groups)}")
+    msg = (f"WROTE {out_path} backend={args.backend} dim={emb_dim} "
+           f"n_segments={len(segs)} embedded={len(ids)} "
+           f"prep={prep:.1f}s gpu={gpu:.1f}s total={prep+gpu:.1f}s batches={len(groups)}")
 
     if args.verify:
         z = np.load(args.verify, allow_pickle=True)
         ref = {int(i): z["emb"][r] for r, i in enumerate(z["seg_idx"])}
         sims = [float(embs[r] @ ref[i]) for r, i in enumerate(ids) if i in ref]
         if sims:
-            print(f"VERIFY vs sequential: {len(sims)} shared, "
-                  f"cosine min={min(sims):.5f} mean={np.mean(sims):.5f}")
+            msg += (f"\nVERIFY vs sequential: {len(sims)} shared, "
+                    f"cosine min={min(sims):.5f} mean={np.mean(sims):.5f}")
+    return msg
 
 
 if __name__ == "__main__":
