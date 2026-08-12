@@ -51,14 +51,47 @@ def engine_dtype():
         return "float16"
 
 
-def build_engine(gpu_frac=0.90):
-    """Load vLLM. ~66s, so a batch loads it once and keeps it resident."""
+def build_engine(gpu_frac=0.90, max_len=None, eager=None):
+    """Load vLLM. ~66s, so a batch loads it once and keeps it resident.
+
+    On a small card the defaults do not fit and the failure is opaque -- "No
+    available memory for the cache blocks", after the weights have already
+    loaded. Two things are oversized for this workload:
+
+      max_model_len   8192 sizes the KV cache, but a 30s window with 5s of
+                      context either side generates ~800 tokens. 4096 is still
+                      generous and roughly halves the reservation.
+      CUDA graphs     capture costs ~0.5 GiB. Worth it on a big card, not worth
+                      failing to start on an 8 GiB one.
+
+    Both are chosen from free VRAM unless passed explicitly.
+    """
+    free_gib = None
+    try:
+        import torch
+        free_b, _ = torch.cuda.mem_get_info()
+        free_gib = free_b / 2**30
+    except Exception:
+        pass
+    if max_len is None:
+        max_len = 4096 if (free_gib is not None and free_gib < 10) else 8192
+    if eager is None:
+        eager = bool(free_gib is not None and free_gib < 10)
+    # Concurrency also sizes the profiling run; the default assumes a server.
+    max_seqs = 16 if (free_gib is not None and free_gib < 10) else 256
+
     t0 = time.time()
     dt = engine_dtype()
     llm = LLM(model=MODEL, trust_remote_code=True, dtype=dt,
-              gpu_memory_utilization=gpu_frac, max_model_len=8192,
-              limit_mm_per_prompt={"audio": 4})
-    print(f"engine up in {time.time()-t0:.1f}s ({dt})", flush=True)
+              gpu_memory_utilization=gpu_frac, max_model_len=max_len,
+              enforce_eager=eager, max_num_seqs=max_seqs,
+              # ONE audio per request -- plan_windows() builds exactly that. vLLM
+              # profiles peak activation against this declared maximum, so saying 4
+              # reserves for four times the audio-encoder work that ever happens.
+              # On an 8 GiB card that alone drove available KV cache to -7.7 GiB.
+              limit_mm_per_prompt={"audio": 1})
+    print(f"engine up in {time.time()-t0:.1f}s ({dt}, ctx {max_len}"
+          + (", eager)" if eager else ")"), flush=True)
     return llm
 
 
