@@ -4,7 +4,7 @@
 #   ./transcribe "Product Marketing Meeting.mp3"
 #   ./transcribe ~/recordings/              a whole folder — engine loads ONCE
 #   ./transcribe podcast.mp3 --overlap 0     # disable window context (default 5s)
-#   ./transcribe ~/recordings/ --gpu-frac 0.65   # small card: leave the embedder room
+#   ./transcribe ~/recordings/ --gpu-frac 0.80   # override the derived VRAM split
 #   ./transcribe podcast.mp3 --glossary "Sreeram Kannan,EigenCloud,EigenDA"
 #   ./transcribe standup.mp3 --name G01="Bob Smith"    remember this voice, by name
 #   ./transcribe standup.mp3 --roster "Bob Smith,Jane Doe"   only score these people

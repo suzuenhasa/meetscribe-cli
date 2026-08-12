@@ -24,7 +24,9 @@ meeting after that.
 
 ## Install
 
-Needs an NVIDIA GPU and `ffmpeg`. 12 GB VRAM or more — 8 GB does not fit.
+Needs an NVIDIA GPU and `ffmpeg`. 12 GB VRAM or more — 8 GB does not fit. The
+model's weights and audio encoder need ~8.3 GB before anything else, and that
+figure does not respond to tuning.
 
 ```bash
 git clone https://github.com/suzuenhasa/meetscribe-cli.git
@@ -118,13 +120,15 @@ Back it up.
 | `--window` | `30` | seconds per window |
 | `--overlap` | `5` | context each side |
 | `--thr` | `auto` | speaker-clustering cut |
-| `--gpu-frac` | `0.90` / `0.72` | VRAM vLLM reserves |
+| `--gpu-frac` | auto | VRAM vLLM reserves |
 | `--host` | — | run the GPU work on a remote box over ssh |
 
 The defaults are measured, not guessed. `--window` longer is slower *and* no more
 accurate. `--thr` used to be a constant and a wrong value silently merged every
-speaker into one; it now derives itself per recording. `--gpu-frac` is a hard
-reservation — the batch default is lower because the embedder runs concurrently.
+speaker into one; it now derives itself per recording. `--gpu-frac` likewise: the
+engine's cost is a fixed ~8.3 GB regardless of card, so any single fraction is
+wrong somewhere — it reserves what the speaker embedder needs alongside and gives
+vLLM the rest. You should not need to set it.
 
 ---
 

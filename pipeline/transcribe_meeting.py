@@ -51,40 +51,84 @@ def engine_dtype():
         return "float16"
 
 
+# The engine's fixed cost, measured rather than assumed. On an RTX 3080 Ti
+# (11.63 GiB usable, vLLM 0.27.1), three repeats at each of gpu_frac 0.85 / 0.90
+# / 0.94 reported available KV of 1.59 / 2.17 / 2.64 GiB -- identical across
+# repeats, and implying the same overhead every time:
+#
+#     available_kv = gpu_frac * total_gib - 8.29
+#
+# It is a CONSTANT, not a share of the card. That is the whole reason one
+# --gpu-frac cannot serve two card sizes: 0.72 leaves 8.7 GiB of KV on a 24 GiB
+# card and -0.8 GiB on a 12 GiB one, so the same value works and silently fails.
+#
+# It is also not tunable. Measured on that card against the three knobs that look
+# like they should move it:
+#     max_num_seqs 256 -> 16       saves 0.15 GiB
+#     max_model_len 8192 -> 4096   OOMs, trying to allocate 4.12 GiB at once
+#     max_num_batched_tokens       no consistent effect
+# vLLM 0.27 enables chunked prefill, so the profiling peak no longer scales with
+# max_num_seqs the way it did when this was first tuned on an 8 GiB card.
+ENGINE_OVERHEAD_GIB = 8.3     # ~1.7 weights + ~6.6 audio-encoder activation
+KV_MIN_GIB = 0.9              # vLLM will not start without one max_model_len seq
+
+# WeSpeaker's peak. It runs in a SEPARATE process, so it has to come out of what
+# vLLM does not reserve. Measured by pinning vLLM's share and running the embedder
+# against the remainder: at 1.49 GiB free --batch 32 OOMs and --batch 8 survives;
+# at 0.91 GiB free both OOM. On an empty card it takes 4.2 GiB, but that is the
+# caching allocator growing into free space rather than a requirement.
+EMBED_RESERVE_GIB = {32: 4.3, 8: 1.6}
+
+
+def plan_gpu_split(total_gib=None, concurrent_embed=True):
+    """Divide the card between vLLM and the embedder. -> (gpu_frac, embed_batch)
+
+    Works in absolute GiB and converts to a fraction only at the end, because
+    every quantity involved is absolute. Prefers the large embedder batch and
+    falls back to the small one, so a 24 GiB card keeps full embedding throughput
+    while a 12 GiB card still runs at all.
+
+    Exits naming the actual numbers when the card cannot fit both. vLLM's own
+    error arrives after the weights have loaded and blames gpu_memory_utilization,
+    which sends you tuning the one thing that cannot help.
+    """
+    if total_gib is None:
+        import torch
+        total_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
+
+    for batch in (32, 8):
+        reserve = EMBED_RESERVE_GIB[batch] if concurrent_embed else 0.3
+        if total_gib - reserve - ENGINE_OVERHEAD_GIB >= KV_MIN_GIB:
+            return round((total_gib - reserve) / total_gib, 3), batch
+
+    floor = ENGINE_OVERHEAD_GIB + KV_MIN_GIB + EMBED_RESERVE_GIB[8]
+    raise SystemExit(
+        f"this GPU has {total_gib:.1f} GiB; the pipeline needs {floor:.1f} GiB:\n"
+        f"  {ENGINE_OVERHEAD_GIB:.1f}  model weights + audio-encoder activation\n"
+        f"  {KV_MIN_GIB:.1f}  KV cache for a single window\n"
+        f"  {EMBED_RESERVE_GIB[8]:.1f}  the speaker embedder, which runs alongside\n"
+        f"The first figure is a floor and does not respond to tuning. 12 GiB is "
+        f"the smallest card that fits.")
+
+
 def build_engine(gpu_frac=0.90, max_len=None, eager=None):
     """Load vLLM. ~66s, so a batch loads it once and keeps it resident.
 
-    On a small card the defaults do not fit and the failure is opaque -- "No
-    available memory for the cache blocks", after the weights have already
-    loaded. Three things are oversized for this workload, in order of how much
-    they actually cost (measured on an 8 GiB card, where available KV cache was
-    -7.7 GiB before any of this):
-
-      max_num_seqs    the big one. The default assumes a server; the profiling
-                      run sizes itself against it. Dropping 256 -> 2 recovered
-                      about 6 GiB.
-      max_model_len   8192 sizes the KV cache, but a 30 s window with 5 s of
-                      context either side generates ~800 tokens.
-      CUDA graphs     capture costs ~0.5 GiB.
-
-    All three are chosen from free VRAM unless passed explicitly. Note this is
-    mitigation, not a fix: 8 GiB still does not fit even at max_num_seqs=1,
-    max_model_len=1024 and eager. The floor is audio-encoder activation, not the
-    1.7 GiB of weights. 12 GiB is the real requirement.
+    On a card that cannot hold ENGINE_OVERHEAD_GIB the failure is opaque: vLLM
+    names gpu_memory_utilization as the cause, after the weights have already
+    loaded. plan_gpu_split() sizes gpu_frac so that does not happen, and explains
+    the numbers first-hand.
     """
-    free_gib = None
-    try:
-        import torch
-        free_b, _ = torch.cuda.mem_get_info()
-        free_gib = free_b / 2**30
-    except Exception:
-        pass
+    # These used to shrink themselves on a small card. Measured, that made things
+    # worse, not better: max_model_len 4096 OOMs during profiling where 8192
+    # succeeds, because a shorter context changes how the audio encoder's prefill
+    # is chunked and it attempts a 4.12 GiB allocation in one block. Sizing is
+    # gpu_frac's job now -- see plan_gpu_split.
     if max_len is None:
-        max_len = 4096 if (free_gib is not None and free_gib < 10) else 8192
+        max_len = 8192
     if eager is None:
-        eager = bool(free_gib is not None and free_gib < 10)
-    # Concurrency also sizes the profiling run; the default assumes a server.
-    max_seqs = 16 if (free_gib is not None and free_gib < 10) else 256
+        eager = False
+    max_seqs = 256
 
     t0 = time.time()
     dt = engine_dtype()

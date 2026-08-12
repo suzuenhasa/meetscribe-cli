@@ -62,10 +62,12 @@ def main():
                          "sanitised for the trip over ssh; this restores what "
                          "the human actually called the meeting.")
     ap.add_argument("--thr", default="auto")
-    ap.add_argument("--gpu-frac", type=float, default=0.72,
-                    help="vLLM's pool. The rest is headroom for the concurrent "
-                         "embedder: vLLM pre-reserves its whole pool, so at 0.85 it "
-                         "took 22 of 23.5 GiB and every embed subprocess OOM'd.")
+    ap.add_argument("--gpu-frac", type=float, default=None,
+                    help="vLLM's share of the card; the rest is headroom for the "
+                         "concurrent embedder. Derived from the card's size by "
+                         "default -- the engine's cost is a constant, so no single "
+                         "fraction is right for both a 12 and a 24 GiB card. Pass "
+                         "a value only to override that.")
     ap.add_argument("--no-overlap-embed", action="store_true",
                     help="wait for each embed instead of overlapping it")
     a = ap.parse_args()
@@ -81,7 +83,12 @@ def main():
 
     t_start = time.time()
     ptxt = TM.build_prompt(a.glossary)
-    llm = TM.build_engine(a.gpu_frac)
+    auto_frac, embed_batch = TM.plan_gpu_split()
+    gpu_frac = a.gpu_frac if a.gpu_frac is not None else auto_frac
+    if a.gpu_frac is None:
+        print(f"gpu split: vLLM {gpu_frac:.2f}, embedder --batch {embed_batch}",
+              flush=True)
+    llm = TM.build_engine(gpu_frac)
     startup = time.time() - t_start
     print(f"engine resident after {startup:.1f}s — {len(files)} meetings queued\n", flush=True)
 
@@ -110,7 +117,8 @@ def main():
         env.pop("CUDA_VISIBLE_DEVICES", None)     # vLLM rewrites this for its workers
         log = open(out / f"{name}_embed.log", "w")
         p = subprocess.Popen([PY, f"{PIPE}/link/embed_batched.py", "--run", str(raw),
-                              "--wav", str(f), "--out", str(out / f"{name}_emb.npz")],
+                              "--wav", str(f), "--out", str(out / f"{name}_emb.npz"),
+                              "--batch", str(embed_batch)],
                              stdout=log, stderr=subprocess.STDOUT, env=env)
         if a.no_overlap_embed:
             p.wait()
@@ -132,10 +140,14 @@ def main():
     for name, f, _ in pending:
         if name in failed:
             continue
+        # Inherit stdout/stderr rather than discarding them. link.py is where
+        # CLUSTER, LOW-SEPARATION and FLOOR-VIOLATION are reported, and the
+        # troubleshooting docs tell people to read exactly those -- while the
+        # docs also recommend folder mode, which is this path. Discarding them
+        # here also hid link.py crashing outright.
         subprocess.run([PY, f"{PIPE}/link/link.py", "--run", str(out / f"{name}_raw.json"),
                         "--npz", str(out / f"{name}_emb.npz"), "--thr", a.thr,
-                        "--out", str(out / f"{name}_linked.json")],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                        "--out", str(out / f"{name}_linked.json")], env=env)
         subprocess.run([PY, f"{PIPE}/identify.py",
                         "--clusters", str(out / f"{name}_linked_clusters.npz"),
                         "--meeting", name, "--roster", a.roster,
