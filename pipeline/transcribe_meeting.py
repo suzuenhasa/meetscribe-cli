@@ -56,15 +56,21 @@ def build_engine(gpu_frac=0.90, max_len=None, eager=None):
 
     On a small card the defaults do not fit and the failure is opaque -- "No
     available memory for the cache blocks", after the weights have already
-    loaded. Two things are oversized for this workload:
+    loaded. Three things are oversized for this workload, in order of how much
+    they actually cost (measured on an 8 GiB card, where available KV cache was
+    -7.7 GiB before any of this):
 
-      max_model_len   8192 sizes the KV cache, but a 30s window with 5s of
-                      context either side generates ~800 tokens. 4096 is still
-                      generous and roughly halves the reservation.
-      CUDA graphs     capture costs ~0.5 GiB. Worth it on a big card, not worth
-                      failing to start on an 8 GiB one.
+      max_num_seqs    the big one. The default assumes a server; the profiling
+                      run sizes itself against it. Dropping 256 -> 2 recovered
+                      about 6 GiB.
+      max_model_len   8192 sizes the KV cache, but a 30 s window with 5 s of
+                      context either side generates ~800 tokens.
+      CUDA graphs     capture costs ~0.5 GiB.
 
-    Both are chosen from free VRAM unless passed explicitly.
+    All three are chosen from free VRAM unless passed explicitly. Note this is
+    mitigation, not a fix: 8 GiB still does not fit even at max_num_seqs=1,
+    max_model_len=1024 and eager. The floor is audio-encoder activation, not the
+    1.7 GiB of weights. 12 GiB is the real requirement.
     """
     free_gib = None
     try:
@@ -85,10 +91,12 @@ def build_engine(gpu_frac=0.90, max_len=None, eager=None):
     llm = LLM(model=MODEL, trust_remote_code=True, dtype=dt,
               gpu_memory_utilization=gpu_frac, max_model_len=max_len,
               enforce_eager=eager, max_num_seqs=max_seqs,
-              # ONE audio per request -- plan_windows() builds exactly that. vLLM
-              # profiles peak activation against this declared maximum, so saying 4
-              # reserves for four times the audio-encoder work that ever happens.
-              # On an 8 GiB card that alone drove available KV cache to -7.7 GiB.
+              # ONE audio per request. This is not a tuning choice: the model
+              # declares a maximum of 1, and vLLM rejects more with
+              # "At most 1 audio(s) may be provided in one prompt". The value was
+              # 4 for a long time and was simply inert -- correcting it moved
+              # available KV cache by 0.14 GiB, which is how we know it was never
+              # the reservation it looked like.
               limit_mm_per_prompt={"audio": 1})
     print(f"engine up in {time.time()-t0:.1f}s ({dt}, ctx {max_len}"
           + (", eager)" if eager else ")"), flush=True)

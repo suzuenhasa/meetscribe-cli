@@ -1,3 +1,15 @@
+"""Turn a linked run into the transcript a person reads.
+
+  mktxt.py <linked.json> <raw.json> <out.txt> "<title>" [names.json]
+
+Speakers are numbered by how much they spoke, so Speaker 1 is the person who
+talked most -- the cluster IDs (G00, G07) are arbitrary and mean nothing to a
+reader. If names.json is given, anyone identify.py recognised gets their real
+name and the rest keep their number.
+
+Consecutive segments from one speaker are printed under a single heading; a new
+heading only appears when the speaker changes.
+"""
 import json, sys
 from collections import defaultdict
 

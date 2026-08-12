@@ -1,5 +1,9 @@
 """Persistent speaker profiles: name a voice once, recognise it thereafter.
 
+The store. Most people reach it through ./speakers at the repo root, which also
+does who/play/clips (reading the transcript and audio) and routes naming through
+identify.py. This module is the sqlite layer plus a direct CLI:
+
   speakers.py enroll  <meeting> G03 "Bob Smith"     name a cluster from a meeting
   speakers.py identify <meeting> [--roster "Bob Smith,Jane Doe"]
   speakers.py list

@@ -5,15 +5,26 @@ Pipeline
   1. aggregate the per-segment WeSpeaker embeddings into one vector per
      (window, local_speaker)  -- plain centroid of L2-normalised vectors,
      re-normalised: the strategy that won the enrollment sweep.
-  2. cluster the CORE aggregates (>= --min-core seconds of embedded speech)
-     with agglomerative average-linkage on cosine distance, cut at a distance
-     threshold.  k is whatever falls out; MOSS's count and the true count are
-     never used.
-  3. optionally refine: recompute global centroids, reassign every aggregate to
-     its nearest centroid, iterate.
+  2. cluster the CORE aggregates (>= --min-core seconds of embedded speech).
+     cluster_speakers.py owns this: constrained agglomerative linkage honouring
+     MOSS's within-window "these are different people" claims, cut where the
+     merge heights gap the most. The cut is DERIVED PER MEETING -- --thr auto is
+     the default and a fixed value is the failure mode it exists to prevent. k is
+     whatever falls out; MOSS's count and the true count are never used.
+  3. refine leave-one-out: reassign each aggregate to its nearest centroid with
+     ITSELF excluded from that centroid. Including it means a turn in a small
+     cluster is compared against a centroid that is mostly itself, so it can
+     never move however well it matches its real speaker.
   4. weak aggregates (below --min-core, or with no embeddable segment at all)
      are attached to the nearest global centroid.
-  5. write the run back out with a `global` field per segment.
+  5. write the run back out with a `global` field per segment, plus a
+     <out>_clusters.npz holding one centroid per speaker -- that file is what
+     identify.py matches against the profile store, and it is 17 KB, so it
+     travels back from a GPU box while the audio does not.
+
+Prints FLOOR-VIOLATION when the speaker count comes out below the number MOSS
+heard talking inside a single window. That contradiction sat in our own data
+while the clustering returned 1, and nothing checked it.
 
 k is also estimated independently by eigengap and by silhouette, purely as a
 cross-check on the threshold-based k.
