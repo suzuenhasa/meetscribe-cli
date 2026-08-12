@@ -32,8 +32,9 @@ cd meetscribe-cli
 ./setup.sh
 ```
 
-It installs into `/workspace` when that is writable — the convention on rented
-GPU boxes — and `~/meetscribe` otherwise. Set `MS_WORK` to choose.
+Everything lands **inside the checkout** — the virtualenv, the ~2 GB of weights,
+`speakers.db`, the work directories. Nothing is written outside it, so deleting
+the folder removes the install and two checkouts never share state.
 
 Ten minutes or so, mostly downloading ~2 GB of weights. It installs vLLM,
 MOSS-Transcribe-Diarize, WeSpeaker ResNet293-LM, the pipeline, and an empty
@@ -44,8 +45,8 @@ installs vLLM into that — nothing to set up first. If torch is already there
 (most GPU images), it installs alongside it rather than pulling a second copy,
 because a duplicate torch shadows the working one and fails confusingly.
 
-Re-run it any time — it is idempotent, and needed again after a container
-recycle if your box wipes `/workspace`.
+Re-run it any time — it is idempotent, and needed again after a container recycle
+on an ephemeral box.
 
 ```bash
 ./setup.sh --check      # verify an install, change nothing
@@ -91,8 +92,8 @@ engine resident after 68.9s — 6 meetings queued
 Shorter to type — add to `~/.bashrc`:
 
 ```bash
-alias transcribe='/workspace/meetscribe-cli/transcribe'
-alias speakers='/workspace/meetscribe-cli/speakers'
+alias transcribe='~/meetscribe-cli/transcribe'
+alias speakers='~/meetscribe-cli/speakers'
 ```
 
 ---
@@ -275,8 +276,8 @@ numbered rather than guessing.
 bare `python3`. Use the one it recorded:
 
 ```bash
-source /workspace/env.sh
-"$MS_PY" /workspace/batch.py /workspace/inbox/*.mp3 --out-dir /workspace/out
+source ~/meetscribe-cli/env.sh
+"$MS_PY" ~/meetscribe-cli/pipeline/batch.py ~/recordings/*.mp3 --out-dir out/
 ```
 
 **vLLM won't start**, opaque engine error. Usually the process budget:
@@ -312,7 +313,7 @@ setup.sh                installs everything; --check verifies
 glossary.txt.example    copy to glossary.txt beside your recordings
 preview.py              backs speakers who / play / clips
 
-pipeline/               deployed to $MS_WORK by setup.sh
+pipeline/               run in place; setup.sh copies nothing
   transcribe_meeting.py   MOSS on vLLM, windowed, one file
   batch.py                a queue, engine resident, embedding overlapped
   cluster_speakers.py     constrained clustering + self-calibrated cut

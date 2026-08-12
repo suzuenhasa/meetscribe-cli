@@ -5,22 +5,16 @@
 #   ./setup.sh              on the machine that has the GPU: install here
 #   ./setup.sh --check      verify an existing install, change nothing
 #
-# Idempotent. Re-run after a container recycle — rented boxes usually wipe
-# /workspace, and this puts it all back.
+# Idempotent. Everything lands inside this checkout, so deleting the directory
+# removes the install. Re-run after a container recycle on an ephemeral box.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Where the pipeline lives. /workspace is the rented-GPU-box convention and is
-# used when it is actually writable; on your own machine the filesystem root is
-# not, so fall back to the home directory rather than failing with a permission
-# error on the first mkdir.
-default_work() {
-  if [ -n "${MS_WORK:-}" ]; then printf '%s' "$MS_WORK"; return; fi
-  if [ -d /workspace ] && [ -w /workspace ]; then printf '/workspace'; return; fi
-  if [ ! -e /workspace ] && [ -w / ]; then printf '/workspace'; return; fi
-  printf '%s/meetscribe' "$HOME"
-}
-WORK="$(default_work)"
+# Everything lives inside this checkout: the venv, the weights, the profile
+# store, the work directories. Nothing is written outside it, so removing the
+# directory removes the install, and two checkouts do not share state.
+WORK="${MS_WORK:-$HERE}"
+PIPE="$WORK/pipeline"
 MODEL="OpenMOSS-Team/MOSS-Transcribe-Diarize"
 WSP_REPO="Wespeaker/wespeaker-voxceleb-resnet293-LM"
 export HF_HOME="${HF_HOME:-$WORK/.hf_home}"
@@ -215,35 +209,32 @@ ok "wespeaker source"
 # it after a batch has already spent minutes transcribing.
 MS_WORK="$WORK" "$PY" -c "
 import os, sys, importlib.util as u
-spec = u.spec_from_file_location('eb', '$WORK/link/embed_batched.py')
+spec = u.spec_from_file_location('eb', '$PIPE/link/embed_batched.py')
 m = u.module_from_spec(spec)
 sys.argv = ['x']
 try:
     spec.loader.exec_module(m)
 except SystemExit:
     pass
-" 2>/dev/null || die "embed_batched.py cannot import — see $WORK/link/embed_batched.py"
+" 2>/dev/null || die "embed_batched.py cannot import — see $PIPE/link/embed_batched.py"
 ok "embedder imports"
 
 # ------------------------------------------------------------------- scripts
 say "Pipeline"
 if [ "$CHECK" -eq 1 ]; then
-  for f in transcribe_meeting.py cluster_speakers.py mktxt.py speakers.py identify.py \
-           link/link.py link/embed_batched.py; do
-    [ -f "$WORK/$f" ] || die "missing $WORK/$f"
+  for f in transcribe_meeting.py batch.py cluster_speakers.py mktxt.py speakers.py \
+           identify.py link/link.py link/embed_batched.py; do
+    [ -f "$PIPE/$f" ] || die "missing $PIPE/$f"
   done
   ok "scripts in place"
   [ -f "$WORK/speakers.db" ] || die "speaker database missing ($WORK/speakers.db)"
   ok "speaker database ($("$PY" -c "
 import sqlite3;print(sqlite3.connect('$WORK/speakers.db').execute('select count(*) from speakers').fetchone()[0])" 2>/dev/null || echo 0) voices enrolled)"
 else
-  mkdir -p "$WORK/link"
-  cp "$HERE"/pipeline/*.py "$WORK/"
-  cp "$HERE"/pipeline/link/*.py "$WORK/link/"
-  ok "deployed to $WORK"
   cat > "$WORK/env.sh" <<EOF
 # source $WORK/env.sh
 export MS_WORK="$WORK"
+export MS_PIPE="$PIPE"
 export HF_HOME="$HF_HOME"
 export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
 export MS_PY="$PY"
@@ -255,7 +246,7 @@ EOF
   # the names a person typed.
   MS_WORK="$WORK" "$PY" -c "
 import os, sys
-sys.path.insert(0, '$WORK')
+sys.path.insert(0, '$PIPE')
 import speakers
 c = speakers.db(); c.commit()
 n = c.execute('select count(*) from speakers').fetchone()[0]

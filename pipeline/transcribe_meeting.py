@@ -1,6 +1,6 @@
 """Full-meeting windowed transcription via vLLM, with timestamps rebased to meeting time.
 
-  python3 transcribe_meeting.py /workspace/data/icsi/Bdb001.wav --window 180 --out out.json
+  python3 transcribe_meeting.py meeting.mp3 --out out.json
 """
 import argparse, json, time
 

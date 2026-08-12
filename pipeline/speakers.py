@@ -27,14 +27,17 @@ import argparse, json, os, sqlite3, time
 import numpy as np
 
 def _default_work():
-    """/workspace when it is actually writable (the rented-GPU-box convention),
-    otherwise the home directory. Matches default_work() in setup.sh."""
+    """The checkout this file lives in. Everything -- venv, weights, profile
+    store, work directories -- stays inside it, so nothing is written outside
+    and two checkouts never share state. MS_WORK overrides."""
     import os
     if os.environ.get("MS_WORK"):
         return os.environ["MS_WORK"]
-    if os.path.isdir("/workspace") and os.access("/workspace", os.W_OK):
-        return "/workspace"
-    return os.path.join(os.path.expanduser("~"), "meetscribe")
+    here = os.path.dirname(os.path.abspath(__file__))
+    # pipeline/x.py -> repo root; pipeline/link/x.py -> repo root
+    while os.path.basename(here) in ("link", "pipeline"):
+        here = os.path.dirname(here)
+    return here
 
 
 WORK = _default_work()
@@ -87,8 +90,9 @@ def centroids_from_npz(path):
     return out
 
 
-def cluster_centroids(meeting, run_dir="/workspace/runs/batch"):
+def cluster_centroids(meeting, run_dir=None):
     """-> {cluster_id: (centroid, seconds)} for one meeting's linked output."""
+    run_dir = run_dir or os.path.join(WORK, "out")
     linked = json.load(open(f"{run_dir}/{meeting}_linked.json"))
     segs = linked["segments"] if isinstance(linked, dict) else linked
     z = np.load(f"{run_dir}/{meeting}_emb.npz", allow_pickle=True)
@@ -233,7 +237,7 @@ def cmd_forget(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run-dir", default="/workspace/runs/batch")
+    ap.add_argument("--run-dir", default=None)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     e = sub.add_parser("enroll"); e.add_argument("meeting"); e.add_argument("cluster")

@@ -14,19 +14,12 @@
 set -euo pipefail
 
 HOST="${MS_HOST:-msbox}"
-# Where the pipeline lives. /workspace is the rented-GPU-box convention and is
-# used when it is actually writable; on your own machine the filesystem root is
-# not, so fall back to the home directory rather than failing with a permission
-# error on the first mkdir.
-default_work() {
-  if [ -n "${MS_WORK:-}" ]; then printf '%s' "$MS_WORK"; return; fi
-  if [ -d /workspace ] && [ -w /workspace ]; then printf '/workspace'; return; fi
-  if [ ! -e /workspace ] && [ -w / ]; then printf '/workspace'; return; fi
-  printf '%s/meetscribe' "$HOME"
-}
-REMOTE="${MS_REMOTE:-$(default_work)}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Everything lives inside the checkout unless told otherwise.
+REMOTE="${MS_REMOTE:-${MS_WORK:-$HERE}}"
+PIPE="$REMOTE/pipeline"
 LOCAL=0
-[ -f "$REMOTE/speakers.py" ] && [ -z "${MS_FORCE_REMOTE:-}" ] && LOCAL=1
+[ -f "$PIPE/speakers.py" ] && [ -z "${MS_FORCE_REMOTE:-}" ] && LOCAL=1
 
 # setup.sh installs into whichever interpreter already owns torch and records it
 # in env.sh as MS_PY. Bare `python3` is often a different interpreter with none of
@@ -55,7 +48,7 @@ case "$CMD" in
     python3 "$HERE/preview.py" "$CMD" "$@"
     ;;
   list)
-    run "$REMOTE/speakers.py" list
+    run "$PIPE/speakers.py" list
     ;;
   meetings)
     if [ "$LOCAL" -eq 1 ]; then ls -1 "$REMOTE"/out/*_linked_clusters.npz 2>/dev/null
@@ -68,7 +61,7 @@ case "$CMD" in
     # accept the transcript path as well as the bare meeting name
     MEETING="$(basename "$MEETING")"; MEETING="${MEETING%.json}"; MEETING="${MEETING%.txt}"
     MEETING="$(echo "$MEETING" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
-    run "$REMOTE/identify.py" --clusters "$REMOTE/out/${MEETING}_linked_clusters.npz" \
+    run "$PIPE/identify.py" --clusters "$REMOTE/out/${MEETING}_linked_clusters.npz" \
         --meeting "$MEETING" --enroll "${CLUSTER}=${NAME}"
     echo
     echo "  Re-run transcribe on that meeting to see the name in the transcript,"
@@ -76,11 +69,11 @@ case "$CMD" in
     ;;
   rename)
     [ $# -ge 2 ] || { echo 'usage: ./speakers rename <id> "New Name"' >&2; exit 2; }
-    run "$REMOTE/speakers.py" rename "$1" "$2"
+    run "$PIPE/speakers.py" rename "$1" "$2"
     ;;
   forget)
     [ $# -ge 1 ] || { echo 'usage: ./speakers forget <id>' >&2; exit 2; }
-    run "$REMOTE/speakers.py" forget "$1"
+    run "$PIPE/speakers.py" forget "$1"
     ;;
   -h|--help|help)
     sed -n '2,11p' "$0"

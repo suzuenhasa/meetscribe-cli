@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Transcribe a queue of meetings with the engine loaded once.
 
-  batch.py a.mp3 b.mp3 c.wav --out-dir /workspace/out [--glossary "..."] [--roster "..."]
+  batch.py a.mp3 b.mp3 c.wav --out-dir out/ [--glossary "..."] [--roster "..."]
 
 Two reasons this exists rather than calling transcribe_meeting.py per file:
 
@@ -26,17 +26,21 @@ import transcribe_meeting as TM
 from moss_transcribe_diarize.inference_utils import load_audio_item
 
 def _default_work():
-    """/workspace when it is actually writable (the rented-GPU-box convention),
-    otherwise the home directory. Matches default_work() in setup.sh."""
+    """The checkout this file lives in. Everything -- venv, weights, profile
+    store, work directories -- stays inside it, so nothing is written outside
+    and two checkouts never share state. MS_WORK overrides."""
     import os
     if os.environ.get("MS_WORK"):
         return os.environ["MS_WORK"]
-    if os.path.isdir("/workspace") and os.access("/workspace", os.W_OK):
-        return "/workspace"
-    return os.path.join(os.path.expanduser("~"), "meetscribe")
+    here = os.path.dirname(os.path.abspath(__file__))
+    # pipeline/x.py -> repo root; pipeline/link/x.py -> repo root
+    while os.path.basename(here) in ("link", "pipeline"):
+        here = os.path.dirname(here)
+    return here
 
 
 WORK = _default_work()
+PIPE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
 
 
@@ -105,7 +109,7 @@ def main():
         env = {**os.environ, "OMP_NUM_THREADS": "4", "MS_WORK": WORK}
         env.pop("CUDA_VISIBLE_DEVICES", None)     # vLLM rewrites this for its workers
         log = open(out / f"{name}_embed.log", "w")
-        p = subprocess.Popen([PY, f"{WORK}/link/embed_batched.py", "--run", str(raw),
+        p = subprocess.Popen([PY, f"{PIPE}/link/embed_batched.py", "--run", str(raw),
                               "--wav", str(f), "--out", str(out / f"{name}_emb.npz")],
                              stdout=log, stderr=subprocess.STDOUT, env=env)
         if a.no_overlap_embed:
@@ -128,15 +132,15 @@ def main():
     for name, f, _ in pending:
         if name in failed:
             continue
-        subprocess.run([PY, f"{WORK}/link/link.py", "--run", str(out / f"{name}_raw.json"),
+        subprocess.run([PY, f"{PIPE}/link/link.py", "--run", str(out / f"{name}_raw.json"),
                         "--npz", str(out / f"{name}_emb.npz"), "--thr", a.thr,
                         "--out", str(out / f"{name}_linked.json")],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
-        subprocess.run([PY, f"{WORK}/identify.py",
+        subprocess.run([PY, f"{PIPE}/identify.py",
                         "--clusters", str(out / f"{name}_linked_clusters.npz"),
                         "--meeting", name, "--roster", a.roster,
                         "--names", str(out / f"{name}_names.json")], env=env)
-        subprocess.run([PY, f"{WORK}/mktxt.py", str(out / f"{name}_linked.json"),
+        subprocess.run([PY, f"{PIPE}/mktxt.py", str(out / f"{name}_linked.json"),
                         str(out / f"{name}_raw.json"), str(out / f"{name}.txt"),
                         titles.get(name, f.stem),
                         str(out / f"{name}_names.json")], env=env)

@@ -19,17 +19,18 @@ import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 import yaml
 
-# MS_WORK lets the pipeline live anywhere; /workspace is only the default because
-# that is where a rented GPU box puts its scratch volume.
 def _default_work():
-    """/workspace when it is actually writable (the rented-GPU-box convention),
-    otherwise the home directory. Matches default_work() in setup.sh."""
+    """The checkout this file lives in. Everything -- venv, weights, profile
+    store, work directories -- stays inside it, so nothing is written outside
+    and two checkouts never share state. MS_WORK overrides."""
     import os
     if os.environ.get("MS_WORK"):
         return os.environ["MS_WORK"]
-    if os.path.isdir("/workspace") and os.access("/workspace", os.W_OK):
-        return "/workspace"
-    return os.path.join(os.path.expanduser("~"), "meetscribe")
+    here = os.path.dirname(os.path.abspath(__file__))
+    # pipeline/x.py -> repo root; pipeline/link/x.py -> repo root
+    while os.path.basename(here) in ("link", "pipeline"):
+        here = os.path.dirname(here)
+    return here
 
 
 WORK = _default_work()

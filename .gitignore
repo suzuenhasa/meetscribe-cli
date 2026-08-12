@@ -1,11 +1,20 @@
 __pycache__/
 *.pyc
-*.npz
-*.json
-!package.json
+
+# Everything setup.sh creates lives inside this checkout.
+venv/
+.hf_home/
+wsp_ckpt/
+wespeaker_src/
+env.sh
+speakers.db
+inbox/
+out/
+runs/
+_meetscribe_src/
+
+# transcripts land beside your audio, not in here
 *.txt
 !glossary.txt.example
-!requirements.txt
-out/
-inbox/
-runs/
+*.json
+*.npz
