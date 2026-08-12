@@ -78,10 +78,23 @@ for c in "${MS_PY:-}" /usr/bin/python3 /venv/main/bin/python "$WORK/venv/bin/pyt
 done
 if [ -z "$PY" ]; then
   [ "$CHECK" -eq 1 ] && die "no interpreter with torch"
-  command -v uv >/dev/null || die "need uv (curl -LsSf https://astral.sh/uv/install.sh | sh) or preinstalled torch"
   warn "no torch anywhere — building a venv at $WORK/venv (vLLM brings its own torch)"
-  uv venv "$WORK/venv" --python 3.12 >/dev/null
+  if [ ! -x "$WORK/venv/bin/python" ]; then
+    if command -v uv >/dev/null; then
+      uv venv "$WORK/venv" --python 3.12 >/dev/null \
+        || die "uv could not create a venv at $WORK/venv"
+    else
+      # uv is faster but not required. The stdlib module is always there, so a
+      # bare machine should not be told to go and install a package manager
+      # first just to get started.
+      python3 -m venv "$WORK/venv" \
+        || die "python3 -m venv failed — on Debian/Ubuntu: apt-get install -y python3-venv"
+      "$WORK/venv/bin/python" -m pip install -q -U pip setuptools wheel \
+        || die "could not bootstrap pip inside $WORK/venv"
+    fi
+  fi
   PY="$WORK/venv/bin/python"; MODE=fresh
+  ok "created $WORK/venv"
 fi
 if command -v uv >/dev/null; then PIPI=(uv pip install --python "$PY" -q); else PIPI=("$PY" -m pip install -q); fi
 [ "$MODE" = fresh ] && { say "Installing vLLM (~2-3 GB, several minutes)"; "${PIPI[@]}" vllm || die "vLLM install failed"; }

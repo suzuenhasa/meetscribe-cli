@@ -36,6 +36,11 @@ Ten minutes or so, mostly downloading ~2 GB of weights. It installs vLLM,
 MOSS-Transcribe-Diarize, WeSpeaker ResNet293-LM, the pipeline, and an empty
 speaker database.
 
+If the machine has no torch, it builds a virtualenv at `$MS_WORK/venv` and
+installs vLLM into that — nothing to set up first. If torch is already there
+(most GPU images), it installs alongside it rather than pulling a second copy,
+because a duplicate torch shadows the working one and fails confusingly.
+
 Re-run it any time — it is idempotent, and needed again after a container
 recycle if your box wipes `/workspace`.
 
