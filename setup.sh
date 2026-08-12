@@ -107,7 +107,26 @@ if [ -z "$PY" ]; then
   PY="$WORK/venv/bin/python"; MODE=fresh
   ok "created $WORK/venv"
 fi
-if command -v uv >/dev/null; then PIPI=(uv pip install --python "$PY"); else PIPI=("$PY" -m pip install); fi
+# CUDA wheel selection. torch on PyPI ships one default CUDA build, currently
+# cu130, and a driver older than 13.x cannot load it -- the failure is
+# "CUDA initialization: The NVIDIA driver on your system is too old", after
+# several GB have already downloaded. CUDA 12.x wheels run on any 12.x driver
+# (minor-version compatibility), so match the wheel to the driver.
+DRV_CUDA="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: *[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+if command -v uv >/dev/null; then
+  # uv resolves the right CUDA variant from the installed driver itself.
+  PIPI=(uv pip install --python "$PY" --torch-backend=auto)
+  [ -n "$DRV_CUDA" ] && ok "driver supports CUDA $DRV_CUDA — uv will match the wheels"
+else
+  PIPI=("$PY" -m pip install)
+  case "$DRV_CUDA" in
+    13.*|1[4-9].*) : ;;                                   # default PyPI build is fine
+    12.[89]|12.1[0-9]) PIPI+=(--extra-index-url https://download.pytorch.org/whl/cu128) ;;
+    12.*)              PIPI+=(--extra-index-url https://download.pytorch.org/whl/cu126) ;;
+    *) warn "could not read the driver's CUDA version; using default wheels" ;;
+  esac
+  [ -n "$DRV_CUDA" ] && ok "driver supports CUDA $DRV_CUDA"
+fi
 
 # vLLM before the torch checks: a freshly created venv has neither, and vLLM
 # brings a matching torch with it.
