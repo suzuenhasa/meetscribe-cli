@@ -103,7 +103,12 @@ def _runtime_headroom_gib(total_gib):
     startable and a ceiling so a very large card does not hand over half of
     itself.
     """
-    return min(max(0.13 * total_gib, 0.8), 4.5)
+    # The floor is 1.6, not something smaller: a 6 GiB 2060 overran its budget by
+    # 1.07 GiB, and 1.6 is the value measured to hold there. An earlier version of
+    # this function used a 0.8 floor and fixed a 5090 by starving that 2060 --
+    # every meeting failed with vLLM itself out of memory before the embedder ever
+    # ran.
+    return min(max(0.13 * total_gib, 1.6), 4.5)
 
 # Concurrent sequences, which is also concurrent AUDIO items -- one per prompt --
 # so this bounds how many encoder forwards run at once, and therefore how much of
@@ -177,6 +182,41 @@ def plan_gpu_split(total_gib=None):
         f"  {_runtime_headroom_gib(total_gib):.1f}  activation headroom the engine does not reserve\n"
         f"Weights are the bulk of the first figure and cannot be reduced from "
         f"here.")
+
+
+def free_vram_gib():
+    """What is ACTUALLY free right now, rather than what we predicted."""
+    import torch
+    return torch.cuda.mem_get_info()[0] / 2**30
+
+
+def choose_embed_strategy(free_gib):
+    """Decide how to embed from a MEASUREMENT. -> (embed_batch, concurrent)
+
+    Call this once the engine is up. Everything that made the prediction
+    unreliable has resolved by then: real weights, real KV, real graphs, this
+    card, this vLLM build.
+
+    This exists because gpu_memory_utilization is not a cap. vLLM sizes KV from a
+    profiling estimate and then allocates on top of it at run time, so the memory
+    it actually occupies is never the number it was given -- measured overruns of
+    1.07 GiB on a 2060, 2.64 on a 3090 and 3.2 on a 5090 fed 16 kHz wav. Every
+    attempt to predict that gap with a constant broke on the card it was not
+    derived from: 0.72 left a 12 GiB card with no KV at all, a flat 1.6 GiB of
+    headroom failed on a 5090, and scaling it starved the 2060 it was supposed to
+    protect. There is also a feedback loop -- more headroom means less KV, which
+    means fewer concurrent windows, which means less activation to reserve
+    against, so the quantity depends on the reservation.
+
+    Asking the driver ends the argument. plan_gpu_split's answer is now a target
+    that only has to be good enough to boot; if it was optimistic the cost is
+    throughput, never a failed run, and it is known within a second of startup
+    rather than after twenty minutes of transcription.
+    """
+    for batch in (32, 8):
+        if free_gib >= EMBED_RESERVE_GIB[batch]:
+            return batch, True
+    return 8, False
 
 
 def build_engine(gpu_frac=0.90, max_len=None, eager=None, window=30.0,

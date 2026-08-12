@@ -24,21 +24,24 @@ Name a voice once and it is recognised in every meeting after that.
 Six meetings, 6.27 hours of audio, one batch, default flags. The engine loads
 once per batch however many files are in it, so it is listed separately:
 
-| GPU | VRAM | engine load | 16 kHz mono WAV | 44.1 kHz stereo MP3 |
-|---|---|---|---|---|
-| RTX 5090 | 32 GB | 75 s | **49 s — 459×** | 81 s — 278× |
-| RTX 3090 | 24 GB | 63 s | 104 s — 217× | 130 s — 174× |
-| RTX 2060 | 6 GB | 116 s | — | 1176 s — 19× |
+| GPU | VRAM | engine load | 16 kHz mono WAV | 44.1 kHz stereo MP3 | format gain |
+|---|---|---|---|---|---|
+| RTX 5090 | 32 GB | 75 s | **49 s — 459×** | 81 s — 278× | 1.65× |
+| RTX 3090 | 24 GB | 63 s | 104 s — 217× | 130 s — 174× | 1.25× |
+| RTX 2060 | 6 GB | 114 s | 857 s — 26× | 966 s — 23× | 1.13× |
 
-**Feed it 16 kHz mono and it gets 1.25–1.65× faster for nothing.** Decoding MP3
-and resampling 44.1 kHz down to the 16 kHz the model wants is real work, and it
-comes out of the same wall clock. The faster your GPU, the more that decode
-dominates — it is worth 1.25× on a 3090 and 1.65× on a 5090. If you are
-processing a library, convert once:
+**Feeding it 16 kHz mono is free speed, but how much depends on your GPU.**
+Decoding MP3 and resampling 44.1 kHz down to the 16 kHz the model wants is real
+work and comes out of the same wall clock — so the faster the card, the larger a
+share of the total that decode represents. It is worth 1.65× on a 5090 and only
+1.13× on a 2060, where the GPU is the bottleneck anyway. If you have a fast card
+and a library to get through, convert once:
 
 ```bash
 ffmpeg -i meeting.mp3 -ac 1 -ar 16000 -c:a pcm_s16le meeting.wav
 ```
+
+On a small card it is barely worth the disk space.
 
 `--overlap 0` is a further ~1.5× on top, but it is the one setting here that
 trades accuracy for speed — see Options.

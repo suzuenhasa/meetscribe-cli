@@ -75,7 +75,10 @@ class Embedder:
     """
 
     def __init__(self, batch, env, log_path):
-        self.log = open(log_path, "w")
+        # append, not truncate: a second worker may run after the first to
+        # retry what did not fit, and the first attempt's diagnostics are
+        # exactly what explains why.
+        self.log = open(log_path, "a")
         self.proc = subprocess.Popen(
             [PY, f"{PIPE}/link/embed_batched.py", "--serve", "--batch", str(batch)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
@@ -169,26 +172,35 @@ def main():
 
     t_start = time.time()
     ptxt = TM.build_prompt(a.glossary)
+    # plan_gpu_split is a TARGET, not a promise: it only has to be good enough to
+    # boot and to leave a plausible share behind. Built releasable regardless, so
+    # the fallback below is available whatever the measurement turns out to be.
     split = TM.plan_gpu_split()
-    embed_batch = split.embed_batch
     gpu_frac = a.gpu_frac if a.gpu_frac is not None else split.frac
-    # On a card too small to hold both at once, transcribe everything first and
-    # embed afterwards, with the engine released in between. Interleaving them in
-    # TIME is not enough: vLLM holds its pool for the life of the process, so a
-    # merely-sequential embedder finds exactly the memory it would have found
-    # running concurrently -- on a 6 GiB card, 45 MiB when it needed 66. Measured
-    # there, llm.sleep() hands back 3.54 of 3.90 GiB, which is the whole problem
-    # solved. The cost is the transcribe/embed overlap, which a card this size
-    # could never afford anyway.
-    deferred = not split.concurrent
-    if a.gpu_frac is None:
-        print(f"gpu split: vLLM {gpu_frac:.2f}, embedder --batch {embed_batch}"
-              + ("" if split.concurrent else
-                 " (embedding deferred — engine released first)"), flush=True)
     # window/overlap are not optional here: they set the audio-length hint the
     # engine reserves against. See build_engine's limit_mm_per_prompt comment.
     llm = TM.build_engine(gpu_frac, window=a.window, overlap=a.overlap,
-                          releasable=deferred)
+                          releasable=True)
+
+    # Now ASK the card rather than trusting the estimate. gpu_memory_utilization
+    # bounds only what vLLM's profiler measured, and it allocates on top of that
+    # at run time, so what is left is never the predicted figure. Choosing here
+    # makes an optimistic target cost throughput instead of a failed run, and
+    # surfaces it a second after startup rather than after transcribing the lot.
+    #
+    # When it does not fit, transcribe everything first and embed afterwards with
+    # the engine RELEASED in between. Separating them in time alone achieves
+    # nothing -- vLLM holds its pool for the life of the process, so a merely
+    # sequential embedder finds the same memory it would have found running
+    # concurrently: on a 6 GiB card, 45 MiB when it needed 66. llm.sleep() hands
+    # back 3.54 of 3.90 GiB there, which is the whole problem solved.
+    free = TM.free_vram_gib()
+    embed_batch, concurrent = TM.choose_embed_strategy(free)
+    deferred = not concurrent
+    print(f"gpu split: vLLM {gpu_frac:.2f} target, {free:.1f} GiB free after load"
+          f" -> embedder --batch {embed_batch}"
+          + ("" if concurrent else ", run after the engine is released"),
+          flush=True)
     startup = time.time() - t_start
     print(f"engine resident after {startup:.1f}s — {len(files)} meetings queued\n", flush=True)
 
@@ -250,26 +262,55 @@ def main():
         print(f"  {f.name[:44]:44} {dur/60:5.1f} min  transcribed {t_tr:5.1f}s  "
               f"{len(segs):4d} segs  coverage {cov:.0%}", flush=True)
 
-    if deferred:
-        # Hand the card back before the embedder asks for it. level=1 offloads
-        # the weights and drops the KV cache; level=2 on top of it raises
-        # "CUDA Error: invalid argument" in the cumem allocator, so it is one
-        # call, once, and the engine is not used again in this run.
-        print("\nreleasing the engine before embedding", flush=True)
+    def release_engine():
+        """Hand the card back. level=1 offloads the weights and drops the KV
+        cache; level=2 on top of it raises "CUDA Error: invalid argument" in the
+        cumem allocator, so it is one call, once, and the engine is not used
+        again afterwards. Measured on a 6 GiB card: 3.54 of 3.90 GiB returned."""
         try:
             llm.sleep(level=1)
+            return True
         except Exception as e:
-            print(f"!! could not release the engine ({type(e).__name__}: {e}); "
-                  f"embedding may not fit", flush=True)
-        emb = Embedder(embed_batch, env, out / "_embed.log")
-        for raw, f, npz in queued:
-            if not emb.submit(raw, f, npz):
-                print(f"\n!! embedding worker died — see {out}/_embed.log", flush=True)
+            print(f"!! could not release the engine ({type(e).__name__}: {e})",
+                  flush=True)
+            return False
 
-    acks = emb.close() if emb is not None else {}
-    failed = [name for name, f in pending
-              if not acks.get(str(out / f"{name}_emb.npz"), {}).get("ok")
-              or not (out / f"{name}_emb.npz").exists()]
+    def embed_all(jobs, why):
+        """Run a fresh worker over `jobs`. -> acks"""
+        print(f"\n{why}", flush=True)
+        worker = Embedder(embed_batch, env, out / "_embed.log")
+        for raw, f, npz in jobs:
+            if not worker.submit(raw, f, npz):
+                print(f"!! embedding worker died — see {out}/_embed.log", flush=True)
+        return worker.close()
+
+    if deferred:
+        release_engine()
+        acks = embed_all(queued, "releasing the engine before embedding")
+    else:
+        acks = emb.close()
+
+    def missing(names_and_files):
+        return [(n, f) for n, f in names_and_files
+                if not acks.get(str(out / f"{n}_emb.npz"), {}).get("ok")
+                or not (out / f"{n}_emb.npz").exists()]
+
+    # RECOVERY. Neither predicting the split nor measuring free VRAM after load
+    # is sufficient: the engine's footprint grows once requests actually flow, so
+    # room that existed at startup can be gone by the time the embedder runs.
+    # Rather than guess more precisely, react -- the transcripts are already on
+    # disk and only the vectors are missing, so release the engine and try again
+    # with the whole card. This is what makes the estimate advisory: being wrong
+    # costs one retry instead of the run.
+    lost = missing(pending)
+    if lost and not deferred:
+        again = [(out / f"{n}_raw.json", f, out / f"{n}_emb.npz") for n, f in lost]
+        if release_engine():
+            acks.update(embed_all(
+                again, f"embedding did not fit alongside the engine for "
+                       f"{len(lost)} meeting(s) — releasing it and retrying"))
+
+    failed = [n for n, _ in missing(pending)]
     t_gpu = time.time() - t_queue
     if failed:
         print(f"\n!! embedding FAILED for {', '.join(failed)} — see "
