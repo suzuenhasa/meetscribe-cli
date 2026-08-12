@@ -24,7 +24,7 @@ recognised in every meeting after that.
 
 ## Install
 
-On a machine with an NVIDIA GPU (12 GB VRAM is the practical floor) and `ffmpeg`:
+On a machine with an NVIDIA GPU and `ffmpeg`:
 
 ```bash
 git clone https://github.com/suzuenhasa/meetscribe-cli.git
@@ -42,6 +42,13 @@ recycle if your box wipes `/workspace`.
 ```bash
 ./setup.sh --check      # verify an install, change nothing
 ```
+
+**Smaller cards.** The model is 0.9B: ~1.7 GiB of weights plus ~0.7 GiB overhead,
+so 8 GB works — pass `--gpu-frac 0.80` for a single file, `0.65` for a folder, so
+the concurrent embedder has room. Pre-Ampere cards (GTX 10xx, RTX 20xx, compute
+capability under 8.0) cannot do bfloat16; the engine detects that and uses
+float16, which costs nothing here. Expect roughly a third of a 3090's throughput
+on a 2070.
 
 ---
 

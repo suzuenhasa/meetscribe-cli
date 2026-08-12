@@ -51,7 +51,15 @@ say "GPU"
 command -v nvidia-smi >/dev/null || die "no nvidia-smi; this needs an NVIDIA GPU"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | sed 's/^/   /'
 VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
-[ "$VRAM" -lt 12000 ] && warn "only ${VRAM} MiB VRAM — expect to reduce --window"
+CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
+[ -n "$CAP" ] && ok "compute capability $CAP$([ "${CAP%%.*}" -lt 8 ] 2>/dev/null && echo "  (pre-Ampere: float16 instead of bfloat16)")"
+if [ "$VRAM" -lt 9000 ]; then
+  warn "${VRAM} MiB VRAM is tight. Weights are ~1.7 GiB and overhead ~0.7 GiB, so it"
+  warn "fits, but pass --gpu-frac 0.80 for a single file and 0.65 for a folder, or"
+  warn "the concurrent embedder will not have room."
+elif [ "$VRAM" -lt 12000 ]; then
+  warn "only ${VRAM} MiB VRAM — usable; drop --gpu-frac if the embedder OOMs"
+fi
 command -v ffmpeg >/dev/null || die "ffmpeg missing (apt-get install -y ffmpeg)"
 ok "ffmpeg present"
 

@@ -38,13 +38,27 @@ def build_prompt(glossary=""):
     return proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
 
 
+def engine_dtype():
+    """bfloat16 needs compute capability 8.0 (Ampere). Turing and older -- a 2070,
+    a 1080 Ti -- top out at 7.5, and vLLM refuses to start rather than falling
+    back, so pick float16 there. Accuracy is unaffected at this model size; only
+    the numeric range differs, and nothing here needs bf16's exponent."""
+    try:
+        import torch
+        major, _ = torch.cuda.get_device_capability()
+        return "bfloat16" if major >= 8 else "float16"
+    except Exception:
+        return "float16"
+
+
 def build_engine(gpu_frac=0.90):
     """Load vLLM. ~66s, so a batch loads it once and keeps it resident."""
     t0 = time.time()
-    llm = LLM(model=MODEL, trust_remote_code=True, dtype="bfloat16",
+    dt = engine_dtype()
+    llm = LLM(model=MODEL, trust_remote_code=True, dtype=dt,
               gpu_memory_utilization=gpu_frac, max_model_len=8192,
               limit_mm_per_prompt={"audio": 4})
-    print(f"engine up in {time.time()-t0:.1f}s", flush=True)
+    print(f"engine up in {time.time()-t0:.1f}s ({dt})", flush=True)
     return llm
 
 
