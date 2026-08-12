@@ -221,6 +221,10 @@ def main():
                          "context across a boundary. A name landing right on a boundary "
                          "is the known residual failure of --glossary.")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--gpu-frac", type=float, default=0.90,
+                    help="share of VRAM vLLM reserves. It claims the whole pool up "
+                         "front, so on a small card lower this to leave room for the "
+                         "speaker embedder.")
     ap.add_argument("--glossary", default="",
                     help="comma-separated proper nouns to bias decoding toward, "
                          "e.g. 'Sreeram Kannan,EigenLayer,EigenCloud'")
@@ -239,7 +243,7 @@ def main():
     print(f"{len(reqs)} windows of {args.window:.0f}s"
           + (f" (+{args.overlap:.0f}s context each side)" if ctx else ""), flush=True)
 
-    llm = build_engine()
+    llm = build_engine(args.gpu_frac)
 
     mt = int((args.window + 2 * args.overlap) * 20)
     t1 = time.time()

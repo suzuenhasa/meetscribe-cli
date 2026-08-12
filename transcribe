@@ -4,6 +4,7 @@
 #   ./transcribe "Product Marketing Meeting.mp3"
 #   ./transcribe ~/recordings/              a whole folder — engine loads ONCE
 #   ./transcribe podcast.mp3 --overlap 0     # disable window context (default 5s)
+#   ./transcribe ~/recordings/ --gpu-frac 0.65   # small card: leave the embedder room
 #   ./transcribe podcast.mp3 --glossary "Sreeram Kannan,EigenCloud,EigenDA"
 #   ./transcribe standup.mp3 --name G01="Bob Smith"    remember this voice, by name
 #   ./transcribe standup.mp3 --roster "Bob Smith,Jane Doe"   only score these people
@@ -45,6 +46,7 @@ LOCAL=0
   && [ -z "${MS_FORCE_REMOTE:-}" ] && LOCAL=1
 WINDOW="30"
 OVERLAP="5"
+GPUFRAC=""
 SRC=""
 GLOSSARY=""
 
@@ -74,6 +76,7 @@ while [ $# -gt 0 ]; do
     --name)     ENROLL="$ENROLL --enroll $2"; shift 2 ;;
     --window)  WINDOW="$2"; shift 2 ;;
     --overlap) OVERLAP="$2"; shift 2 ;;
+    --gpu-frac) GPUFRAC="$2"; shift 2 ;;
     --host)   HOST="$2"; shift 2 ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *)        SRC="$1"; shift ;;
@@ -126,7 +129,7 @@ if [ -d "$SRC" ]; then
     "$PY" '$PIPE/batch.py' ${REMOTE_ARGS[*]@Q} --out-dir '$REMOTE/out' \
       --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \\
-      --titles '$REMOTE/out/_titles.json'
+      --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}
   "
   echo "==> retrieving"
   for f in "${BATCH[@]}"; do
@@ -167,6 +170,7 @@ rrun "
          VLLM_LOGGING_LEVEL=WARNING PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
   "$PY" '$PIPE/transcribe_meeting.py' '$REMOTE/inbox/$SAFE.$EXT' --window $WINDOW \
+      ${GPUFRAC:+--gpu-frac $GPUFRAC} \
       --overlap $OVERLAP --glossary '$GLOSSARY' \
       --out '$REMOTE/out/${SAFE}_raw.json' 2>&1 \
     | grep -E '^gen |silence gate|repetition|windows of' || true

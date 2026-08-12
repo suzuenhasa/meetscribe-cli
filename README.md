@@ -54,7 +54,7 @@ on an ephemeral box.
 
 **Smaller cards.** The model is 0.9B: ~1.7 GiB of weights plus ~0.7 GiB overhead,
 so 8 GB works — pass `--gpu-frac 0.80` for a single file, `0.65` for a folder, so
-the concurrent embedder has room. Pre-Ampere cards (GTX 10xx, RTX 20xx, compute
+the concurrent embedder has room (see Options). Pre-Ampere cards (GTX 10xx, RTX 20xx, compute
 capability under 8.0) cannot do bfloat16; the engine detects that and uses
 float16, which costs nothing here. Throughput scales with the card.
 
@@ -213,6 +213,7 @@ The defaults are measured. Change them only with a reason.
 | `--window` | `30` | seconds per transcription window |
 | `--overlap` | `5` | context each side of a window |
 | `--thr` | `auto` | speaker-clustering cut |
+| `--gpu-frac` | `0.90` / `0.72` | share of VRAM vLLM reserves |
 
 **`--window`**: longer is *slower* and no more accurate. 60 s and 90 s were both
 measured — throughput falls from 437× realtime to 315× and 254×, and neither
@@ -221,6 +222,13 @@ fixes anything. Fewer, longer prompts batch worse.
 **`--overlap`**: gives each window context across its boundaries, which is what
 fixes a name landing on a seam. It costs about 1.6× throughput, so `--overlap 0`
 is worth considering on a large bulk run where names matter less.
+
+**`--gpu-frac`**: vLLM claims its whole pool up front rather than growing into
+it, so this is a hard reservation. It defaults to 0.90 for a single file and 0.72
+for a folder — the lower figure leaves room for the speaker embedder, which runs
+*concurrently* with the next file's transcription in a batch. On an 8 GB card try
+`0.80` single / `0.65` folder. The symptom of setting it too high is the embedder
+failing with an out-of-memory error while transcription itself succeeds.
 
 **`--thr`**: this used to be a hardcoded constant, and a wrong value merged every
 speaker into one *silently* — a confident, wrong, single-speaker transcript. It
