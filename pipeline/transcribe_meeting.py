@@ -3,6 +3,7 @@
   python3 transcribe_meeting.py meeting.mp3 --out out.json
 """
 import argparse, json, time
+from collections import namedtuple
 
 import numpy as np
 from vllm import LLM, SamplingParams
@@ -51,67 +52,135 @@ def engine_dtype():
         return "float16"
 
 
-# The engine's fixed cost, measured rather than assumed. On an RTX 3080 Ti
-# (11.63 GiB usable, vLLM 0.27.1), three repeats at each of gpu_frac 0.85 / 0.90
-# / 0.94 reported available KV of 1.59 / 2.17 / 2.64 GiB -- identical across
-# repeats, and implying the same overhead every time:
+# The engine's fixed cost. It is a CONSTANT, not a share of the card, which is
+# the whole reason one --gpu-frac cannot serve two card sizes:
 #
-#     available_kv = gpu_frac * total_gib - 8.29
+#     available_kv = gpu_frac * total_gib - ENGINE_OVERHEAD_GIB
 #
-# It is a CONSTANT, not a share of the card. That is the whole reason one
-# --gpu-frac cannot serve two card sizes: 0.72 leaves 8.7 GiB of KV on a 24 GiB
-# card and -0.8 GiB on a 12 GiB one, so the same value works and silently fails.
+# vLLM reports the split at DEBUG, hidden by env.sh's VLLM_LOGGING_LEVEL=WARNING:
 #
-# It is also not tunable. Measured on that card against the three knobs that look
-# like they should move it:
-#     max_num_seqs 256 -> 16       saves 0.15 GiB
-#     max_model_len 8192 -> 4096   OOMs, trying to allocate 4.12 GiB at once
-#     max_num_batched_tokens       no consistent effect
-# vLLM 0.27 enables chunked prefill, so the profiling peak no longer scales with
-# max_num_seqs the way it did when this was first tuned on an 8 GiB card.
-ENGINE_OVERHEAD_GIB = 8.3     # ~1.7 weights + ~6.6 audio-encoder activation
+#     weights                              1.72 GiB   real, resident
+#     CUDA context + persistent allocator  0.32 GiB   real, resident
+#     transient activation headroom        6.26 GiB   reserved against a request
+#                                                     nothing here can send
+#
+# That third line was 76% of the cost and was pure profiling artifact -- see
+# build_engine's limit_mm_per_prompt comment for the mechanism and the fix.
+# Declaring the real audio length drops the total from 8.30 to 2.23-2.50 GiB at
+# no cost in throughput.
+#
+# It also explains three knobs that looked like they should have moved the old
+# figure and did not. All three are the same dummy request: max_num_seqs 256->16
+# only ever freed the sampler's logits buffer (256 x 151936 x 4 B = 0.145 GiB),
+# max_model_len 8192->4096 made it WORSE by pushing the profiler from one encoder
+# item to two (360 x 1500 x 4096 x 2 B = 4.12 GiB, exactly the allocation it died
+# on), and enforce_eager freed nothing because graphs are captured after the
+# profiling run, out of the slack rather than out of KV.
+ENGINE_OVERHEAD_GIB = 2.6     # 1.72 weights + 0.32 context + margin over 2.50
 KV_MIN_GIB = 0.9              # vLLM will not start without one max_model_len seq
 
-# WeSpeaker's peak. It runs in a SEPARATE process, so it has to come out of what
-# vLLM does not reserve. Measured by pinning vLLM's share and running the embedder
+# Headroom vLLM does NOT know it needs. gpu_memory_utilization bounds what the
+# PROFILER measured, and vLLM then sizes KV to fill whatever the profile left
+# over -- so removing the phantom 6.26 GiB did not just free memory, it handed
+# that memory to KV and left the real forward passes nowhere to run. Measured:
+# the engine overran its own budget by 2.64 GiB on a 3090 and 1.07 on a 2060,
+# and the embedder was OOM-killed in the 294 MiB that remained. The phantom had
+# been acting as an accidental runtime buffer. This is the deliberate version.
+def _runtime_headroom_gib(total_gib):
+    """Slack for activation vLLM does not reserve. Scales with the card.
+
+    gpu_memory_utilization bounds what the PROFILER measured, and the profiler
+    builds a dummy request with ONE audio item while the scheduler runs up to
+    max_num_seqs of them -- so once the 90-minute phantom is gone, concurrent
+    encoder activation is structurally under-reserved. A bigger card holds more
+    KV, runs more windows at once, and overruns by more, so a flat constant is
+    wrong at both ends.
+
+    Measured overruns past budget: 1.07 GiB on a 6 GiB 2060, 2.64 on a 24 GiB
+    3090, 3.2 on a 32 GiB 5090 fed 16 kHz wav (which, having no mp3 decode to
+    throttle it, keeps the engine fuller than mp3 does). That is close enough to
+    linear in card size to size it that way, with a floor that keeps small cards
+    startable and a ceiling so a very large card does not hand over half of
+    itself.
+    """
+    return min(max(0.13 * total_gib, 0.8), 4.5)
+
+# Concurrent sequences, which is also concurrent AUDIO items -- one per prompt --
+# so this bounds how many encoder forwards run at once, and therefore how much of
+# the headroom above can be consumed at peak.
+#
+# Measured on a 3090, six meetings, only this varying: 16 -> 128x, 64 -> 160x,
+# 256 -> 173x, 512 -> 219x*, 1024 -> 218x*. Flat past 256, and most of the gain
+# is in by 64 -- the card saturates on arithmetic long before it runs out of KV.
+# (*the 512/1024 pair was run on 16 kHz wav, hence the different absolute level;
+# what matters is that they do not beat 256.)
+#
+# So 256 costs nothing on a card with room, and capping it lower is a real 35%
+# loss -- which is exactly the mistake this constant existed to make. It is only
+# lowered on cards too small to absorb the runtime activation of a wide batch.
+def _max_num_seqs(total_gib=None):
+    if os.environ.get("MS_MAX_SEQS"):
+        return int(os.environ["MS_MAX_SEQS"])
+    if total_gib is None:
+        try:
+            import torch
+            total_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
+        except Exception:
+            return 64
+    return 256 if total_gib >= 10.0 else 64
+
+# WeSpeaker's peak. It runs in a SEPARATE process, so it comes out of what vLLM
+# does not reserve. Measured by pinning vLLM's share and running the embedder
 # against the remainder: at 1.49 GiB free --batch 32 OOMs and --batch 8 survives;
 # at 0.91 GiB free both OOM. On an empty card it takes 4.2 GiB, but that is the
 # caching allocator growing into free space rather than a requirement.
 EMBED_RESERVE_GIB = {32: 4.3, 8: 1.6}
+EMBED_SEQUENTIAL_GIB = 0.3    # not resident alongside the engine, so only slack
+
+# A namedtuple rather than a bare tuple: this grew a third field, and the last
+# time a tuple here changed width two call sites kept unpacking the old one and
+# only failed at runtime.
+GpuSplit = namedtuple("GpuSplit", "frac embed_batch concurrent")
 
 
-def plan_gpu_split(total_gib=None, concurrent_embed=True):
-    """Divide the card between vLLM and the embedder. -> (gpu_frac, embed_batch)
+def plan_gpu_split(total_gib=None):
+    """Divide the card between vLLM and the embedder. -> GpuSplit
 
     Works in absolute GiB and converts to a fraction only at the end, because
-    every quantity involved is absolute. Prefers the large embedder batch and
-    falls back to the small one, so a 24 GiB card keeps full embedding throughput
-    while a 12 GiB card still runs at all.
+    every quantity involved is absolute. Tries three tiers in order of speed:
+    a large concurrent embedder batch, a small one, and finally embedding
+    sequentially -- which gives up the overlap but reclaims 1.3 GiB, and is the
+    difference between a 4 GiB card refusing to start and running slowly.
 
-    Exits naming the actual numbers when the card cannot fit both. vLLM's own
-    error arrives after the weights have loaded and blames gpu_memory_utilization,
+    Exits naming the actual numbers when even that does not fit. vLLM's own error
+    arrives after the weights have loaded and blames gpu_memory_utilization,
     which sends you tuning the one thing that cannot help.
     """
     if total_gib is None:
         import torch
         total_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
 
-    for batch in (32, 8):
-        reserve = EMBED_RESERVE_GIB[batch] if concurrent_embed else 0.3
+    for batch, concurrent in ((32, True), (8, True), (8, False)):
+        reserve = EMBED_RESERVE_GIB[batch] if concurrent else EMBED_SEQUENTIAL_GIB
+        reserve += _runtime_headroom_gib(total_gib)
         if total_gib - reserve - ENGINE_OVERHEAD_GIB >= KV_MIN_GIB:
-            return round((total_gib - reserve) / total_gib, 3), batch
+            return GpuSplit(round((total_gib - reserve) / total_gib, 3),
+                            batch, concurrent)
 
-    floor = ENGINE_OVERHEAD_GIB + KV_MIN_GIB + EMBED_RESERVE_GIB[8]
+    floor = (ENGINE_OVERHEAD_GIB + KV_MIN_GIB + EMBED_SEQUENTIAL_GIB
+             + _runtime_headroom_gib(total_gib))
     raise SystemExit(
         f"this GPU has {total_gib:.1f} GiB; the pipeline needs {floor:.1f} GiB:\n"
-        f"  {ENGINE_OVERHEAD_GIB:.1f}  model weights + audio-encoder activation\n"
+        f"  {ENGINE_OVERHEAD_GIB:.1f}  model weights, CUDA context and activation\n"
         f"  {KV_MIN_GIB:.1f}  KV cache for a single window\n"
-        f"  {EMBED_RESERVE_GIB[8]:.1f}  the speaker embedder, which runs alongside\n"
-        f"The first figure is a floor and does not respond to tuning. 12 GiB is "
-        f"the smallest card that fits.")
+        f"  {EMBED_SEQUENTIAL_GIB:.1f}  the speaker embedder, run sequentially\n"
+        f"  {_runtime_headroom_gib(total_gib):.1f}  activation headroom the engine does not reserve\n"
+        f"Weights are the bulk of the first figure and cannot be reduced from "
+        f"here.")
 
 
-def build_engine(gpu_frac=0.90, max_len=None, eager=None):
+def build_engine(gpu_frac=0.90, max_len=None, eager=None, window=30.0,
+                 overlap=5.0, releasable=False):
     """Load vLLM. ~66s, so a batch loads it once and keeps it resident.
 
     On a card that cannot hold ENGINE_OVERHEAD_GIB the failure is opaque: vLLM
@@ -119,29 +188,49 @@ def build_engine(gpu_frac=0.90, max_len=None, eager=None):
     loaded. plan_gpu_split() sizes gpu_frac so that does not happen, and explains
     the numbers first-hand.
     """
-    # These used to shrink themselves on a small card. Measured, that made things
-    # worse, not better: max_model_len 4096 OOMs during profiling where 8192
-    # succeeds, because a shorter context changes how the audio encoder's prefill
-    # is chunked and it attempts a 4.12 GiB allocation in one block. Sizing is
-    # gpu_frac's job now -- see plan_gpu_split.
+    # These used to shrink themselves on a small card, which measured WORSE, not
+    # better -- see the ENGINE_OVERHEAD_GIB comment for why a shorter context
+    # made the profiler allocate more. Sizing is plan_gpu_split's job now.
     if max_len is None:
         max_len = 8192
     if eager is None:
         eager = False
-    max_seqs = 256
+    max_seqs = _max_num_seqs()
 
     t0 = time.time()
     dt = engine_dtype()
     llm = LLM(model=MODEL, trust_remote_code=True, dtype=dt,
               gpu_memory_utilization=gpu_frac, max_model_len=max_len,
               enforce_eager=eager, max_num_seqs=max_seqs,
-              # ONE audio per request. This is not a tuning choice: the model
-              # declares a maximum of 1, and vLLM rejects more with
-              # "At most 1 audio(s) may be provided in one prompt". The value was
-              # 4 for a long time and was simply inert -- correcting it moved
-              # available KV cache by 0.14 GiB, which is how we know it was never
-              # the reservation it looked like.
-              limit_mm_per_prompt={"audio": 1})
+              # Lets the caller hand the card back with llm.sleep() once the
+              # transcribing is done. Only requested on cards too small to hold
+              # the engine and the embedder at the same time, since it swaps in
+              # a custom allocator that a big card has no reason to pay for.
+              enable_sleep_mode=releasable,
+              # ONE audio per request, and say how LONG it is. The count is not a
+              # tuning choice -- the model declares a maximum of 1 and vLLM rejects
+              # more. The length is what reclaims 6 GiB.
+              #
+              # vLLM sizes its whole memory reservation from a dummy profiling
+              # request, and without `length` it builds that request from the
+              # model's declared MAX_AUDIO_DURATION_S of 90 minutes: 180 windows
+              # pushed through the audio encoder in a single forward, reserving
+              # 6.18 GiB (180 x the measured 35.2 MiB per-window peak). Nothing
+              # here can produce that request -- plan_windows caps every one of
+              # them at window + 2*overlap, which needs 0.071 GiB. Declaring the
+              # real length took the engine's fixed cost from 8.30 to 2.26 GiB at
+              # no cost in throughput, and is the difference between needing a
+              # 12 GiB card and running on 6.
+              #
+              # This is now a CONTRACT, not a hint: a request carrying more audio
+              # than `length` will attempt the real 6.18 GiB forward and OOM at
+              # runtime. That is why it is derived from the same window/overlap
+              # that plan_windows uses rather than hardcoded -- both are
+              # user-settable, and a fixed reservation would break under --window.
+              # The 1.25 is slack for the resampler and the model's own padding.
+              limit_mm_per_prompt={"audio": {"count": 1,
+                                             "length": int((window + 2 * overlap)
+                                                           * SR * 1.25)}})
     print(f"engine up in {time.time()-t0:.1f}s ({dt}, ctx {max_len}"
           + (", eager)" if eager else ")"), flush=True)
     return llm
@@ -328,7 +417,7 @@ def main():
     print(f"{len(reqs)} windows of {args.window:.0f}s"
           + (f" (+{args.overlap:.0f}s context each side)" if ctx else ""), flush=True)
 
-    llm = build_engine(args.gpu_frac)
+    llm = build_engine(args.gpu_frac, window=args.window, overlap=args.overlap)
 
     mt = int((args.window + 2 * args.overlap) * 20)
     t1 = time.time()

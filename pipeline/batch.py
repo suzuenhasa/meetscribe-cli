@@ -169,20 +169,34 @@ def main():
 
     t_start = time.time()
     ptxt = TM.build_prompt(a.glossary)
-    auto_frac, embed_batch = TM.plan_gpu_split()
-    gpu_frac = a.gpu_frac if a.gpu_frac is not None else auto_frac
+    split = TM.plan_gpu_split()
+    embed_batch = split.embed_batch
+    gpu_frac = a.gpu_frac if a.gpu_frac is not None else split.frac
+    # On a card too small to hold both at once, transcribe everything first and
+    # embed afterwards, with the engine released in between. Interleaving them in
+    # TIME is not enough: vLLM holds its pool for the life of the process, so a
+    # merely-sequential embedder finds exactly the memory it would have found
+    # running concurrently -- on a 6 GiB card, 45 MiB when it needed 66. Measured
+    # there, llm.sleep() hands back 3.54 of 3.90 GiB, which is the whole problem
+    # solved. The cost is the transcribe/embed overlap, which a card this size
+    # could never afford anyway.
+    deferred = not split.concurrent
     if a.gpu_frac is None:
-        print(f"gpu split: vLLM {gpu_frac:.2f}, embedder --batch {embed_batch}",
-              flush=True)
-    llm = TM.build_engine(gpu_frac)
+        print(f"gpu split: vLLM {gpu_frac:.2f}, embedder --batch {embed_batch}"
+              + ("" if split.concurrent else
+                 " (embedding deferred — engine released first)"), flush=True)
+    # window/overlap are not optional here: they set the audio-length hint the
+    # engine reserves against. See build_engine's limit_mm_per_prompt comment.
+    llm = TM.build_engine(gpu_frac, window=a.window, overlap=a.overlap,
+                          releasable=deferred)
     startup = time.time() - t_start
     print(f"engine resident after {startup:.1f}s — {len(files)} meetings queued\n", flush=True)
 
     env = {**os.environ, "OMP_NUM_THREADS": "4", "MS_WORK": WORK}
     env.pop("CUDA_VISIBLE_DEVICES", None)     # vLLM rewrites this for its workers
-    emb = Embedder(embed_batch, env, out / "_embed.log")
+    emb = None if deferred else Embedder(embed_batch, env, out / "_embed.log")
 
-    pending, unreadable = [], []
+    pending, unreadable, empty, queued = [], [], [], []
     t_queue = time.time()
     for f in files:
         name = safe(f.stem)
@@ -211,19 +225,48 @@ def main():
                   f"{str(e).splitlines()[0][:80]}", flush=True)
             continue
 
+        if not segs:
+            # MOSS returned nothing at all for this recording. Ten of forty
+            # accented-parliament clips did exactly this in one evaluation and
+            # were reported as successes carrying empty transcripts. There is
+            # nothing to embed or cluster, so say so and move on.
+            empty.append(name)
+            print(f"  {f.name[:44]:44} {dur/60:5.1f} min  NO SPEECH FOUND — "
+                  f"empty transcript", flush=True)
+            continue
+
         # Queue the embedding and move straight to the next transcription. Never
         # silence the worker: an early version sent stderr to DEVNULL and every
         # embed failed invisibly, leaving a "successful" run with no vectors.
         npz = out / f"{name}_emb.npz"
-        if not emb.submit(raw, f, npz):
-            print(f"\n!! embedding worker died — see {out}/_embed.log", flush=True)
-        if a.no_overlap_embed:
-            emb.wait_for(npz)
+        if deferred:
+            queued.append((raw, f, npz))
+        else:
+            if not emb.submit(raw, f, npz):
+                print(f"\n!! embedding worker died — see {out}/_embed.log", flush=True)
+            if a.no_overlap_embed:
+                emb.wait_for(npz)
         pending.append((name, f))
         print(f"  {f.name[:44]:44} {dur/60:5.1f} min  transcribed {t_tr:5.1f}s  "
               f"{len(segs):4d} segs  coverage {cov:.0%}", flush=True)
 
-    acks = emb.close()
+    if deferred:
+        # Hand the card back before the embedder asks for it. level=1 offloads
+        # the weights and drops the KV cache; level=2 on top of it raises
+        # "CUDA Error: invalid argument" in the cumem allocator, so it is one
+        # call, once, and the engine is not used again in this run.
+        print("\nreleasing the engine before embedding", flush=True)
+        try:
+            llm.sleep(level=1)
+        except Exception as e:
+            print(f"!! could not release the engine ({type(e).__name__}: {e}); "
+                  f"embedding may not fit", flush=True)
+        emb = Embedder(embed_batch, env, out / "_embed.log")
+        for raw, f, npz in queued:
+            if not emb.submit(raw, f, npz):
+                print(f"\n!! embedding worker died — see {out}/_embed.log", flush=True)
+
+    acks = emb.close() if emb is not None else {}
     failed = [name for name, f in pending
               if not acks.get(str(out / f"{name}_emb.npz"), {}).get("ok")
               or not (out / f"{name}_emb.npz").exists()]
@@ -237,6 +280,7 @@ def main():
 
     print(flush=True)
     env = {**os.environ, "OMP_NUM_THREADS": "4", "MS_WORK": WORK}
+    broken, broken_names = [], set()
     for name, f in pending:
         if name in failed:
             continue
@@ -245,29 +289,84 @@ def main():
         # troubleshooting docs tell people to read exactly those -- while the
         # docs also recommend folder mode, which is this path. Discarding them
         # here also hid link.py crashing outright.
-        subprocess.run([PY, f"{PIPE}/link/link.py", "--run", str(out / f"{name}_raw.json"),
-                        "--npz", str(out / f"{name}_emb.npz"), "--thr", a.thr,
-                        "--out", str(out / f"{name}_linked.json")], env=env)
-        subprocess.run([PY, f"{PIPE}/identify.py",
-                        "--clusters", str(out / f"{name}_linked_clusters.npz"),
-                        "--meeting", name, "--roster", a.roster,
-                        "--names", str(out / f"{name}_names.json")], env=env)
-        subprocess.run([PY, f"{PIPE}/mktxt.py", str(out / f"{name}_linked.json"),
+        #
+        # And CHECK the return codes. These ran unchecked, so when link.py died
+        # on one recording the run still printed its meeting count and exited 0,
+        # with that transcript simply absent -- 122 embeddings and 121 texts,
+        # which nothing reported. A missing output is a failure, not a quiet
+        # difference in the file count.
+        steps = [
+            ("link", [PY, f"{PIPE}/link/link.py", "--run", str(out / f"{name}_raw.json"),
+                      "--npz", str(out / f"{name}_emb.npz"), "--thr", a.thr,
+                      "--out", str(out / f"{name}_linked.json")]),
+            ("identify", [PY, f"{PIPE}/identify.py",
+                          "--clusters", str(out / f"{name}_linked_clusters.npz"),
+                          "--meeting", name, "--roster", a.roster,
+                          "--names", str(out / f"{name}_names.json")]),
+            ("render", [PY, f"{PIPE}/mktxt.py", str(out / f"{name}_linked.json"),
                         str(out / f"{name}_raw.json"), str(out / f"{name}.txt"),
                         titles.get(name, f.stem),
-                        str(out / f"{name}_names.json")], env=env)
+                        str(out / f"{name}_names.json")]),
+        ]
+        # link and render are load-bearing. identify only decorates the result
+        # with names it recognises, and mktxt is explicitly written to run
+        # without it -- so aborting the chain when identify fails destroys a
+        # transcript that would have rendered fine as "Speaker N". That is the
+        # same missing-output failure this loop exists to catch, caused by the
+        # catching.
+        bad = None
+        for step, argv in steps:
+            rc = subprocess.run(argv, env=env).returncode
+            if rc == 0:
+                continue
+            if step == "identify":
+                print(f"  !! identify failed ({rc}) for {name} — speakers stay "
+                      f"numbered in this transcript", flush=True)
+                continue
+            bad = f"{name} ({step} exited {rc})"
+            break
+        if bad is None:
+            # Every step claimed success; confirm it actually left the artifacts
+            # behind, since a step can exit 0 and still write nothing.
+            missing = [p.name for p in (out / f"{name}_linked.json", out / f"{name}.txt")
+                       if not p.exists() or p.stat().st_size == 0]
+            if missing:
+                bad = f"{name} (missing {', '.join(missing)})"
+        if bad:
+            broken.append(bad)
+            broken_names.add(name)
         print(flush=True)
 
     total = time.time() - t_start
+    # Exclude post-processing failures too, not just embedding ones, or the
+    # headline still counts meetings whose transcript does not exist -- the
+    # exact "122 embeddings, 121 texts" miscount this set out to remove.
+    done = [n for n, _ in pending if n not in failed and n not in broken_names]
     mins = sum(json.load(open(out / f"{n}_raw.json"))["duration_s"]
-               for n, _ in pending if n not in failed) / 60
-    print(f"{len(pending) - len(failed)} meetings, {mins:.0f} min of audio")
+               for n in done) / 60
+    print(f"{len(done)} meetings, {mins:.0f} min of audio")
     print(f"  startup          {startup:6.1f}s  (once, not per meeting)")
     print(f"  transcribe+embed {t_gpu:6.1f}s"
           + ("  [sequential]" if a.no_overlap_embed else "  [overlapped]"))
     print(f"  total            {total:6.1f}s  ->  {mins*60/max(t_gpu,0.01):.0f}x realtime "
           f"excluding startup")
 
+    # Exit nonzero if ANY recording did not come out whole. A batch that reports
+    # success while a transcript is missing is worse than one that fails loudly:
+    # the caller has no reason to look.
+    if broken:
+        print(f"\n!! POST-PROCESSING FAILED for {len(broken)}: {'; '.join(broken)}",
+              flush=True)
+    if empty:
+        print(f"\n!! NO SPEECH FOUND in {len(empty)}: {', '.join(empty)}\n"
+              f"   These produced an empty transcript. Check the audio is speech "
+              f"and is not silent or corrupt.", flush=True)
+    n_bad = len(broken) + len(failed) + len(unreadable) + len(empty)
+    if n_bad:
+        print(f"\n{n_bad} of {len(files)} file(s) did not complete.", flush=True)
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

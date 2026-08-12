@@ -17,16 +17,40 @@ Finance & Corporate Committee - Zoom Meeting
   future proof meeting. So sorry about that.
 ```
 
-That took 17.7 s of GPU time. Name a voice once and it is recognised in every
-meeting after that.
+Name a voice once and it is recognised in every meeting after that.
+
+## Speed
+
+Six meetings, 6.27 hours of audio, one batch, default flags. The engine loads
+once per batch however many files are in it, so it is listed separately:
+
+| GPU | VRAM | engine load | 16 kHz mono WAV | 44.1 kHz stereo MP3 |
+|---|---|---|---|---|
+| RTX 5090 | 32 GB | 75 s | **49 s — 459×** | 81 s — 278× |
+| RTX 3090 | 24 GB | 63 s | 104 s — 217× | 130 s — 174× |
+| RTX 2060 | 6 GB | 116 s | — | 1176 s — 19× |
+
+**Feed it 16 kHz mono and it gets 1.25–1.65× faster for nothing.** Decoding MP3
+and resampling 44.1 kHz down to the 16 kHz the model wants is real work, and it
+comes out of the same wall clock. The faster your GPU, the more that decode
+dominates — it is worth 1.25× on a 3090 and 1.65× on a 5090. If you are
+processing a library, convert once:
+
+```bash
+ffmpeg -i meeting.mp3 -ac 1 -ar 16000 -c:a pcm_s16le meeting.wav
+```
+
+`--overlap 0` is a further ~1.5× on top, but it is the one setting here that
+trades accuracy for speed — see Options.
 
 ---
 
 ## Install
 
-Needs an NVIDIA GPU and `ffmpeg`. 12 GB VRAM or more — 8 GB does not fit. The
-model's weights and audio encoder need ~8.3 GB before anything else, and that
-figure does not respond to tuning.
+Needs an NVIDIA GPU and `ffmpeg`. **6 GB VRAM or more**, and compute capability
+7.0+ (Turing, GTX 16-series and RTX 20-series onward) — Pascal and older will not
+run vLLM. A 6 GB card transcribes and embeds in two passes rather than at once,
+which is slower but complete.
 
 ```bash
 git clone https://github.com/suzuenhasa/meetscribe-cli.git
@@ -37,6 +61,13 @@ cd meetscribe-cli
 Ten minutes, mostly ~2 GB of weights. Everything lands inside the checkout, so
 deleting the folder removes the install. Re-run any time; `./setup.sh --check`
 verifies without changing anything.
+
+`setup.sh` assumes an FHS-style Linux — it fetches a prebuilt Python and expects
+the usual loader paths. On NixOS and other non-FHS distributions it will not run
+as-is: use your own Python, and expect to set library paths for the NVIDIA
+driver, GCC runtime and zlib, plus a compiler and `TRITON_LIBCUDA_PATH` for
+Triton. Everything works there once those are supplied — it is a packaging
+assumption, not a limitation.
 
 ---
 
@@ -126,9 +157,15 @@ Back it up.
 The defaults are measured, not guessed. `--window` longer is slower *and* no more
 accurate. `--thr` used to be a constant and a wrong value silently merged every
 speaker into one; it now derives itself per recording. `--gpu-frac` likewise: the
-engine's cost is a fixed ~8.3 GB regardless of card, so any single fraction is
+engine's cost is a fixed ~2.6 GB regardless of card, so any single fraction is
 wrong somewhere — it reserves what the speaker embedder needs alongside and gives
 vLLM the rest. You should not need to set it.
+
+`--overlap` is the one real trade here. Each 30 s window is decoded with 5 s of
+context on both sides, so a word landing on a boundary is transcribed from a
+window that can hear the whole of it. Setting `--overlap 0` is about 1.5× faster
+and mangles words at the seams. Keep it unless throughput matters more than the
+transcript.
 
 ---
 

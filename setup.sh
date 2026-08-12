@@ -57,12 +57,23 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader | 
 VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
 [ -n "$CAP" ] && ok "compute capability $CAP$([ "${CAP%%.*}" -lt 8 ] 2>/dev/null && echo "  (pre-Ampere: float16 instead of bfloat16)")"
-if [ "$VRAM" -lt 9000 ]; then
-  warn "${VRAM} MiB VRAM is tight. Weights are ~1.7 GiB and overhead ~0.7 GiB, so it"
-  warn "fits, but pass --gpu-frac 0.80 for a single file and 0.65 for a folder, or"
-  warn "the concurrent embedder will not have room."
-elif [ "$VRAM" -lt 12000 ]; then
-  warn "only ${VRAM} MiB VRAM — usable; drop --gpu-frac if the embedder OOMs"
+# vLLM's wheels target sm_70 and up. A GTX 1080 is sm_6.1 and fails deep inside
+# vLLM with nothing that names the real cause, so say it plainly here instead.
+if [ -n "$CAP" ] && [ "${CAP%%.*}" -lt 7 ] 2>/dev/null; then
+  die "compute capability $CAP is too old. vLLM needs 7.0+ — Turing, GTX 16-series,
+       RTX 20-series or newer. Pascal cards such as the GTX 1080 cannot run this."
+fi
+# The split between vLLM and the concurrent embedder is derived from the card at
+# run time now, so there is nothing to pass by hand. Below ~7.5 GiB the embedder
+# cannot sit alongside the engine, and transcription runs to completion first
+# with the engine released before embedding -- slower, but complete.
+if [ "$VRAM" -lt 6000 ]; then
+  warn "${VRAM} MiB VRAM is under the floor. The engine needs ~2.6 GiB plus KV"
+  warn "cache, and the speaker embedder ~1.5 more. It will refuse to start rather"
+  warn "than fail after loading the weights."
+elif [ "$VRAM" -lt 7500 ]; then
+  warn "${VRAM} MiB VRAM — transcription and embedding will run in two passes"
+  warn "rather than overlapping. Measured ~19x realtime on a 6 GB RTX 2060."
 fi
 command -v ffmpeg >/dev/null || die "ffmpeg missing (apt-get install -y ffmpeg)"
 ok "ffmpeg present"
