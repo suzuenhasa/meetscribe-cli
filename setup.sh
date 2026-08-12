@@ -73,16 +73,23 @@ ok "ffmpeg present"
 # working one and everything fails in confusing ways.
 say "Python"
 mkdir -p "$WORK"
+# Reuse an interpreter ONLY if it already has torch AND vLLM -- that means a
+# prebuilt GPU image, where installing alongside is right. An interpreter with
+# torch but no vLLM is usually a conda base or a system python; installing vLLM
+# there drags in its own torch, can break the environment it was borrowed from,
+# and is not ours to modify. Build a venv inside the checkout instead.
 PY=""; MODE=""
-for c in "${MS_PY:-}" /usr/bin/python3 /venv/main/bin/python "$WORK/venv/bin/python" python3; do
+for c in "${MS_PY:-}" "$WORK/venv/bin/python" /venv/main/bin/python /usr/bin/python3 python3; do
   [ -z "$c" ] && continue
   command -v "$c" >/dev/null 2>&1 || continue
   if "$c" -c "import torch, vllm" >/dev/null 2>&1; then PY="$c"; MODE=both; break; fi
-  [ -z "$PY" ] && "$c" -c "import torch" >/dev/null 2>&1 && { PY="$c"; MODE=torch; }
 done
+if [ -z "$PY" ] && [ -x "$WORK/venv/bin/python" ]; then
+  PY="$WORK/venv/bin/python"; MODE=fresh      # half-built venv from an interrupted run
+fi
 if [ -z "$PY" ]; then
-  [ "$CHECK" -eq 1 ] && die "no interpreter with torch"
-  warn "no torch anywhere — building a venv at $WORK/venv (vLLM brings its own torch)"
+  [ "$CHECK" -eq 1 ] && die "no interpreter with vLLM"
+  warn "no interpreter with vLLM — building one at $WORK/venv (vLLM brings its own torch)"
   if [ ! -x "$WORK/venv/bin/python" ]; then
     if command -v uv >/dev/null; then
       uv venv "$WORK/venv" --python 3.12 >/dev/null \
@@ -100,11 +107,25 @@ if [ -z "$PY" ]; then
   PY="$WORK/venv/bin/python"; MODE=fresh
   ok "created $WORK/venv"
 fi
-if command -v uv >/dev/null; then PIPI=(uv pip install --python "$PY" -q); else PIPI=("$PY" -m pip install -q); fi
-[ "$MODE" = fresh ] && { say "Installing vLLM (~2-3 GB, several minutes)"; "${PIPI[@]}" vllm || die "vLLM install failed"; }
-TORCH_BEFORE=$("$PY" -c "import torch; print(torch.__version__)")
-ok "$PY  torch $TORCH_BEFORE"
-"$PY" -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" || die "torch cannot see the GPU"
+if command -v uv >/dev/null; then PIPI=(uv pip install --python "$PY"); else PIPI=("$PY" -m pip install); fi
+
+# vLLM before the torch checks: a freshly created venv has neither, and vLLM
+# brings a matching torch with it.
+if ! "$PY" -c "import vllm" >/dev/null 2>&1; then
+  [ "$CHECK" -eq 1 ] && die "vLLM not installed in $PY"
+  warn "installing vLLM (~2-3 GB, several minutes — progress below)"
+  "${PIPI[@]}" vllm || die "vLLM install failed. Output is above; the usual causes are
+       disk space, and a CUDA/torch combination no published wheel matches."
+  "$PY" -c "import vllm" >/dev/null 2>&1 \
+    || die "pip reported success but vLLM still will not import into $PY"
+fi
+
+TORCH_BEFORE=$("$PY" -c "import torch; print(torch.__version__)" 2>/dev/null) \
+  || die "no torch in $PY after installing vLLM"
+ok "$PY"
+ok "torch $TORCH_BEFORE"
+"$PY" -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" \
+  || die "torch cannot see the GPU from $PY"
 ok "CUDA visible"
 
 # --------------------------------------------------------------- pid headroom
@@ -124,10 +145,6 @@ fi
 
 # ---------------------------------------------------------------------- deps
 say "Dependencies"
-if ! "$PY" -c "import vllm" >/dev/null 2>&1; then
-  [ "$CHECK" -eq 1 ] && die "vLLM not installed"
-  "${PIPI[@]}" vllm
-fi
 "$PY" - <<'EOF' || die "this vLLM build lacks MOSS support; upgrade vLLM"
 from vllm import ModelRegistry; import sys
 sys.exit(0 if "MossTranscribeDiarizeForConditionalGeneration" in ModelRegistry.get_supported_archs() else 1)
