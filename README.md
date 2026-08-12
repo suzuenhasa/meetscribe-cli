@@ -1,10 +1,6 @@
 # meetscribe
 
-Meeting audio in, speaker-attributed transcript out. Runs on your own hardware.
-
-```bash
-./transcribe "product sync.mp3"
-```
+Meeting audio in, speaker-attributed transcript out. Runs on your own GPU.
 
 ```
 Product Marketing Meeting (weekly) 2021-06-28
@@ -26,142 +22,64 @@ recognised in every meeting after that.
 
 ---
 
-## Commands
+## Install
+
+On a machine with an NVIDIA GPU (12 GB VRAM is the practical floor) and `ffmpeg`:
 
 ```bash
-./setup.sh msbox                          install onto a GPU box over ssh
-./setup.sh                                install on this machine (needs the GPU)
-./setup.sh --check                        verify an install, change nothing
-
-./transcribe "meeting.mp3"                one file
-./transcribe ~/recordings/                a folder — engine loads once
-./transcribe m.mp3 --glossary "Acme,Bob Smith"
-./transcribe m.mp3 --roster "Bob Smith,Jane Doe"
-./transcribe m.mp3 --name G02="Bob Smith"
-
-./speakers who "meeting.json"             the voices, and what each said
-./speakers play "meeting.json" G02        HEAR that voice
-./speakers list                           who is on file
-./speakers meetings                       what you can name voices from
-./speakers name <meeting> G02 "Bob Smith"
-./speakers rename <id> "New Name"
-./speakers forget <id>
-```
-
----
-
-## Setup
-
-You need a machine with an NVIDIA GPU (12 GB VRAM is the practical floor) and
-`ffmpeg`. Everything else installs itself.
-
-### Onto a rented GPU box
-
-Your audio stays on your laptop; only the file being transcribed is uploaded.
-Add the box to `~/.ssh/config`:
-
-```
-Host msbox
-    HostName 203.0.113.42          # your instance's IP
-    Port 12345                     # and its ssh port
-    User root
-    IdentityFile ~/.ssh/id_rsa     # whatever key the provider gave you
-```
-
-Check it works, then install:
-
-```bash
-ssh msbox 'nvidia-smi --query-gpu=name,memory.total --format=csv,noheader'
-./setup.sh msbox
-```
-
-### On the machine you're sitting at
-
-If that machine has the GPU:
-
-```bash
+git clone https://github.com/suzuenhasa/meetscribe-cli.git
+cd meetscribe-cli
 ./setup.sh
 ```
 
-Either way it takes about ten minutes, mostly downloading ~2 GB of weights, and
-installs vLLM, MOSS-Transcribe-Diarize, WeSpeaker ResNet293-LM, the pipeline
-scripts, and an empty speaker database.
+Ten minutes or so, mostly downloading ~2 GB of weights. It installs vLLM,
+MOSS-Transcribe-Diarize, WeSpeaker ResNet293-LM, the pipeline, and an empty
+speaker database.
 
-It is idempotent — re-run it any time, and after a container recycle if you're on
-a rented box that wipes `/workspace`.
-
-```bash
-./setup.sh --check          # verifies everything, changes nothing
-```
-
-Set `MS_WORK` to install somewhere other than `/workspace`.
-
-### Running on the box itself
-
-`transcribe` and `speakers` detect a local install and skip ssh entirely, so
-the same commands work whether you are on your laptop or on the box:
+Re-run it any time — it is idempotent, and needed again after a container
+recycle if your box wipes `/workspace`.
 
 ```bash
-cd /workspace/meetscribe-cli
-./transcribe /workspace/inbox/          # a folder
-./speakers list
-```
-
-If you call the pipeline scripts directly instead, use the interpreter `setup.sh`
-chose — it installs into whichever python already owns torch, and bare `python3`
-is frequently a different one with none of the dependencies (the symptom is
-`ModuleNotFoundError: numpy`):
-
-```bash
-source /workspace/env.sh
-"$MS_PY" /workspace/batch.py /workspace/inbox/*.mp3 --out-dir /workspace/out
+./setup.sh --check      # verify an install, change nothing
 ```
 
 ---
 
-## Transcribing
+## Use
 
 ```bash
-cd ~/recordings
+mkdir -p /workspace/inbox        # put your audio here
+cd /workspace/inbox
+/workspace/meetscribe-cli/transcribe .
+```
+
+Transcripts land in the directory you run from — a `.txt` to read and a `.json`
+with every segment, timestamp and speaker.
+
+One file at a time works too:
+
+```bash
 transcribe "weekly sync.mp3"
 ```
 
-Writes `weekly sync.txt` and `weekly sync.json` into the **current directory**.
-The JSON has every segment with start/end times and speaker, for anything you
-want to build on top.
+Formats: `wav`, `mp3`, `m4a`, `flac`, `ogg`, `mp4`, `webm`. Any sample rate.
 
-Formats: `wav`, `mp3`, `m4a`, `flac`, `ogg`, `mp4`, `webm`. Any sample rate — it
-resamples.
-
-Make it a single word — in `~/.bashrc`:
-
-```bash
-alias transcribe='~/meetscribe-cli/transcribe'
-alias speakers='~/meetscribe-cli/speakers'
-```
-
-### A whole folder
-
-```bash
-transcribe ~/recordings/
-```
+**Point it at a folder whenever you have more than one file.** The engine takes
+~66 s to load, and a folder pays that once for the whole batch instead of per
+file, while each meeting's embedding overlaps the next one's transcription:
 
 ```
-engine resident after 68.9s — 2 meetings queued
-
-  wrapper test.mp3        3.0 min  transcribed  2.1s   38 segs  coverage 100%
-  later meeting.mp3       2.0 min  transcribed  1.6s   33 segs  coverage 100%
-
-2 meetings, 5 min of audio
+engine resident after 68.9s — 6 meetings queued
   startup            68.9s  (once, not per meeting)
-  transcribe+embed    7.7s  [overlapped]
+  transcribe+embed   107.3s  [overlapped]
 ```
 
-The engine costs ~66 s to load and that is paid **once** for the batch rather
-than once per file, and each meeting's embedding overlaps the next one's
-transcription — measured to cost vLLM about 2%, because the two bottleneck on
-different things. Ten short meetings go from about eleven minutes of pure startup
-to one.
+Shorter to type — add to `~/.bashrc`:
+
+```bash
+alias transcribe='/workspace/meetscribe-cli/transcribe'
+alias speakers='/workspace/meetscribe-cli/speakers'
+```
 
 ---
 
@@ -173,7 +91,7 @@ similar-sounding English**. `"I'm Sreeram"` came out as `"I'm sure I'm a, I'm"`;
 because the output is valid English.
 
 Tell the decoder the words exist. Drop a `glossary.txt` in the directory you run
-from — it is picked up automatically, no flag:
+from — picked up automatically, no flag:
 
 ```
 # one term per line, # for comments
@@ -183,10 +101,9 @@ EigenLayer
 ```
 
 On a 32-minute podcast this took proper nouns from almost all wrong to 51 of 52
-correct. It does not insert the terms into audio that lacks them — that was
-checked against a recording containing none of them.
+correct, and it does not insert the terms into audio that lacks them.
 
-Or inline, for a one-off:
+Inline, for a one-off:
 
 ```bash
 transcribe podcast.mp3 --glossary "Sreeram Kannan,EigenCloud"
@@ -208,48 +125,29 @@ transcribe "next week.mp3"                  # Bob Smith
 
 ### Working out who G02 is
 
-You cannot name a voice you have not heard. `who` shows every voice with what
-they actually said:
-
 ```bash
-speakers who "wrapper test.json"
+speakers who "standup.json"
 ```
 
 ```
-wrapper test   3.0 min   3 voices
-audio: wrapper test.mp3
+standup   3.0 min   3 voices
 
   G02     2.0 min   32 turns
-       [0:01:55] And what Ethereum did is expand or modularize the system so that anybody...
-       [0:02:43] year old kid in India from a random like place. He wrote this DeFi program...
-
+       [0:01:55] And what Ethereum did is expand or modularize the system so that...
   G00     0.3 min   3 turns
-       [0:00:10] Welcome to CSX Week 3. This is Infrastructure Week and we have a lot of...
-
-  G01     0.3 min   5 turns
-       [0:00:34] It's great to talk about what you're up to and also about your journey...
+       [0:00:10] Welcome to CSX Week 3. This is Infrastructure Week and we have...
 ```
 
-Often the text alone gives it away. When it doesn't, listen — it plays the
-clearest few clips of that voice straight from your audio:
+Usually the content gives it away. If not, `speakers clips` prints more of what
+one voice said, and `speakers play` plays the clearest samples — though that
+needs an audio device, so it works on a machine you're sitting at, not over ssh.
 
 ```bash
-speakers play "wrapper test.json" G02        # 3 clips
-speakers play "wrapper test.json" G02 6      # 6 clips
-speakers clips "wrapper test.json" G02       # just the timestamps, no playback
+speakers clips "standup.json" G02      # timestamps + text, works anywhere
+speakers play  "standup.json" G02      # needs an audio device
 ```
 
-Then name them:
-
-```bash
-speakers name "wrapper test" G02 "Sreeram Kannan"
-```
-
-`who` and `play` read your local transcript and audio, so keep the recording
-beside the `.json`. They need `ffplay` or `mpv` for playback; `ffmpeg` provides
-`ffplay`.
-
-Each run reports what it recognised:
+### What it reports
 
 ```
 identify: 4 voices in this meeting, 3 enrolled candidates
@@ -261,37 +159,31 @@ identify: 4 voices in this meeting, 3 enrolled candidates
 
 `=` recognised, `?` too close to call, blank is nobody on file. A voice is
 matched only if it clears **0.55** *and* beats the runner-up by **0.10**; between
-0.40 and 0.55 a person decides; below that it is treated as new. Those numbers
-are measured for centroid-to-centroid comparison and are not valid at any other
-level — a threshold fitted on clip-to-clip produced 8 false accepts out of 30
-when applied here.
+0.40 and 0.55 a person decides; below that it is treated as new.
 
 Acceptance is a max over the whole gallery, so false accepts grow with its size.
-If you know who is in the room, say so — scoring 3 people is far safer than 500:
+If you know who is in the room, say so:
 
 ```bash
 transcribe standup.mp3 --roster "Bob Smith,Jane Doe,Ravi Patel"
-```
-
-You can also name someone during the run:
-
-```bash
-transcribe standup.mp3 --name G02="Bob Smith"
 ```
 
 Managing the store:
 
 ```bash
 speakers list                     # id, name, sessions, speech on file
+speakers meetings                 # what you can name voices from
 speakers rename 3 "Robert Smith"
 speakers forget 3                 # delete a person and their voiceprints
 ```
 
-The store is one SQLite file, `speakers.db`, created by `setup.sh` beside the
-pipeline. It holds one voiceprint per person — a 256-dimension centroid averaged
-over every meeting they have been named in — plus a log of every match decision.
-**It is the only state here that cannot be rebuilt from the audio**, because it
-holds the names a person typed. Back it up.
+`speakers.db` sits beside the pipeline. One voiceprint per person — a
+256-dimension centroid averaged over every meeting they've been named in — plus
+a log of every match decision. **It is the only thing here that cannot be rebuilt
+from the audio**, because it holds names a person typed. Back it up.
+
+A voice needs **10 seconds** of speech to enroll; that is where the accuracy
+curve flattens (99.55% top-1, and two more minutes buys 0.2 points).
 
 ---
 
@@ -307,19 +199,20 @@ The defaults are measured. Change them only with a reason.
 | `--window` | `30` | seconds per transcription window |
 | `--overlap` | `5` | context each side of a window |
 | `--thr` | `auto` | speaker-clustering cut |
-| `--host` | `msbox` | which box to use |
 
 **`--window`**: longer is *slower* and no more accurate. 60 s and 90 s were both
 measured — throughput falls from 437× realtime to 315× and 254×, and neither
 fixes anything. Fewer, longer prompts batch worse.
 
+**`--overlap`**: gives each window context across its boundaries, which is what
+fixes a name landing on a seam. It costs about 1.6× throughput, so `--overlap 0`
+is worth considering on a large bulk run where names matter less.
+
 **`--thr`**: this used to be a hardcoded constant, and a wrong value merged every
 speaker into one *silently* — a confident, wrong, single-speaker transcript. It
-now derives itself per recording from the model's own within-window labels.
-Pinning it by hand re-introduces that failure.
+now derives itself per recording. Pinning it by hand re-introduces that failure.
 
-Environment: `MS_WORK` (install location), `MS_HOST` (default box),
-`MS_SPEAKER_DB` (profile store path).
+Environment: `MS_WORK` (install location), `MS_SPEAKER_DB` (profile store path).
 
 ---
 
@@ -360,11 +253,21 @@ once — a real bug, not a tuning problem.
 near a 30-second boundary, try `--overlap 10`.
 
 **Someone is recognised as the wrong person.** Use `--roster` to limit
-candidates. If two people genuinely score close, the run marks it `?` and leaves
-them numbered rather than guessing.
+candidates. If two people score close the run marks it `?` and leaves them
+numbered rather than guessing.
 
-**vLLM won't start**, with an opaque engine error. Usually the process budget;
-`setup.sh` handles it, but if it recurs: `ssh msbox 'supervisorctl stop ray'`.
+**`ModuleNotFoundError: numpy`** when calling the pipeline scripts directly.
+`setup.sh` installs into whichever python already owns torch, not necessarily
+bare `python3`. Use the one it recorded:
+
+```bash
+source /workspace/env.sh
+"$MS_PY" /workspace/batch.py /workspace/inbox/*.mp3 --out-dir /workspace/out
+```
+
+**vLLM won't start**, opaque engine error. Usually the process budget:
+`supervisorctl stop ray`. If it says free memory is near zero, something else is
+already holding the GPU — the box fits one vLLM at a time.
 
 **Anything else** — `./setup.sh --check` rules out half the causes in seconds.
 
@@ -389,13 +292,13 @@ every speaker into one on real-world audio, without any error.
 ## Layout
 
 ```
-transcribe              one file or a folder, on the machine with your audio
-speakers                who / play / name / rename / forget
-preview.py              reads the transcript + audio for who / play / clips
-setup.sh                installs everything, locally or onto a box over ssh
+transcribe              one file or a folder
+speakers                who / play / clips / name / rename / forget
+setup.sh                installs everything; --check verifies
 glossary.txt.example    copy to glossary.txt beside your recordings
+preview.py              backs speakers who / play / clips
 
-pipeline/               deployed to the GPU machine by setup.sh
+pipeline/               deployed to $MS_WORK by setup.sh
   transcribe_meeting.py   MOSS on vLLM, windowed, one file
   batch.py                a queue, engine resident, embedding overlapped
   cluster_speakers.py     constrained clustering + self-calibrated cut
@@ -405,3 +308,6 @@ pipeline/               deployed to the GPU machine by setup.sh
   link/embed_batched.py   WeSpeaker embeddings, batched
   link/link.py            segments -> global speakers
 ```
+
+`transcribe` and `speakers` can also drive a separate GPU box over ssh
+(`--host`), uploading only the audio; `./setup.sh <sshhost>` installs there.
