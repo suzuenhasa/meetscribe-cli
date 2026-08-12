@@ -1,21 +1,10 @@
 #!/usr/bin/env python3
 """Constrained speaker clustering with a per-meeting self-calibrated cut.
 
-Replaces the fixed cosine threshold, which does not survive a change of recording
-setup: 0.2656 is right for ICSI far-field room mics and collapses every speaker in
-a Zoom recording into one, silently. Measured over four meetings (k, and DER under
-the oracle speaker map where a reference exists):
-
-  method                          Bdb001(6)   Bed014(6)   Bmr011(8)   Zoom(~6)
-  fixed 0.2656          [old]     6  30.8%    6  35.6%    8  31.5%    1   <- silent failure
-  NME-SC                          5           5           5  36.4%    7
-  AHC + silhouette k              5           6           8  31.5%    2
-  AHC + max merge-gap             6  30.8%    6  35.6%    8  31.5%    4
-  CL-AHC to completion            5           5           5  36.4%    -
-  THIS: CL-AHC + max merge-gap    6  30.8%    6  35.6%    8  31.5%    7
-
-Both halves are load-bearing — the constraints alone give 5 on the Zoom file, the
-self-calibrated cut alone gives 4, together they give 7:
+The cut used to be the constant 0.2656. It is right for ICSI far-field room mics
+and collapses every speaker in a Zoom recording into one — a wrong threshold does
+not raise, it just reports one speaker. So it is now derived per recording, from
+two signals that fail in different ways:
 
 1. CANNOT-LINK. Two speaker-turns from the SAME window carrying different MOSS
    labels (S01 vs S02) cannot be the same person. MOSS asserting "two people here"
@@ -23,91 +12,36 @@ self-calibrated cut alone gives 4, together they give 7:
    suppression cannot corrupt it the way they corrupt cosine similarity. Blocked
    pairs never merge and a merged node inherits its children's blocks.
 
-   Two guards, both measured to matter: a turn must hold >= `durable` seconds to
-   constrain anything (sub-second fragments are where MOSS's labelling is least
-   reliable), and windows claiming more than `guard` distinct speakers are ignored
-   as degenerate.
+2. SELF-CALIBRATED CUT. Cut the constrained tree at the midpoint of the largest
+   gap between consecutive merge heights — where the tree stops wanting to merge.
+   No constant is fitted and nothing crosses a meeting boundary.
 
-2. SELF-CALIBRATED CUT. Sort the constrained tree's merge heights, take the
-   largest gap between consecutive heights, cut at its midpoint — the point at
-   which the tree stops wanting to merge. Nothing crosses a meeting boundary and
-   no constant is fitted. Derived cuts: 0.339 / 0.235 / 0.267 on the three ICSI
-   meetings, bracketing the old hand-fitted 0.2656 and reproducing its DER
-   exactly, and 0.659 on the Zoom file, which is the entire point.
+Both halves are load-bearing: on the Zoom recording the constraints alone find 5
+speakers, the calibrated cut alone finds 4, together they find 7. choose_threshold()
+combines them and handles the case where there is nothing to calibrate against.
 
-3. ABSORB SPLINTERS. The cut tends to shave off 3-5 second fragments — one
-   audience question, a cough — and each would become a spurious speaker. Any
-   cluster under MIN_CLUSTER_SEC is folded into its nearest neighbour. This can
-   only merge clusters too small to enroll a profile, so it never touches a real
-   speaker.
-
-4. FALLBACK. With zero cannot-link pairs MOSS never saw two people in one window,
-   so the recording is plausibly one speaker — and a largest-gap rule always finds
-   a largest gap, so it splits a monologue rather than returning k=1. With no
-   constraints to calibrate against we fall back to the constant.
-
-TRIED AND REJECTED -- do not rebuild this. A per-cluster outlier guard (expel a
-turn whose similarity sits N robust deviations below its cluster's own internal
-cohesion) was implemented and measured, aimed at the podcast's MC: they speak once
-for 12.6s, sit at 0.891 against a cluster that is internally 0.920, and get absorbed
-by cluster mass. It cannot work. On homogeneous synthetic clusters the guard expels
-someone 13-28% of the time at z>3, and needs z>=5 before false positives reach zero
--- but the MC's own score is z=3.11, ranking only 5th of 129 in that cluster, behind
-four genuine turns at 6.23/4.62/3.99/3.23. Every setting that catches the MC also
-fragments real speakers. The MC is not separable by any rule over these embeddings:
-its similarity to the cluster (0.891) is BELOW the mean of all pairs in the recording
-(0.893). That is an embedding-capacity limit, not a clustering bug.
-
-Reported but never acted on: `low_separation`, set when the merge heights barely
-span any range or the winning gap does not stand out. It means the speaker split
-is a guess. Acting on it was tried and reverted — the one recording that trips it
-is a live event whose true speaker count was higher, not lower, than the
-fall-back would have given.
-
-The min-k floor (`min_k_floor`) is a separate, embedding-free check: the most
-distinct labels MOSS emitted inside any one window. It is a floor, not a counter —
-measured 4 / 5 / 5 / 4 against true 6 / 6 / 8 / 6 — so it is used only to catch a
-clustering that has collapsed below what MOSS itself witnessed.
+TRIED AND REJECTED — do not rebuild. A per-cluster outlier guard (expel a turn
+sitting N robust deviations below its cluster's own internal cohesion) was built
+and measured, aimed at a podcast MC who speaks once for 12.6s and gets absorbed by
+cluster mass. Every setting that catches them also fragments real speakers: their
+score is z=3.11, ranking 5th of 129 in that cluster, behind four genuine turns.
+Their similarity to the cluster that swallowed them (0.891) is below the mean of
+all pairs in the recording (0.893) — an embedding-capacity limit, not a bug here.
 """
 import numpy as np
 from collections import Counter
 
 FALLBACK_THR = 0.2656   # only reached when there are no cannot-link pairs at all
 
-# A cluster holding less speech than this is absorbed into its nearest surviving
-# neighbour. Not a fitted number: it is speakers.py's MIN_ENROLL_SEC, and the
-# argument is the same one -- too little speech to support a speaker profile is
-# too little to call a speaker. It removes the 3-5 second splinters the max-gap
-# cut leaves behind without touching any cluster big enough to matter.
+# Absorption floor, see absorb_small(). Not a fitted number: it is speakers.py's
+# MIN_ENROLL_SEC, on the same argument -- too little speech to support a speaker
+# profile is too little to call a speaker.
 MIN_CLUSTER_SEC = 10.0
 
-
-# Weight of the prosody/pitch similarity when fused with the neural embedding's.
-# Measured across 7 recordings (5 with real ground truth, 4 of those never used to
-# design anything), as fraction of same-speaker pairs that look less alike than a
-# random different-speaker pair:
-#
-#   w      Bdb001  Bed002  Bed003  Bed004  Bed005   Zoom  Podcast   WORST
-#   0.00     0.0%    0.5%    1.4%    0.0%    3.1%   1.2%     6.7%    7.0%
-#   0.25     0.0%    0.9%    1.0%    0.0%    2.4%   0.8%     3.7%    3.8%
-#   1.00    20.3%   29.7%   34.2%   30.7%   31.7%  17.3%     9.4%   34.2%
-#
-# 0.2-0.35 is a plateau rather than a fitted point. Pitch alone is far worse
-# everywhere, so this is a minority vote that rescues the recordings where the
-# neural embedding has collapsed, at a cost of <=0.4pp on the ones where it has not.
-# DEFAULT 0. Pitch fusion was built to rescue embeddings that were collapsing on
-# real-world audio. That collapse turned out to be a missing resample in
-# embed_batched.py -- 44.1 kHz mp3 handed to a 16 kHz model. With the audio fixed,
-# WeSpeaker goes from d'=1.82 to d'=5.99 on the podcast unaided, and fusion changes
-# nothing while costing ~90s and two ICSI speaker-count regressions. Kept, not
-# deleted, because the machinery is measured and correct -- but off.
-PROSODY_WEIGHT = 0.0
-
-# Reported alongside the result, NOT used to change behaviour. Where the max-gap
-# cut is reliable the merge heights span 0.37-0.83 and the winning gap is 2-12x
-# the runner-up; on the one recording where the tree carries no usable structure
-# the span is 0.16 and the ratio 1.4. Low values mean the speaker split is a
-# guess, so say so rather than silently switching strategy.
+# Below either of these the speaker split is a guess. Reported, never acted on:
+# acting on it was tried and reverted, because the one recording that trips it is
+# a live event whose true speaker count was HIGHER than any fallback would give.
+# See maxgap_threshold() for what the two statistics measure.
 LOW_SPAN = 0.25
 LOW_DOMINANCE = 2.0
 
@@ -272,7 +206,6 @@ def refine_leave_one_out(Ac, lab_core, k, iters=3):
     return lab
 
 
-
 def absorb_small(lab_core, core, A, secs, min_sec=MIN_CLUSTER_SEC):
     """Fold clusters holding under `min_sec` of speech into the nearest survivor.
 
@@ -325,8 +258,7 @@ def min_k_floor(keys, secs, durable=1.0, guard=10):
     return max(counts) if counts else 1
 
 
-def choose_threshold(A, keys, secs, min_core=2.0, durable=1.0, guard=10,
-                     pros=None, weight=PROSODY_WEIGHT):
+def choose_threshold(A, keys, secs, min_core=2.0, durable=1.0, guard=10):
     """Pick this meeting's clustering cut. -> (thr, info)
 
     A: (n_keys, D) L2-normalised aggregates, aligned with `keys` and `secs`.
@@ -343,8 +275,6 @@ def choose_threshold(A, keys, secs, min_core=2.0, durable=1.0, guard=10,
     core = np.where(np.asarray(secs) >= min_core)[0]
     Ac = A[core]
     S = Ac @ Ac.T
-    if pros is not None:
-        S = fuse(S, np.asarray(pros)[core], weight)
 
     C = cannot_link_matrix([keys[i] for i in core], np.asarray(secs)[core],
                            durable, guard)
@@ -368,85 +298,8 @@ def choose_threshold(A, keys, secs, min_core=2.0, durable=1.0, guard=10,
     return thr, info
 
 
-def fuse(Se, P, weight=PROSODY_WEIGHT):
-    """Blend the embedding similarity matrix with a prosody similarity matrix.
-
-    Score-level, not feature-level: concatenating the two feature vectors was
-    measured to make things WORSE (podcast d' 1.97 -> 1.49) because the spaces
-    have incomparable scales. Each matrix is z-normalised over its own
-    off-diagonal distribution so `weight` means the same thing in both, then the
-    result is mapped back onto the embedding's original scale so that cosine
-    thresholds elsewhere in this module keep their meaning.
-    """
-    if P is None or weight <= 0 or len(Se) < 3:
-        return Se
-    P = np.asarray(P, dtype=float)
-    if P.shape[0] != Se.shape[0] or not np.isfinite(P).all():
-        return Se
-    # A turn with no voiced frames has no pitch. Such rows arrive as NaN and must
-    # stay NEUTRAL: if they are z-scored like everything else they all collapse
-    # onto the same vector, look perfectly alike, and form a junk cluster. That
-    # cost exactly +1 spurious speaker on all three ICSI meetings when this
-    # function first shipped -- DER was unchanged, which is how it was spotted.
-    valid = np.isfinite(P).all(1)
-    if valid.sum() < 3:
-        return Se
-    V = P[valid]
-    keep = V.std(0) > 1e-9
-    if keep.sum() < 2:
-        return Se
-    Z = np.zeros((len(P), int(keep.sum())))
-    Z[valid] = (V[:, keep] - V[:, keep].mean(0)) / V[:, keep].std(0)
-    Z[valid] /= np.maximum(np.linalg.norm(Z[valid], axis=1, keepdims=True), 1e-9)
-    Sp = Z @ Z.T
-
-    iu = np.triu_indices(len(Se), 1)
-    e_mu, e_sd = Se[iu].mean(), Se[iu].std() + 1e-9
-    both = np.outer(valid, valid)                   # only pairs with pitch on both sides
-    pv = Sp[both & ~np.eye(len(Se), dtype=bool)]
-    if pv.size < 2 or pv.std() < 1e-9:
-        return Se
-    F = ((Se - e_mu) / e_sd).copy()
-    fused = (1 - weight) * ((Se - e_mu) / e_sd) + weight * ((Sp - pv.mean()) / pv.std())
-    F[both] = fused[both]                           # elsewhere: embedding alone
-    F = (F / (F[iu].std() + 1e-9)) * e_sd + e_mu    # back onto the cosine scale
-    F = (F + F.T) / 2
-    np.fill_diagonal(F, 1.0)
-    return np.clip(F, -1.0, 1.0)
-
-
-def aggregate_prosody(pros, seg_idx, meta, keys):
-    """Pool per-segment prosody into one vector per (window, local) key.
-
-    Weighted by voiced-frame count (column 0), so pooling several clips
-    approximates pooling their raw pitch samples. Returns (n_keys, PROS_DIM-1)
-    aligned with `keys`, or None if the npz predates prosody extraction.
-    """
-    if pros is None or not len(pros):
-        return None
-    pos = {int(s): i for i, s in enumerate(seg_idx)}
-    dim = pros.shape[1] - 1
-    acc = {k: (np.zeros(dim), 0.0) for k in keys}
-    for m in meta:
-        k = (m["window"], m["local"])
-        if k not in acc or m["idx"] not in pos:
-            continue
-        row = pros[pos[m["idx"]]]
-        n = float(row[0])
-        if n <= 0:
-            continue
-        v, w = acc[k]
-        acc[k] = (v + row[1:] * n, w + n)
-    out = np.full((len(keys), dim), np.nan)         # NaN = no pitch, stays neutral
-    for i, k in enumerate(keys):
-        v, w = acc[k]
-        if w > 0:
-            out[i] = v / w
-    return out
-
-
 def cluster(A, secs, keys, min_core=2.0, refine_iters=3, thr=None,
-            durable=1.0, guard=10, pros=None, weight=PROSODY_WEIGHT):
+            durable=1.0, guard=10):
     """Drop-in for link.py's cluster(), with the threshold chosen per meeting.
 
     Pass `thr` to force a fixed cut (and skip the constraints entirely); leave it
@@ -457,14 +310,11 @@ def cluster(A, secs, keys, min_core=2.0, refine_iters=3, thr=None,
     core = np.where(secs >= min_core)[0]
     Ac = A[core]
     S = Ac @ Ac.T
-    if pros is not None:
-        S = fuse(S, np.asarray(pros)[core], weight)
     D = np.clip(1.0 - S, 0, 2)
     np.fill_diagonal(D, 0.0)
 
     if thr is None:
-        thr, info = choose_threshold(A, keys, secs, min_core, durable, guard,
-                                     pros=pros, weight=weight)
+        thr, info = choose_threshold(A, keys, secs, min_core, durable, guard)
         C = cannot_link_matrix([keys[i] for i in core], secs[core], durable, guard)
     else:
         info = {"threshold": round(float(thr), 4), "n_cannot_link": 0,

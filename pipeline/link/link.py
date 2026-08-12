@@ -49,12 +49,6 @@ def load(run_path, npz_path):
     return R, E, seg_idx, meta
 
 
-def load_prosody(npz_path):
-    """Per-segment pitch/spectral descriptors, or None for a pre-prosody npz."""
-    z = np.load(npz_path, allow_pickle=True)
-    return z["pros"] if "pros" in z.files else None
-
-
 def aggregate(R, E, seg_idx, meta):
     """-> keys, A (n_keys,D), secs, nsegs, key_of_segment(list per segment)."""
     pos = {int(s): i for i, s in enumerate(seg_idx)}
@@ -188,21 +182,23 @@ def main():
             lab, k, *_ = cluster(A, secs, t, args.min_core, args.refine)
             print(f"SWEEP meeting={name} thr={t:.4f} k={k}")
 
-    praw = load_prosody(args.npz)
-    P = cluster_speakers.aggregate_prosody(praw, seg_idx, meta, keys)
-    if P is None:
-        print(f"NOTE meeting={name} npz has no prosody -- embedding only. "
-              f"Re-run embed_batched.py to enable pitch fusion.")
     lab, k, core, weak, S, D, Cf, info = cluster_speakers.cluster(
         A, secs, keys, min_core=args.min_core, refine_iters=args.refine,
-        thr=fixed_thr, pros=P)
+        thr=fixed_thr)
     sizes = {int(c): float(secs[lab == c].sum()) for c in sorted(set(lab))}
     tshow = "n/a" if info["threshold"] is None else f"{info['threshold']:.4f}"
-    print(f"CLUSTER meeting={name} prosody={'yes' if P is not None else 'no'} "
-          f"thr={tshow} mode={info['mode']} "
+    print(f"CLUSTER meeting={name} thr={tshow} mode={info['mode']} "
           f"min_core={args.min_core} refine={args.refine} k_est={k} "
           f"cannot_link={info['n_cannot_link']} min_k_floor={info['floor']} "
           f"cluster_secs={ {c: round(v) for c, v in sorted(sizes.items(), key=lambda x:-x[1])} }")
+    if info.get("low_separation"):
+        # The tree had no clear gap to cut at, so the speaker count is a guess.
+        # Worth saying out loud rather than presenting it with the same
+        # confidence as a clean split.
+        print(f"LOW-SEPARATION meeting={name} span={info.get('span')} "
+              f"dominance={info.get('dominance')}: the merge heights barely spread, "
+              f"so this speaker count is weakly supported. Check it before naming "
+              f"anyone from this meeting.")
     if not info["floor_ok"]:
         # MOSS heard more people at once than the clustering produced. Something
         # is wrong -- do not let it pass as a clean transcript.
