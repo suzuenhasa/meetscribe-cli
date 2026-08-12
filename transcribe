@@ -121,8 +121,13 @@ if [ -d "$SRC" ]; then
   done
   printf '}' >> "$TITLES"
   rput "$TITLES" "$REMOTE/out/_titles.json"; rm -f "$TITLES"
+  # Do NOT let set -e abort here. batch.py now exits nonzero when any single
+  # recording fails, and the rest of the batch has still succeeded -- aborting
+  # would throw away every good transcript over one bad file, having already
+  # paid for the whole run. Capture the code, retrieve what exists, exit with it.
+  BATCH_RC=0
   rrun "
-    set -euo pipefail
+    set -uo pipefail
     export HF_HOME='$REMOTE/.hf_home' MS_WORK='$REMOTE' OMP_NUM_THREADS=8 \
            TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
     cd '$REMOTE'
@@ -130,16 +135,37 @@ if [ -d "$SRC" ]; then
       --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \\
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}
-  "
+  " || BATCH_RC=$?
+
   echo "==> retrieving"
+  GOT=0; WANT=0; MISSING=(); SEEN=" "
   for f in "${BATCH[@]}"; do
     b="$(basename "${f%.*}")"
     sf="$(echo "$b" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
+    # Two inputs can sanitise to the same remote stem, and there is only ONE
+    # remote transcript for them. Counting per input would claim to have
+    # delivered two files that are the same file.
+    case "$SEEN" in *" $sf "*) continue ;; esac
+    SEEN="$SEEN$sf "; WANT=$((WANT + 1))
+    # Clear the destinations first. rget deliberately swallows failure so one
+    # absent file cannot abort the loop -- which means it leaves whatever was
+    # already here, and a transcript from an EARLIER run would be counted as
+    # delivered by this one, hiding exactly the omission this check exists for.
+    rm -f "./${b}.txt" "./${b}.json"
     rget "$REMOTE/out/${sf}.txt" "./${b}.txt"
     rget "$REMOTE/out/${sf}_linked.json" "./${b}.json"
+    if [ -s "./${b}.txt" ] && [ -s "./${b}.json" ]; then
+      GOT=$((GOT + 1))
+    else
+      MISSING+=("$b")
+    fi
   done
-  echo "    $(pwd)"
-  exit 0
+  echo "    $GOT of $WANT transcripts in $(pwd)"
+  if [ "${#MISSING[@]}" -gt 0 ]; then
+    echo "    !! no transcript for: ${MISSING[*]}" >&2
+    [ "$BATCH_RC" -eq 0 ] && BATCH_RC=1
+  fi
+  exit "$BATCH_RC"
 fi
 
 [ -f "$SRC" ] || { echo "usage: transcribe <audio-file> [--glossary \"Name,Term\"] [--window 30] [--thr auto]" >&2; exit 2; }

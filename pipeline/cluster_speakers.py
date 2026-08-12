@@ -258,6 +258,35 @@ def min_k_floor(keys, secs, durable=1.0, guard=10):
     return max(counts) if counts else 1
 
 
+def core_set(secs, min_core):
+    """Indices of the aggregates long enough to cluster on. Never empty.
+
+    A recording where nothing clears `min_core` still has a speaker in it. When
+    this returned nothing the centroid matrix came out (0, D), and assigning the
+    remaining turns called argmax on an empty array -- one recording whose only
+    aggregate was 1.9s crashed link.py, and because batch.py did not check
+    return codes the run reported success with that meeting's transcript simply
+    missing. Falling back to the single longest aggregate gives k=1, which is
+    the right answer for a recording that short.
+    """
+    secs = np.asarray(secs, dtype=float)
+    core = np.where(secs >= min_core)[0]
+    if len(core) or not len(secs):
+        return core
+    # Everything that was embedded at all, not merely the longest one. Falling
+    # back to a single aggregate discards every cannot-link MOSS asserted, so the
+    # tree has one node and the answer can only ever be k=1: ten windows of
+    # two-party dialogue, none of whose aggregates cleared min_core, came out as
+    # one speaker with all twenty aggregates labelled G00 and the run exiting 0.
+    # That is worse than the crash it replaced, which at least got reported.
+    # `secs > 0` is exactly "has an embedded segment", so no zero-norm row enters
+    # the core and the centroid matrix stays well formed.
+    alive = np.where(secs > 0)[0]
+    if len(alive):
+        return alive
+    return np.array([int(np.argmax(secs))], dtype=int)
+
+
 def choose_threshold(A, keys, secs, min_core=2.0, durable=1.0, guard=10):
     """Pick this meeting's clustering cut. -> (thr, info)
 
@@ -272,7 +301,7 @@ def choose_threshold(A, keys, secs, min_core=2.0, durable=1.0, guard=10):
                     and so can never merge into each other.
       "fixed"       no constraints at all, so nothing to calibrate against.
     """
-    core = np.where(np.asarray(secs) >= min_core)[0]
+    core = core_set(secs, min_core)
     Ac = A[core]
     S = Ac @ Ac.T
 
@@ -307,7 +336,7 @@ def cluster(A, secs, keys, min_core=2.0, refine_iters=3, thr=None,
     same tuple link.py already unpacks, plus the info dict.
     """
     secs = np.asarray(secs, dtype=float)
-    core = np.where(secs >= min_core)[0]
+    core = core_set(secs, min_core)
     Ac = A[core]
     S = Ac @ Ac.T
     D = np.clip(1.0 - S, 0, 2)
@@ -346,7 +375,13 @@ def cluster(A, secs, keys, min_core=2.0, refine_iters=3, thr=None,
 
     lab = np.full(len(A), -1, dtype=int)
     lab[core] = lab_core
-    weak = np.where(secs < min_core)[0]
+    # Everything core_set did not take, rather than everything under min_core.
+    # Those were the same set until core_set gained its fallback; now the fallback
+    # aggregate is below the threshold AND is core, and letting the weak pass
+    # reassign it overwrote its label -- harmless for a unit vector, but a
+    # never-embedded aggregate has norm 0 and came back -1, so the meeting
+    # reported k=1 with nothing assigned to it.
+    weak = np.setdiff1d(np.where(secs < min_core)[0], core)
     for i in weak:
         lab[i] = int(np.argmax(A[i] @ Cm.T)) if np.linalg.norm(A[i]) > 0 else -1
 
