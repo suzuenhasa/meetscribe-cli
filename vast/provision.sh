@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Provision meetscribe on a vast.ai instance.
 #
-# Point a template's PROVISIONING_SCRIPT at the RAW url of this file and vast
-# runs it once, as root, at boot -- logging to /var/log/portal/provisioning.log.
-# See vast/README.md for the template fields that go with it.
+# PASTE THIS WHOLE FILE into a vast template's "On-start Script" and set nothing
+# else. Pin a version by editing MS_REF's default below to a full 40-character
+# commit sha; left as `main` it installs whatever main happens to be.
+#
+# (It also works as a PROVISIONING_SCRIPT url, which is worth using if you want
+# several templates sharing one script -- see vast/README.md. Then On-start is
+# `exec /opt/instance-tools/bin/entrypoint.sh` instead, and this logs to
+# /var/log/portal/provisioning.log.)
 #
 # It clones the repo, installs the pipeline, downloads the weights, and then
 # does one throwaway transcription so the engine's compile cache is populated
