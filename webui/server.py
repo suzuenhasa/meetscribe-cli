@@ -294,8 +294,29 @@ HUMAN = ("accept", "left-unknown")
 
 
 def db_path():
+    """The ONE profile store, the same file pipeline/speakers.py opens.
+
+    This used to default to <library>/speakers.db, on the reasoning that the
+    store should travel with the library. The pipeline has always used
+    $MS_WORK/speakers.db, and nobody reconciled the two -- so there were two
+    stores. identify.py wrote decisions to one; the browser read the other. A
+    voice named in the UI was invisible to the next ./transcribe, which is
+    exactly the "it already knows who this is and the transcript still says
+    Speaker 3" that had no other explanation.
+
+    Asking the pipeline rather than rebuilding its path here, so the two cannot
+    drift apart again. MS_SPEAKER_DB still overrides, for both, and --speaker-db
+    still wins on this side."""
     p = STATE["cfg"].get("speaker_db")
-    return Path(p) if p else STATE["library"] / "speakers.db"
+    if p:
+        return Path(p)
+    try:
+        import speakers as S
+        return Path(S.DB)
+    except Exception:
+        # No pipeline beside us: read-only browsing of a library that carries
+        # its own store is still worth having.
+        return STATE["library"] / "speakers.db"
 
 
 def ensure_db():
