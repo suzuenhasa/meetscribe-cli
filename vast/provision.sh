@@ -149,6 +149,13 @@ autorestart=true
 startsecs=45
 startretries=10
 stopwaitsecs=60
+; The model runs in a separate VLLM::EngineCore process. Without these two,
+; stopping or restarting this program signals only the parent and leaves that
+; child alive holding the whole KV cache -- 17.6 GiB of a 24 GiB card -- which
+; then makes the replacement fail to allocate. engined.py reaps such orphans at
+; startup as a backstop, but not creating them is better.
+stopasgroup=true
+killasgroup=true
 environment=MS_WORK="$MS_WORK",HF_HOME="$HF_HOME",VLLM_CACHE_ROOT="$VLLM_CACHE_ROOT",OMP_NUM_THREADS="8",TOKENIZERS_PARALLELISM="false",VLLM_LOGGING_LEVEL="WARNING"
 stdout_logfile=/var/log/portal/meetscribe-engine.log
 redirect_stderr=true

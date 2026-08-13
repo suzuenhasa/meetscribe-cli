@@ -25,7 +25,9 @@ to have on by default.
 import argparse
 import json
 import os
+import signal
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -121,7 +123,49 @@ def submit(sock_path, argv):
 
 
 # --------------------------------------------------------------- the daemon
+def reap_orphans():
+    """Kill any VLLM::EngineCore left behind by a dead parent.
+
+    vLLM runs the model in a SEPARATE process. When the parent dies without
+    stopping it -- SIGKILL, the OOM killer, a lost ssh session, supervisor
+    restarting a wedged daemon -- that child survives and keeps the whole KV
+    cache: 17.6 GiB of a 24 GiB card, measured here. Nothing can ever reach it
+    again, because the sockets that addressed it died with its parent. It is
+    purely lost memory.
+
+    The symptom is bad out of proportion to the cause: the next start finds too
+    little VRAM and dies inside the allocator with a stack trace about engine
+    initialisation that names no cause at all, on a card nvidia-smi shows as
+    two-thirds full with no obvious owner.
+
+    An EngineCore whose parent is pid 1 has been orphaned, by definition and
+    with no other explanation, so it is safe to take. One that is still doing
+    work has a live parent and is not touched."""
+    try:
+        ps = subprocess.run(["ps", "-eo", "pid,ppid,args"],
+                            capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return
+    reaped = []
+    for line in ps.splitlines()[1:]:
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[1] != "1":
+            continue
+        if not parts[2].startswith("VLLM::EngineCore"):
+            continue
+        try:
+            os.kill(int(parts[0]), signal.SIGKILL)
+            reaped.append(parts[0])
+        except (OSError, ValueError):
+            pass
+    if reaped:
+        print(f"reaped orphaned VLLM::EngineCore {', '.join(reaped)} — a previous "
+              f"engine died without releasing the card", flush=True)
+        time.sleep(3)       # let the driver actually hand the memory back
+
+
 def serve(sock_path, window, overlap, gpu_frac):
+    reap_orphans()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import contextlib
     import transcribe_meeting as TM
