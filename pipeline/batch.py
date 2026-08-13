@@ -209,23 +209,85 @@ def main():
     emb = None if deferred else Embedder(embed_batch, env, out / "_embed.log")
 
     pending, unreadable, empty, queued = [], [], [], []
+    sampling = TM.SamplingParams(temperature=0.0,
+                                 max_tokens=int((a.window + 2 * a.overlap) * 20))
+
+    # Pool windows ACROSS recordings before decoding. One generate() per file
+    # makes the batch as big as that file happens to be, which is fine for an
+    # hour-long meeting -- 149 windows fills the card -- and terrible for short
+    # ones: a 20 s clip is a single window, so the GPU decodes a batch of one and
+    # idles between Python round trips. In an external evaluation the same audio
+    # ran at 13x as 122 short files and 145x concatenated into one, and this is
+    # most of that gap. Windows are independent, so there is nothing to preserve
+    # by keeping them apart.
+    #
+    # The target is max_num_seqs, which is also roughly what the KV cache holds
+    # at this request length (a 5090 reports 192,320 tokens against ~800 per
+    # window). vLLM queues internally beyond that, so overshooting is harmless;
+    # the reason to bound it at all is the second limit below.
+    target = TM._max_num_seqs()
+    # Audio for a file has to stay resident until every one of its windows has
+    # come back, so pooling holds wavs. Flush on this as well or a long queue
+    # would accumulate them without limit.
+    max_pooled_samples = int(4 * 3600 * TM.SR)
+
+    inflight = {}          # name -> per-file state awaiting its windows
+    pool = []              # (name, window_index, request)
+    pooled_samples = 0
     t_queue = time.time()
+
+    def finish(name):
+        """Assemble one recording once all of its windows have come back."""
+        st = inflight.pop(name)
+        f, wav, dur = st["f"], st["wav"], st["dur"]
+        segs, cov, _ = TM.assemble(st["outs"], st["offsets"], st["cores"], wav, dur)
+        raw = out / f"{name}_raw.json"
+        json.dump({"audio": str(f), "duration_s": round(dur, 2), "window_s": a.window,
+                   "n_windows": len(st["outs"]), "coverage": round(cov, 4),
+                   "segments": segs}, open(raw, "w"))
+        if not segs:
+            # MOSS returned nothing at all for this recording. Ten of forty
+            # accented-parliament clips did exactly this in one evaluation and
+            # were reported as successes carrying empty transcripts. There is
+            # nothing to embed or cluster, so say so and move on.
+            empty.append(name)
+            print(f"  {f.name[:44]:44} {dur/60:5.1f} min  NO SPEECH FOUND — "
+                  f"empty transcript", flush=True)
+            return
+        # Queue the embedding and move straight on. Never silence the worker: an
+        # early version sent stderr to DEVNULL and every embed failed invisibly,
+        # leaving a "successful" run with no vectors.
+        npz = out / f"{name}_emb.npz"
+        if deferred:
+            queued.append((raw, f, npz))
+        else:
+            if not emb.submit(raw, f, npz):
+                print(f"\n!! embedding worker died — see {out}/_embed.log", flush=True)
+            if a.no_overlap_embed:
+                emb.wait_for(npz)
+        pending.append((name, f))
+        print(f"  {f.name[:44]:44} {dur/60:5.1f} min  {len(st['outs']):4d} win  "
+              f"{len(segs):4d} segs  coverage {cov:.0%}", flush=True)
+
+    def flush():
+        """Decode everything pooled, then assemble whichever files are complete."""
+        nonlocal pooled_samples
+        if not pool:
+            return
+        outs = llm.generate([r for _, _, r in pool], sampling)
+        for (name, wi, _), o in zip(pool, outs):
+            inflight[name]["outs"][wi] = o
+        pool.clear()
+        for name in [n for n, st in inflight.items()
+                     if all(o is not None for o in st["outs"])]:
+            pooled_samples -= len(inflight[name]["wav"])
+            finish(name)
+
     for f in files:
         name = safe(f.stem)
         try:
             wav = load_audio_item(str(f), sampling_rate=TM.SR)
-            dur = len(wav) / TM.SR
-
-            t0 = time.time()
             reqs, offsets, cores = TM.plan_windows(wav, ptxt, a.window, a.overlap)
-            mt = int((a.window + 2 * a.overlap) * 20)
-            outs = llm.generate(reqs, TM.SamplingParams(temperature=0.0, max_tokens=mt))
-            segs, cov, _ = TM.assemble(outs, offsets, cores, wav, dur)
-            raw = out / f"{name}_raw.json"
-            json.dump({"audio": str(f), "duration_s": round(dur, 2), "window_s": a.window,
-                       "n_windows": len(reqs), "coverage": round(cov, 4),
-                       "segments": segs}, open(raw, "w"))
-            t_tr = time.time() - t0
         except Exception as e:
             # One unreadable recording must not cost the whole queue. A truncated
             # mp3 used to raise straight out of the loop, taking the engine with
@@ -237,30 +299,17 @@ def main():
                   f"{str(e).splitlines()[0][:80]}", flush=True)
             continue
 
-        if not segs:
-            # MOSS returned nothing at all for this recording. Ten of forty
-            # accented-parliament clips did exactly this in one evaluation and
-            # were reported as successes carrying empty transcripts. There is
-            # nothing to embed or cluster, so say so and move on.
-            empty.append(name)
-            print(f"  {f.name[:44]:44} {dur/60:5.1f} min  NO SPEECH FOUND — "
-                  f"empty transcript", flush=True)
-            continue
-
-        # Queue the embedding and move straight to the next transcription. Never
-        # silence the worker: an early version sent stderr to DEVNULL and every
-        # embed failed invisibly, leaving a "successful" run with no vectors.
-        npz = out / f"{name}_emb.npz"
-        if deferred:
-            queued.append((raw, f, npz))
-        else:
-            if not emb.submit(raw, f, npz):
-                print(f"\n!! embedding worker died — see {out}/_embed.log", flush=True)
-            if a.no_overlap_embed:
-                emb.wait_for(npz)
-        pending.append((name, f))
-        print(f"  {f.name[:44]:44} {dur/60:5.1f} min  transcribed {t_tr:5.1f}s  "
-              f"{len(segs):4d} segs  coverage {cov:.0%}", flush=True)
+        inflight[name] = {"f": f, "wav": wav, "dur": len(wav) / TM.SR,
+                          "offsets": offsets, "cores": cores,
+                          "outs": [None] * len(reqs)}
+        pool.extend((name, i, r) for i, r in enumerate(reqs))
+        pooled_samples += len(wav)
+        # `if`, not `while`: flush() decodes the entire pool, so one pass always
+        # empties it. A loop could spin forever if pooled_samples stayed above
+        # the bound with nothing left to decode.
+        if len(pool) >= target or pooled_samples >= max_pooled_samples:
+            flush()
+    flush()
 
     def release_engine():
         """Hand the card back. level=1 offloads the weights and drops the KV
