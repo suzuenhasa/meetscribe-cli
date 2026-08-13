@@ -55,17 +55,28 @@ total across a multi-GPU box).
 
 ## What provisioning does
 
-Clones the repo, runs `setup.sh`, verifies with `setup.sh --check`, and then
-transcribes 45 seconds of synthetic audio and throws the result away.
+Clones the repo, runs `setup.sh`, verifies with `setup.sh --check`, transcribes
+45 seconds of synthetic audio and throws the result away, then starts the
+engine and leaves it running.
 
-That last step is the point. The **first** engine load on any machine costs
-240–400 s while torch.compile and FlashInfer populate their caches; every load
-after is ~70 s. Doing it during provisioning means the box is warm before you
-touch it. Set `MS_SKIP_WARM=1` to skip it.
+The last two steps are the point, and they solve two different halves of the
+same cost.
 
-It cannot be baked into an image ahead of time: vLLM's compile cache is keyed by
-the GPU's *model name string*, so a cache built on a 5090 misses on a 5080, and
-you do not know what you have rented until you have rented it.
+**The throwaway transcription** fills the compile caches. The *first* engine
+load on any machine costs 240–400 s while torch.compile and FlashInfer populate
+them; every load after is ~70 s. This cannot be baked into an image ahead of
+time — vLLM's compile cache is keyed by the GPU's *model name string*, so a
+cache built on a 5090 misses on a 5080, and you do not know what you have rented
+until you have rented it. `MS_SKIP_WARM=1` skips it.
+
+**The resident engine** removes the remaining ~70 s. That load is paid per run,
+not per machine, so without a daemon every `./transcribe` pays it again — which
+on a short recording is the entire wall clock. Measured on a 3090: a 3-minute
+clip took 145 s cold and 25 s against a resident engine. `MS_NO_DAEMON=1` skips
+it, and `./engine start|stop|status` controls it by hand afterwards.
+
+Neither is load-bearing. Without both, transcribing works exactly as it always
+did; it is just slower to start.
 
 ## Using it
 
@@ -88,7 +99,14 @@ library it serves is your meetings.
 cat /var/log/portal/provisioning.log      # what provisioning did
 cat /opt/meetscribe/.provisioned          # the timestamp it finished
 /opt/meetscribe/setup.sh --check          # verify, changes nothing
+/opt/meetscribe/engine status             # is the engine resident?
 ```
+
+Do check that last one rather than assuming. The engine is registered with
+supervisor so it restarts if it dies — but supervisord was not running at all on
+one provisioned box we tested, and `supervisorctl start` fails quietly enough
+that nothing looked wrong. Provisioning now starts the engine directly when that
+happens, and `./engine start` does the same by hand.
 
 If `.provisioned` is missing, provisioning did not finish — the log says why.
 Weights and the compile cache live under `MS_WORK`, so re-running provisioning

@@ -121,6 +121,64 @@ else
   fi
 fi
 
+# ------------------------------------------------------- the resident engine
+# The warm cache above makes loading the engine ~70s instead of 240-400s. This
+# makes it 0, which is a different problem: the cache is per MACHINE, the load
+# is per PROCESS, so every ./transcribe paid it again. Keeping one engine alive
+# in a daemon moves that cost to boot, once.
+#
+# It matters most for exactly the case the batch path cannot help -- a single
+# recording, where 70s of loading sits in front of a few seconds of work.
+#
+# autorestart, and NOT autostart: provisioning starts it below once the weights
+# are actually present. A service that starts at boot on a half-provisioned box
+# just fails and backs off.
+MS_PY="$(. "$MS_WORK/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
+cat > /etc/supervisor/conf.d/meetscribe-engine.conf <<EOF
+[program:meetscribe-engine]
+command=$MS_PY -u $MS_WORK/pipeline/engined.py --serve
+directory=$MS_WORK
+autostart=false
+autorestart=true
+startsecs=45
+stopwaitsecs=60
+environment=MS_WORK="$MS_WORK",HF_HOME="$HF_HOME",VLLM_CACHE_ROOT="$VLLM_CACHE_ROOT",OMP_NUM_THREADS="8",TOKENIZERS_PARALLELISM="false",VLLM_LOGGING_LEVEL="WARNING"
+stdout_logfile=/var/log/portal/meetscribe-engine.log
+redirect_stderr=true
+EOF
+supervisorctl reread >/dev/null 2>&1 || true
+supervisorctl update >/dev/null 2>&1 || true
+
+if [ "${MS_NO_DAEMON:-}" = "1" ]; then
+  log "MS_NO_DAEMON=1 — not starting the resident engine"
+else
+  # Ask supervisor first, since that is what restarts the engine if it ever
+  # dies. Then CHECK, and start it directly if that did nothing.
+  #
+  # Not a belt-and-braces flourish: supervisord was not running at all on a
+  # provisioned vast box we tested, so `supervisorctl start` failed with "no
+  # such file" and the engine simply never came up. supervisorctl fails quietly
+  # enough that the difference between "started it" and "did nothing" is
+  # invisible unless you look for the socket -- which is what this does.
+  log "starting the resident engine"
+  supervisorctl start meetscribe-engine >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do [ -S "$MS_WORK/run/engine.sock" ] && break; sleep 2; done
+  if [ ! -S "$MS_WORK/run/engine.sock" ]; then
+    log "supervisor did not start it — starting it directly"
+    MS_WORK="$MS_WORK" HF_HOME="$HF_HOME" VLLM_CACHE_ROOT="$VLLM_CACHE_ROOT" \
+      bash "$MS_WORK/engine" start 2>&1 | sed 's/^/  /' || true
+  fi
+  # Everything works without it -- ./transcribe loads its own engine when there
+  # is no daemon -- so this is a note, not a failure.
+  if [ -S "$MS_WORK/run/engine.sock" ]; then
+    log "resident engine up — transcriptions no longer pay the engine load"
+  else
+    log "!! the resident engine did not come up. See $MS_WORK/run/engine.log and"
+    log "   /var/log/portal/meetscribe-engine.log. Transcribing still works;"
+    log "   each run just loads its own engine, as it did before."
+  fi
+fi
+
 # ---------------------------------------------------------------- done
 date -u +%FT%TZ > "$MS_WORK/.provisioned"
 log ""

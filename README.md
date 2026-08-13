@@ -52,6 +52,32 @@ On a small card it is barely worth the disk space.
 `--overlap 0` is a further ~1.5× on top, but it is the one setting here that
 trades accuracy for speed — see Options.
 
+### Keeping the engine loaded
+
+That engine-load column is paid once per *run*, not once per machine. On a long
+batch it disappears into the total. On a short recording it **is** the total —
+a 3-minute clip on a 3090 spends 1.4 s transcribing and about 140 s loading the
+thing that transcribes it.
+
+So don't make it load:
+
+```bash
+./engine start          # ~70 s, once
+./transcribe memo.mp3   # 25 s, where it was 145 s
+./engine stop           # hand the card back
+```
+
+Everything uses it when it is there and loads its own engine when it is not, so
+this is only ever an optimisation: `./transcribe` and the web UI behave the same
+either way, and stopping it is safe at any time, including mid-queue — a running
+job finishes on the engine it already has.
+
+It holds VRAM while it runs. After 15 minutes idle it hands the card back and
+keeps only the weights, waking in about a second when the next job arrives; set
+`MS_ENGINE_IDLE_SLEEP=0` to keep it resident regardless. It serves one job at a
+time, and only the `--window`/`--overlap` it was started with — a run asking for
+different ones is told why and loads its own.
+
 ---
 
 ## Install
@@ -225,6 +251,8 @@ interpreter setup chose: `source env.sh && "$MS_PY" pipeline/batch.py ...`
 ```
 transcribe            one file or a folder
 speakers              who / play / clips / name / rename / forget
+engine                start / stop the resident engine, so runs skip the load
+ui                    the browser front end
 setup.sh              installs everything; --check verifies
 preview.py            backs speakers who / play / clips
 pipeline/             the pipeline itself, run in place

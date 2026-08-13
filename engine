@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Keep the transcription engine loaded, so runs do not wait for it.
+#
+#   ./engine start            load it and leave it running
+#   ./engine stop             let go of the card
+#   ./engine status           is it up?
+#   ./engine restart          stop, then start
+#   ./engine log              what it has been doing
+#
+# Loading the engine costs ~70s with a warm compile cache, and it is paid per
+# RUN. On an hour-long meeting that is noise; on a 3-minute voice memo it is the
+# entire wall clock. Measured on a 3090: 145s to transcribe 3 minutes of audio
+# cold, 25s with the engine already up.
+#
+# Nothing requires this. ./transcribe and the web UI use the engine when it is
+# here and load their own when it is not, so starting it is an optimisation and
+# stopping it is always safe -- including mid-queue, which finishes on the
+# engine it already has.
+#
+# It holds VRAM while it runs. After MS_ENGINE_IDLE_SLEEP seconds idle (default
+# 900) it hands the card back and keeps only the weights, waking in about a
+# second when the next job arrives. Set it to 0 to never let go.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK="${MS_WORK:-$HERE}"
+SOCK="$WORK/run/engine.sock"
+PIDF="$WORK/run/engine.pid"
+LOG="$WORK/run/engine.log"
+PY="$(. "$HERE/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
+
+alive() { "$PY" "$HERE/pipeline/engined.py" --status --sock "$SOCK" >/dev/null 2>&1; }
+
+case "${1:-status}" in
+  start)
+    if alive; then echo "already running ($SOCK)"; exit 0; fi
+    shift                       # anything left is passed through, e.g. --window 60
+    mkdir -p "$WORK/run"
+    # setsid so it outlives the shell that started it -- including an ssh
+    # session, which is how it is usually started on a rented box.
+    MS_WORK="$WORK" HF_HOME="${HF_HOME:-$WORK/.hf_home}" \
+    VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$WORK/.vllm_cache}" \
+    OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}" TOKENIZERS_PARALLELISM=false \
+    VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-WARNING}" \
+      setsid nohup "$PY" -u "$HERE/pipeline/engined.py" --serve --sock "$SOCK" \
+        "$@" >"$LOG" 2>&1 </dev/null &
+    echo $! > "$PIDF"
+    echo "==> loading the engine; this takes ~70s once"
+    for _ in $(seq 1 150); do
+      [ -S "$SOCK" ] && { echo "==> ready — $(grep -m1 'engine resident' "$LOG" || true)"; exit 0; }
+      kill -0 "$(cat "$PIDF")" 2>/dev/null || { echo "!! it exited:"; tail -20 "$LOG"; exit 1; }
+      sleep 2
+    done
+    echo "!! still not up after 5 minutes; see $LOG"; exit 1 ;;
+  stop)
+    PID="$(cat "$PIDF" 2>/dev/null || true)"
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+      # The process GROUP, not the pid. vLLM runs the model in a separate
+      # VLLM::EngineCore process, and killing only the parent leaves that one
+      # alive holding the whole KV cache -- 17.6 GiB of a 24 GiB card, measured
+      # here. Nothing then says the engine is still there: the socket is gone,
+      # `status` says "not running", and the next start dies in the allocator
+      # with a stack trace about engine initialisation that names no cause.
+      # setsid at start time is what makes the group killable in one go.
+      kill -TERM -- "-$PID" 2>/dev/null || kill -TERM "$PID" 2>/dev/null || true
+      for _ in $(seq 1 30); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done
+      if kill -0 "$PID" 2>/dev/null; then
+        kill -KILL -- "-$PID" 2>/dev/null || kill -KILL "$PID" 2>/dev/null || true
+        sleep 1
+      fi
+      rm -f "$PIDF" "$SOCK"
+      echo "stopped"
+    elif [ -S "$SOCK" ]; then
+      # Started some other way -- by hand, or by supervisor. Say so rather than
+      # printing "stopped" over an engine that is still holding the card.
+      rm -f "$PIDF"
+      echo "!! there is an engine on $SOCK that this script did not start."
+      echo "   supervisorctl stop meetscribe-engine, or kill it yourself:"
+      echo "   ps aux | grep -E 'engined|EngineCore'"
+      exit 1
+    else
+      rm -f "$PIDF" "$SOCK"
+      echo "not running"
+    fi ;;
+  restart) "$0" stop; "$0" start ;;
+  status)
+    if alive; then echo "running — $SOCK"; else echo "not running"; exit 1; fi ;;
+  log) tail -n "${2:-40}" "$LOG" ;;
+  -h|--help) sed -n '2,22p' "$0" ;;
+  *) echo "usage: $0 {start|stop|restart|status|log}" >&2; exit 2 ;;
+esac

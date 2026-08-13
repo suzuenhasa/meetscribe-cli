@@ -195,7 +195,7 @@ def post_workers():
     return max(1, min(os.cpu_count() or 2, 8))
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("audio", nargs="+")
     ap.add_argument("--out-dir", default=f"{WORK}/out")
@@ -216,8 +216,48 @@ def main():
                          "a value only to override that.")
     ap.add_argument("--no-overlap-embed", action="store_true",
                     help="wait for each embed instead of overlapping it")
-    a = ap.parse_args()
+    return ap
 
+
+class Resident:
+    """An engine kept alive between jobs by engined.py.
+
+    Loading the engine costs ~70s even with a warm compile cache, and that is
+    paid per PROCESS. Batching a queue amortises it; a single file cannot, so a
+    20 s voice memo spends 70 s starting and 3 s working. Holding the engine in
+    a daemon moves that cost to boot, once, for every job the box ever runs.
+
+    Two things make a resident engine different from a fresh one:
+
+    the window/overlap it was built with are BAKED IN -- they set the audio
+    length hint the engine reserves against (see build_engine), and a job asking
+    for longer windows than the hint would be silently truncated. `serves` is
+    that check; the client falls back to its own engine when it fails, which is
+    correct but slow, so the daemon is built with whatever the box actually uses.
+
+    and it can be asleep. On a card too small to hold engine and embedder at
+    once, run_job releases the engine mid-job and never wakes it -- fine when
+    the process was about to exit, wrong when another job is coming. `wake` is
+    paired with that release and costs about a second, against the ~70s of a
+    real load.
+    """
+
+    def __init__(self, llm, gpu_frac, window, overlap):
+        self.llm, self.gpu_frac = llm, gpu_frac
+        self.window, self.overlap = window, overlap
+        self.asleep = False
+
+    def serves(self, a):
+        return a.window == self.window and a.overlap == self.overlap
+
+    def wake(self):
+        if not self.asleep:
+            return
+        self.llm.wake_up()
+        self.asleep = False
+
+
+def run_job(a, resident=None):
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     files = [Path(f) for f in a.audio if Path(f).is_file()]
@@ -229,15 +269,21 @@ def main():
 
     t_start = time.time()
     ptxt = TM.build_prompt(a.glossary)
-    # plan_gpu_split is a TARGET, not a promise: it only has to be good enough to
-    # boot and to leave a plausible share behind. Built releasable regardless, so
-    # the fallback below is available whatever the measurement turns out to be.
-    split = TM.plan_gpu_split()
-    gpu_frac = a.gpu_frac if a.gpu_frac is not None else split.frac
-    # window/overlap are not optional here: they set the audio-length hint the
-    # engine reserves against. See build_engine's limit_mm_per_prompt comment.
-    llm = TM.build_engine(gpu_frac, window=a.window, overlap=a.overlap,
-                          releasable=True)
+    if resident is not None:
+        # Already loaded, and possibly asleep from a previous job on a small card.
+        resident.wake()
+        llm, gpu_frac = resident.llm, resident.gpu_frac
+    else:
+        # plan_gpu_split is a TARGET, not a promise: it only has to be good enough
+        # to boot and to leave a plausible share behind. Built releasable
+        # regardless, so the fallback below is available whatever the measurement
+        # turns out to be.
+        split = TM.plan_gpu_split()
+        gpu_frac = a.gpu_frac if a.gpu_frac is not None else split.frac
+        # window/overlap are not optional here: they set the audio-length hint the
+        # engine reserves against. See build_engine's limit_mm_per_prompt comment.
+        llm = TM.build_engine(gpu_frac, window=a.window, overlap=a.overlap,
+                              releasable=True)
 
     # Now ASK the card rather than trusting the estimate. gpu_memory_utilization
     # bounds only what vLLM's profiler measured, and it allocates on top of that
@@ -259,7 +305,9 @@ def main():
           + ("" if concurrent else ", run after the engine is released"),
           flush=True)
     startup = time.time() - t_start
-    print(f"engine resident after {startup:.1f}s — {len(files)} meetings queued\n", flush=True)
+    print(f"engine resident after {startup:.1f}s"
+          + (" (already loaded)" if resident is not None else "")
+          + f" — {len(files)} meetings queued\n", flush=True)
 
     env = {**os.environ, "OMP_NUM_THREADS": "4", "MS_WORK": WORK}
     env.pop("CUDA_VISIBLE_DEVICES", None)     # vLLM rewrites this for its workers
@@ -372,9 +420,16 @@ def main():
         """Hand the card back. level=1 offloads the weights and drops the KV
         cache; level=2 on top of it raises "CUDA Error: invalid argument" in the
         cumem allocator, so it is one call, once, and the engine is not used
-        again afterwards. Measured on a 6 GiB card: 3.54 of 3.90 GiB returned."""
+        again afterwards. Measured on a 6 GiB card: 3.54 of 3.90 GiB returned.
+
+        "Not used again" holds within a job. A resident engine gets another job
+        after this one, so record that it is asleep -- run_job wakes it at the
+        top rather than leaving the next caller to find an engine with no
+        weights in it."""
         try:
             llm.sleep(level=1)
+            if resident is not None:
+                resident.asleep = True
             return True
         except Exception as e:
             print(f"!! could not release the engine ({type(e).__name__}: {e})",
@@ -546,6 +601,10 @@ def main():
         print(f"\n{n_bad} of {len(files)} file(s) did not complete.", flush=True)
         return 1
     return 0
+
+
+def main(argv=None):
+    return run_job(build_parser().parse_args(argv))
 
 
 if __name__ == "__main__":

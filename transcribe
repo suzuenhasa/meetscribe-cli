@@ -82,6 +82,13 @@ while [ $# -gt 0 ]; do
     *)        SRC="$1"; shift ;;
   esac
 done
+# VLLM_CACHE_ROOT travels with the install for the same reason everything else
+# does: vLLM's compiled graph is cached per model, per engine config and per GPU
+# model name, and the FIRST build of it costs 120-400s against ~70s for every one
+# after. Left to its default it lands in ~/.cache/vllm, which meant a cache warmed
+# by provisioning under the install directory was never read -- measured on a
+# 3090: 50 MB written where nobody looked, then 49 MB compiled again at runtime.
+#
 # setup.sh installs into whichever interpreter already owns torch and records it
 # in env.sh as MS_PY. Bare `python3` is frequently a DIFFERENT interpreter with none
 # of the dependencies -- the failure is ModuleNotFoundError: numpy, which looks like
@@ -131,12 +138,21 @@ if [ -d "$SRC" ]; then
   rrun "
     set -uo pipefail
     export HF_HOME='$REMOTE/.hf_home' MS_WORK='$REMOTE' OMP_NUM_THREADS=8 \
+           VLLM_CACHE_ROOT='$REMOTE/.vllm_cache' \
            TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
     cd '$REMOTE'
-    "$PY" '$PIPE/batch.py' ${REMOTE_ARGS[*]@Q} --out-dir '$REMOTE/out' \
+    ARGS=(${REMOTE_ARGS[*]@Q} --out-dir '$REMOTE/out' \
       --window $WINDOW --overlap $OVERLAP --thr $THR \
-      --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \\
-      --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}
+      --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
+      --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC})
+    # Hand the job to the resident engine if the box is running one, which saves
+    # the ~70s load. 97 is engined.py saying it could not -- no daemon, a stale
+    # socket, or an engine built for different windows -- having already printed
+    # which. Run it here in that case, exactly as this line did before daemons.
+    "$PY" '$PIPE/engined.py' --submit -- \"\${ARGS[@]}\"
+    rc=\$?
+    [ \$rc -eq 97 ] && { "$PY" '$PIPE/batch.py' \"\${ARGS[@]}\"; rc=\$?; }
+    exit \$rc
   " || BATCH_RC=$?
 
   echo "==> retrieving"
@@ -197,10 +213,43 @@ rrun "mkdir -p '$REMOTE/inbox' '$REMOTE/out'; supervisorctl stop ray >/dev/null 
 rput "$SRC" "$REMOTE/inbox/$SAFE.$EXT"
 
 echo "==> transcribing"
-rrun "
+# A single recording is where a resident engine matters most: the five steps
+# below are seconds of work behind a ~70s engine load, so a voice memo spends
+# almost all of its wall clock starting up. batch.py does all five for a queue
+# of one, so when the box has a daemon, hand it the file and skip the load.
+#
+# Not with --name: enrolling a voice is identify.py's --enroll, which the batch
+# path has no equivalent for. Rather than half-support it, take the slow path.
+SINGLE_DONE=0
+if [ -z "$ENROLL" ]; then
+  T1="$(mktemp)"
+  # batch.py names transcripts from the sanitised remote filename; this is what
+  # gives the header back the title the human actually used.
+  printf '{%s}' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1])+":"+json.dumps(sys.argv[2]), end="")' "$SAFE" "$BASE")" > "$T1"
+  rput "$T1" "$REMOTE/out/_titles.json"; rm -f "$T1"
+  SINGLE_RC=0
+  rrun "
+    set -uo pipefail
+    cd '$REMOTE'
+    export HF_HOME='$REMOTE/.hf_home' MS_WORK='$REMOTE' VLLM_CACHE_ROOT='$REMOTE/.vllm_cache' \
+           OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
+    "$PY" '$PIPE/engined.py' --submit -- '$REMOTE/inbox/$SAFE.$EXT' \
+      --out-dir '$REMOTE/out' --window $WINDOW --overlap $OVERLAP --thr $THR \
+      --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
+      --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}
+  " || SINGLE_RC=$?
+  # 97 is "no usable daemon" and is the one code that means fall through; any
+  # other failure is a real one and the steps below would only repeat it.
+  if [ "$SINGLE_RC" -eq 0 ]; then SINGLE_DONE=1
+  elif [ "$SINGLE_RC" -ne 97 ]; then exit "$SINGLE_RC"
+  fi
+fi
+
+[ "$SINGLE_DONE" -eq 1 ] || rrun "
   set -euo pipefail
   cd '$REMOTE'
-  export HF_HOME='$REMOTE/.hf_home' OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+  export HF_HOME='$REMOTE/.hf_home' VLLM_CACHE_ROOT='$REMOTE/.vllm_cache' \
+         OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
          VLLM_LOGGING_LEVEL=WARNING PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
   "$PY" '$PIPE/transcribe_meeting.py' '$REMOTE/inbox/$SAFE.$EXT' --window $WINDOW \
