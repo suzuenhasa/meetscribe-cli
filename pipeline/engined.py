@@ -201,10 +201,43 @@ def serve(sock_path, window, overlap, gpu_frac):
     t0 = time.time()
     split = TM.plan_gpu_split()
     frac = gpu_frac if gpu_frac is not None else split.frac
+
+    # BOTH models, and the second one started FIRST. Transcribing needs the vLLM
+    # engine; working out who spoke needs WeSpeaker, a separate ~5s load that
+    # every single run used to pay. Holding only the engine left that half of the
+    # problem exactly where it was -- and on a short recording it is most of what
+    # remains once the engine is free.
+    #
+    # It costs nothing because it loads in its OWN process while this one spends
+    # ~70s building the engine. Started before that call rather than after, so
+    # the whole of it lands inside a window we are already paying for.
+    #
+    # Only when the card can hold both at once, which plan_gpu_split already
+    # decides: on a 6 GiB card it cannot, and jobs there transcribe first and
+    # embed afterwards with the engine released -- a resident embedder would sit
+    # in exactly the memory that scheme frees up.
+    emb = None
+    if split.concurrent:
+        env = {**os.environ, "OMP_NUM_THREADS": "4", "MS_WORK": work}
+        env.pop("CUDA_VISIBLE_DEVICES", None)   # vLLM rewrites this for its workers
+        try:
+            emb = batch.Embedder(split.embed_batch, env,
+                                 Path(sock_path).parent / "embed.log")
+        except Exception as e:
+            print(f"!! could not start the speaker model ({type(e).__name__}: {e})"
+                  f" — jobs will load their own", flush=True)
+
     llm = TM.build_engine(frac, window=window, overlap=overlap, releasable=True)
-    res = batch.Resident(llm, frac, window, overlap)
+
+    if emb is not None and not emb.alive():
+        print("!! the speaker model died while loading (see run/embed.log) — "
+              "jobs will load their own", flush=True)
+        emb = None
+    res = batch.Resident(llm, frac, window, overlap, embedder=emb)
     print(f"engine resident after {time.time()-t0:.1f}s — "
-          f"window {window}s overlap {overlap}s, gpu-frac {frac:.2f}", flush=True)
+          f"window {window}s overlap {overlap}s, gpu-frac {frac:.2f}"
+          + (f", speaker model held (--batch {emb.batch})" if emb
+             else ", speaker model NOT held"), flush=True)
 
     p = Path(sock_path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -231,39 +264,43 @@ def serve(sock_path, window, overlap, gpu_frac):
     signal.signal(signal.SIGINT, _bye)
 
     parser = batch.build_parser()
-    while True:
-        # The timeout is what makes idle sleep possible, nothing else. One job at
-        # a time, on purpose: two batches sharing one engine would each get half
-        # the card and finish in more than twice the time, and the second would
-        # race the first for the embedder's headroom.
-        srv.settimeout(IDLE_SLEEP_S if IDLE_SLEEP_S > 0 and not res.asleep else None)
-        try:
-            conn, _ = srv.accept()
-        except socket.timeout:
-            # Nothing for a while: hand the VRAM back. It costs ~1s to wake
-            # against ~70s to load, so this is nearly free, and it means a
-            # resident engine does not lock other work off the card all day.
-            try:
-                llm.sleep(level=1)
-                res.asleep = True
-                print(f"idle {IDLE_SLEEP_S:.0f}s — released the card, "
-                      f"still resident", flush=True)
-            except Exception as e:
-                print(f"!! could not release while idle ({type(e).__name__}: {e})",
-                      flush=True)
-                srv.settimeout(None)
-            continue
 
+    def handle(conn):
+        """Serve one connection. Returns True if the engine must shut down."""
         with conn, conn.makefile("rwb") as f:
+            line = f.readline()
+            if not line.strip():
+                # A probe: `engine status` connects and closes without sending
+                # anything, so that asking whether the engine is up does not
+                # queue behind a running job. There is nothing to answer.
+                return False
             try:
-                req = json.loads(f.readline() or "{}")
+                req = json.loads(line)
             except ValueError:
-                continue
+                return False
+
+            if req.get("cmd") == "release":
+                # Someone else needs the card. Anything that cannot go through
+                # this engine has to load its OWN, and a resident engine holding
+                # 17.6 of 24 GiB does not leave room for one -- so a caller about
+                # to fall back asks us to step aside first. Costs ~1s to wake
+                # again on the next job, against the run it would otherwise
+                # break.
+                try:
+                    if not res.asleep:
+                        llm.sleep(level=1)
+                        res.asleep = True
+                    send(f, {"rc": 0})
+                    print("released the card on request", flush=True)
+                except Exception as e:
+                    send(f, {"reject": f"could not release: {type(e).__name__}: {e}"})
+                return False
+
             try:
                 a = parser.parse_args(req.get("argv", []))
             except SystemExit:
                 send(f, {"reject": "arguments this engine does not understand"})
-                continue
+                return False
 
             # Three ways a resident engine is the wrong engine for a job. Each
             # sends the client to its own engine, which is slow and correct.
@@ -282,7 +319,7 @@ def serve(sock_path, window, overlap, gpu_frac):
                        f"for {a.gpu_frac:.2f}")
             if why:
                 send(f, {"reject": why})
-                continue
+                return False
 
             if req.get("cwd") and Path(req["cwd"]).is_dir():
                 os.chdir(req["cwd"])        # safe: one job at a time
@@ -307,13 +344,55 @@ def serve(sock_path, window, overlap, gpu_frac):
                 try:
                     res.wake()
                 except Exception as e:
-                    # An engine that will not wake is no longer an engine. Exit
-                    # and let supervisor build a clean one; clients fall back by
-                    # themselves in the meantime.
+                    # An engine that will not wake is no longer an engine. Say
+                    # so and shut down; supervisor builds a clean one, and
+                    # clients fall back by themselves meanwhile.
                     print(f"!! could not wake the engine ({type(e).__name__}: {e})"
                           f" — exiting so it gets rebuilt", flush=True)
-                    p.unlink(missing_ok=True)
-                    return 1
+                    return True
+            return False
+
+    while True:
+        # The timeout is what makes idle sleep possible, nothing else. One job at
+        # a time, on purpose: two batches sharing one engine would each get half
+        # the card and finish in more than twice the time, and the second would
+        # race the first for the embedder's headroom.
+        srv.settimeout(IDLE_SLEEP_S if IDLE_SLEEP_S > 0 and not res.asleep else None)
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            # Nothing for a while: hand the VRAM back. It costs ~1s to wake
+            # against ~70s to load, so this is nearly free, and it means a
+            # resident engine does not lock other work off the card all day.
+            try:
+                llm.sleep(level=1)
+                res.asleep = True
+                print(f"idle {IDLE_SLEEP_S:.0f}s — released the card, "
+                      f"still resident", flush=True)
+            except Exception as e:
+                print(f"!! could not release while idle ({type(e).__name__}: {e})",
+                      flush=True)
+                srv.settimeout(None)
+            continue
+
+        # NOTHING a client does may kill the engine. It costs 70-400s to replace
+        # and may have a queue behind it, so the bar for dying is far higher than
+        # for any single connection failing.
+        #
+        # This is not hypothetical. `engine status` connects and closes without
+        # reading, and the daemon used to answer a client that was already gone,
+        # get BrokenPipeError out of send(), and let it propagate out of this
+        # loop. Every status check killed the engine it was checking, about a
+        # second after reporting it healthy -- and everything downstream looked
+        # like the cause instead: engines "dying on ssh logout", stale sockets,
+        # jobs falling back for no reason, two engines racing for the card.
+        try:
+            if handle(conn):
+                p.unlink(missing_ok=True)
+                return 1
+        except Exception as e:
+            print(f"!! a client connection failed ({type(e).__name__}: {e}) — "
+                  f"still listening", flush=True)
 
 
 def main():
@@ -322,6 +401,7 @@ def main():
     g.add_argument("--serve", action="store_true")
     g.add_argument("--submit", action="store_true")
     g.add_argument("--status", action="store_true")
+    g.add_argument("--release", action="store_true")
     ap.add_argument("--sock", default=None)
     ap.add_argument("--window", type=float, default=30.0)
     ap.add_argument("--overlap", type=float, default=5.0)
@@ -340,12 +420,41 @@ def main():
         except OSError as e:
             print(f"stale socket at {sock_path}: {e}")
             return 1
-        # An empty request is rejected by design; the rejection proves it is
-        # alive and answering, which is the whole question being asked.
-        f = s.makefile("rwb")
-        send(f, {"argv": [], "cwd": os.getcwd(), "work": os.environ.get("MS_WORK", "")})
-        f.readline()
+        # CONNECTING is the whole test, and nothing is sent or read. On a unix
+        # socket a successful connect means a listener is bound; a file with
+        # nothing behind it gives ECONNREFUSED above. An earlier version sent a
+        # request and waited for the reply, which meant status HUNG -- and then,
+        # on the 5s timeout, reported "not running" -- for the entire duration of
+        # any job, because the daemon serves one at a time and does not read the
+        # next connection until the current one is done. Status claiming the
+        # engine is down while it is busy transcribing is worse than useless:
+        # ./engine start reads it, and would have started a second engine.
+        s.close()
         print(f"resident engine up at {sock_path}")
+        return 0
+
+    if a.release:
+        # Best effort by design. The caller is about to load its own engine and
+        # only wants the card free first; no daemon, or a daemon that will not
+        # answer, both mean there is nothing holding it.
+        if not Path(sock_path).exists():
+            return 0
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(60)        # sleep(level=1) is quick, but it is real work
+        try:
+            s.connect(sock_path)
+            f = s.makefile("rwb")
+            send(f, {"cmd": "release"})
+            msg = json.loads(f.readline() or "{}")
+        except (OSError, ValueError) as e:
+            print(f"==> could not ask the resident engine to release the card ({e})",
+                  file=sys.stderr)
+            return 1
+        if "reject" in msg:
+            print(f"==> resident engine could not release the card: {msg['reject']}",
+                  file=sys.stderr)
+            return 1
+        print("==> asked the resident engine to release the card", file=sys.stderr)
         return 0
 
     if a.submit:

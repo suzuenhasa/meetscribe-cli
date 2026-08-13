@@ -175,16 +175,23 @@ else
   # enough that the difference between "started it" and "did nothing" is
   # invisible unless you look for the socket -- which is what this does.
   log "starting the resident engine"
+  # `engine status` and NOT `[ -S run/engine.sock ]`. -S asks whether a socket
+  # FILE exists, and a daemon that died hard leaves one behind -- so on the
+  # no-supervisord box this whole section exists for, the wait below broke on its
+  # first iteration against a dead socket, the direct-start fallback never fired,
+  # and provisioning reported "resident engine up" over nothing at all. `status`
+  # connects, which is the actual question.
+  up() { MS_WORK="$MS_WORK" bash "$MS_WORK/engine" status >/dev/null 2>&1; }
   supervisorctl start meetscribe-engine >/dev/null 2>&1 || true
-  for _ in $(seq 1 60); do [ -S "$MS_WORK/run/engine.sock" ] && break; sleep 2; done
-  if [ ! -S "$MS_WORK/run/engine.sock" ]; then
+  for _ in $(seq 1 90); do up && break; sleep 2; done
+  if ! up; then
     log "supervisor did not start it — starting it directly"
     MS_WORK="$MS_WORK" HF_HOME="$HF_HOME" VLLM_CACHE_ROOT="$VLLM_CACHE_ROOT" \
       bash "$MS_WORK/engine" start 2>&1 | sed 's/^/  /' || true
   fi
   # Everything works without it -- ./transcribe loads its own engine when there
   # is no daemon -- so this is a note, not a failure.
-  if [ -S "$MS_WORK/run/engine.sock" ]; then
+  if up; then
     log "resident engine up — transcriptions no longer pay the engine load"
   else
     log "!! the resident engine did not come up. See $MS_WORK/run/engine.log and"

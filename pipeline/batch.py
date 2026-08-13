@@ -25,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import transcribe_meeting as TM
+import postproc
 from moss_transcribe_diarize.inference_utils import load_audio_item
 
 def _default_work():
@@ -79,6 +80,7 @@ class Embedder:
         # append, not truncate: a second worker may run after the first to
         # retry what did not fit, and the first attempt's diagnostics are
         # exactly what explains why.
+        self.batch = batch
         self.log = open(log_path, "a")
         self.proc = subprocess.Popen(
             [PY, f"{PIPE}/link/embed_batched.py", "--serve", "--batch", str(batch)],
@@ -127,6 +129,25 @@ class Embedder:
                 self.cond.wait()
             return bool(self.acks.get(out, {}).get("ok"))
 
+    def alive(self):
+        return self.proc.poll() is None
+
+    def drain(self, outs):
+        """Wait for exactly these outputs. -> {out_path: ack}
+
+        close() below ends the worker, which is right when it was built for one
+        run and wrong when it is held across many by the daemon -- shutting it
+        down there would reload WeSpeaker on the next job, which is the entire
+        thing being avoided. Same waiting, no shutdown."""
+        got = {}
+        with self.cond:
+            for o in [str(x) for x in outs]:
+                while o not in self.acks and not self.eof:
+                    self.cond.wait()
+                if o in self.acks:
+                    got[o] = self.acks[o]
+        return got
+
     def close(self):
         """Finish the queue and shut the worker down. -> {out_path: ack}"""
         try:
@@ -139,50 +160,10 @@ class Embedder:
         return dict(self.acks)
 
 
-def _run_module(spec):
-    """Run one pipeline script in-process. -> (key, returncode, captured output)
-
-    spec is (key, script_path, argv). Called in a pool worker, which pays each
-    import once and then handles many recordings -- the point of the exercise,
-    since these scripts cost far more to start than to run. Measured per
-    recording: link.py 0.13s of which ~0.10 is importing numpy, identify.py
-    0.116s against 0.103s to import numpy and sqlite3, mktxt.py 0.036s against
-    0.034s for a bare interpreter. Launching them three times per file was almost
-    entirely launch.
-
-    runpy rather than importing and calling main(), because mktxt.py has no
-    main() -- it is top-level script code reading sys.argv. Re-executing a module
-    body is cheap and its imports still hit sys.modules from the previous call,
-    which is where the saving actually comes from.
-
-    stdout is captured and returned rather than printed, so a pool cannot
-    interleave two recordings' diagnostics; the caller replays them in order.
-    Exceptions become a nonzero code, which is what the subprocess version gave
-    and what the artifact checking downstream expects.
-    """
-    import contextlib, io, runpy, sys as _sys, traceback
-    key, path, argv = spec
-    buf = io.StringIO()
-    old = _sys.argv
-    try:
-        _sys.argv = argv
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            runpy.run_path(path, run_name="__main__")
-        return key, 0, buf.getvalue()
-    except SystemExit as e:
-        return key, int(e.code or 0), buf.getvalue()
-    except Exception:
-        return key, 1, buf.getvalue() + traceback.format_exc()
-    finally:
-        _sys.argv = old
-
-
-def _pool_init(pipe_dir):
-    """Put the pipeline on the path so workers can import its modules."""
-    import sys as _sys
-    for p in (pipe_dir, f"{pipe_dir}/link"):
-        if p not in _sys.path:
-            _sys.path.insert(0, p)
+# Below this many recordings, post-processing runs in the parent instead of in a
+# pool. Set by what a worker costs to start (see run_all): a pool has to save
+# more than its own startup, and per-file work here is milliseconds.
+POST_POOL_MIN = int(os.environ.get("MS_POST_POOL_MIN", "4"))
 
 
 def post_workers():
@@ -242,10 +223,20 @@ class Resident:
     real load.
     """
 
-    def __init__(self, llm, gpu_frac, window, overlap):
+    def __init__(self, llm, gpu_frac, window, overlap, embedder=None):
         self.llm, self.gpu_frac = llm, gpu_frac
         self.window, self.overlap = window, overlap
         self.asleep = False
+        # The SECOND model. Holding the engine and not this one only solves half
+        # the problem: WeSpeaker is a separate ~5s load that every run paid, and
+        # on a short recording that is a large share of what is left once the
+        # engine is free. Held for the daemon's lifetime, not the job's.
+        self.embedder = embedder
+
+    def embedder_if_alive(self):
+        if self.embedder is not None and self.embedder.alive():
+            return self.embedder
+        return None
 
     def serves(self, a):
         return a.window == self.window and a.overlap == self.overlap
@@ -297,13 +288,23 @@ def run_job(a, resident=None):
     # sequential embedder finds the same memory it would have found running
     # concurrently: on a 6 GiB card, 45 MiB when it needed 66. llm.sleep() hands
     # back 3.54 of 3.90 GiB there, which is the whole problem solved.
-    free = TM.free_vram_gib()
-    embed_batch, concurrent = TM.choose_embed_strategy(free)
-    deferred = not concurrent
-    print(f"gpu split: vLLM {gpu_frac:.2f} target, {free:.1f} GiB free after load"
-          f" -> embedder --batch {embed_batch}"
-          + ("" if concurrent else ", run after the engine is released"),
-          flush=True)
+    held = resident.embedder_if_alive() if resident is not None else None
+    if held is not None:
+        # Nothing to decide. The embedder is already loaded and already holding
+        # its share of the card, so measuring free VRAM here would see the memory
+        # it is using and conclude it does not fit -- deferring an embedder that
+        # is sitting right there, ready.
+        embed_batch, deferred = held.batch, False
+        print(f"gpu split: vLLM {gpu_frac:.2f}, embedder --batch {embed_batch} "
+              f"(already loaded)", flush=True)
+    else:
+        free = TM.free_vram_gib()
+        embed_batch, concurrent = TM.choose_embed_strategy(free)
+        deferred = not concurrent
+        print(f"gpu split: vLLM {gpu_frac:.2f} target, {free:.1f} GiB free after load"
+              f" -> embedder --batch {embed_batch}"
+              + ("" if concurrent else ", run after the engine is released"),
+              flush=True)
     startup = time.time() - t_start
     print(f"engine resident after {startup:.1f}s"
           + (" (already loaded)" if resident is not None else "")
@@ -311,7 +312,9 @@ def run_job(a, resident=None):
 
     env = {**os.environ, "OMP_NUM_THREADS": "4", "MS_WORK": WORK}
     env.pop("CUDA_VISIBLE_DEVICES", None)     # vLLM rewrites this for its workers
-    emb = None if deferred else Embedder(embed_batch, env, out / "_embed.log")
+    # Reuse the daemon's worker when there is one; otherwise this run owns its
+    # own, exactly as it did before daemons existed.
+    emb = None if deferred else (held or Embedder(embed_batch, env, out / "_embed.log"))
 
     pending, unreadable, empty, queued = [], [], [], []
     sampling = TM.SamplingParams(temperature=0.0,
@@ -448,6 +451,9 @@ def run_job(a, resident=None):
     if deferred:
         release_engine()
         acks = embed_all(queued, "releasing the engine before embedding")
+    elif emb is held:
+        # Wait for this run's work, and leave the worker up for the next one.
+        acks = emb.drain(out / f"{n}_emb.npz" for n, _ in pending)
     else:
         acks = emb.close()
 
@@ -519,22 +525,38 @@ def run_job(a, resident=None):
     os.environ["MS_WORK"] = WORK
     rc_link, rc_render = {}, {}
     if todo:
-        ctx = multiprocessing.get_context("spawn")
-        nworkers = min(post_workers(), len(todo))
-        with ctx.Pool(nworkers, initializer=_pool_init, initargs=(PIPE,)) as pool:
-            for key, rc, output in pool.imap_unordered(
-                    _run_module, [(n, f"{PIPE}/link/link.py", argv_link(n)) for n, _ in todo]):
-                rc_link[key] = (rc, output)
+        # A pool is worth having for a queue and is pure loss for a handful of
+        # files. Starting one means `spawn`, and spawn re-runs THIS module's top
+        # level in every worker -- which imports transcribe_meeting, which
+        # imports vLLM and torch. 8.7s per worker against 0.5s for the numpy and
+        # scipy these scripts actually use, and two pools per run. On one
+        # 3-minute recording that was 17.4s of a 23s job, spent loading an
+        # inference stack to cluster a few hundred vectors.
+        #
+        # Below the threshold, run them right here: the parent has numpy loaded
+        # already and each script is milliseconds of real work, so there is
+        # nothing left to parallelise away. Above it, per-file work dominates
+        # again and the pool earns its startup back.
+        postproc.pool_init(PIPE)
+        parallel = len(todo) > POST_POOL_MIN
+
+        def run_all(specs):
+            if not parallel:
+                return {k: (rc, o) for k, rc, o in map(postproc.run_module, specs)}
+            ctx = multiprocessing.get_context("spawn")
+            with ctx.Pool(min(post_workers(), len(specs)),
+                          initializer=postproc.pool_init, initargs=(PIPE,)) as pool:
+                return {k: (rc, o) for k, rc, o in
+                        pool.imap_unordered(postproc.run_module, specs)}
+
+        rc_link = run_all([(n, f"{PIPE}/link/link.py", argv_link(n)) for n, _ in todo])
         # identify in the parent: single sqlite writer, and cheap once imported
         rc_ident = {}
         for name, _ in todo:
             if rc_link.get(name, (1, ""))[0] == 0:
-                rc_ident[name] = _run_module((name, f"{PIPE}/identify.py", argv_identify(name)))[1:]
-        with ctx.Pool(nworkers, initializer=_pool_init, initargs=(PIPE,)) as pool:
-            ready = [(n, f) for n, f in todo if rc_link.get(n, (1, ""))[0] == 0]
-            for key, rc, output in pool.imap_unordered(
-                    _run_module, [(n, f"{PIPE}/mktxt.py", argv_render(n, f)) for n, f in ready]):
-                rc_render[key] = (rc, output)
+                rc_ident[name] = postproc.run_module((name, f"{PIPE}/identify.py", argv_identify(name)))[1:]
+        ready = [(n, f) for n, f in todo if rc_link.get(n, (1, ""))[0] == 0]
+        rc_render = run_all([(n, f"{PIPE}/mktxt.py", argv_render(n, f)) for n, f in ready])
     else:
         rc_ident = {}
 

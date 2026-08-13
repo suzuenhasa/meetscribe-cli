@@ -38,12 +38,16 @@ need_host() {
 }
 THR="auto"
 ROSTER=""
-ENROLL=""
+ENROLL=()
 # Running ON the machine that has the pipeline? Then there is nothing to ssh to.
+# Decided AFTER the argument loop, because --host has to be able to win: this
+# test is "does pipeline/transcribe_meeting.py exist", that file is tracked in
+# git, so it exists in every clone -- including a laptop with no GPU and nothing
+# installed. Deciding here would make `./transcribe rec.mp3 --host box`, the
+# command the README and the vast template both tell people to run, quietly run
+# on the laptop and fail on the import.
 # Set MS_FORCE_REMOTE to use the box even when a local install exists.
 LOCAL=0
-[ -f "$PIPE/transcribe_meeting.py" ] \
-  && [ -z "${MS_FORCE_REMOTE:-}" ] && LOCAL=1
 WINDOW="30"
 OVERLAP="5"
 GPUFRAC=""
@@ -73,7 +77,7 @@ while [ $# -gt 0 ]; do
     --thr)      THR="$2"; shift 2 ;;
     --glossary) GLOSSARY="$2"; shift 2 ;;
     --roster)   ROSTER="$2"; shift 2 ;;
-    --name)     ENROLL="$ENROLL --enroll $2"; shift 2 ;;
+    --name)     ENROLL+=(--enroll "$2"); shift 2 ;;
     --window)  WINDOW="$2"; shift 2 ;;
     --overlap) OVERLAP="$2"; shift 2 ;;
     --gpu-frac) GPUFRAC="$2"; shift 2 ;;
@@ -82,6 +86,14 @@ while [ $# -gt 0 ]; do
     *)        SRC="$1"; shift ;;
   esac
 done
+
+# An explicit --host (or MS_HOST) means the box, full stop, whatever is sitting
+# in this directory. Otherwise use a local install if there is a usable one.
+if [ -n "$HOST" ]; then
+  LOCAL=0
+elif [ -f "$PIPE/transcribe_meeting.py" ] && [ -z "${MS_FORCE_REMOTE:-}" ]; then
+  LOCAL=1
+fi
 # VLLM_CACHE_ROOT travels with the install for the same reason everything else
 # does: vLLM's compiled graph is cached per model, per engine config and per GPU
 # model name, and the FIRST build of it costs 120-400s against ~70s for every one
@@ -101,6 +113,11 @@ else
   PY="$(ssh "$HOST" ". '$REMOTE/env.sh' 2>/dev/null; echo \"\${MS_PY:-python3}\"" 2>/dev/null | tail -1)"
   [ -n "$PY" ] || PY=python3
 fi
+# Shell-quoted for splicing into the remote snippets below, where the path
+# lands inside a double-quoted string and would otherwise word-split: setup.sh
+# records MS_PY as $WORK/venv/bin/python, so a checkout under "My Recordings"
+# truncated the snippet mid-path and ran a fragment.
+PYQ="$(printf '%q' "$PY")"
 
 # A directory means batch: the engine loads once instead of per file (~66s each),
 # and embedding overlaps the next file's transcription.
@@ -149,9 +166,9 @@ if [ -d "$SRC" ]; then
     # the ~70s load. 97 is engined.py saying it could not -- no daemon, a stale
     # socket, or an engine built for different windows -- having already printed
     # which. Run it here in that case, exactly as this line did before daemons.
-    "$PY" '$PIPE/engined.py' --submit -- \"\${ARGS[@]}\"
+    $PYQ '$PIPE/engined.py' --submit -- \"\${ARGS[@]}\"
     rc=\$?
-    [ \$rc -eq 97 ] && { "$PY" '$PIPE/batch.py' \"\${ARGS[@]}\"; rc=\$?; }
+    [ \$rc -eq 97 ] && { $PYQ '$PIPE/batch.py' \"\${ARGS[@]}\"; rc=\$?; }
     exit \$rc
   " || BATCH_RC=$?
 
@@ -221,7 +238,7 @@ echo "==> transcribing"
 # Not with --name: enrolling a voice is identify.py's --enroll, which the batch
 # path has no equivalent for. Rather than half-support it, take the slow path.
 SINGLE_DONE=0
-if [ -z "$ENROLL" ]; then
+if [ ${#ENROLL[@]} -eq 0 ]; then
   T1="$(mktemp)"
   # batch.py names transcripts from the sanitised remote filename; this is what
   # gives the header back the title the human actually used.
@@ -233,7 +250,7 @@ if [ -z "$ENROLL" ]; then
     cd '$REMOTE'
     export HF_HOME='$REMOTE/.hf_home' MS_WORK='$REMOTE' VLLM_CACHE_ROOT='$REMOTE/.vllm_cache' \
            OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
-    "$PY" '$PIPE/engined.py' --submit -- '$REMOTE/inbox/$SAFE.$EXT' \
+    $PYQ '$PIPE/engined.py' --submit -- '$REMOTE/inbox/$SAFE.$EXT' \
       --out-dir '$REMOTE/out' --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}
@@ -252,30 +269,58 @@ fi
          OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
          VLLM_LOGGING_LEVEL=WARNING PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-  "$PY" '$PIPE/transcribe_meeting.py' '$REMOTE/inbox/$SAFE.$EXT' --window $WINDOW \
+  # This path loads its OWN engine, and a resident one is holding most of the
+  # card -- 17.6 of 24 GiB measured -- so ask it to step aside first. Without
+  # this, the load below fails for want of memory. Harmless when there is no
+  # daemon, and the daemon takes about a second to wake for its next job.
+  $PYQ '$PIPE/engined.py' --release >/dev/null 2>&1 || true
+
+  # NOT piped into grep. It used to be, to keep the output tidy, with '|| true'
+  # on the end -- which meant pipefail could not see the failure and set -e could
+  # not act on it. vLLM's out-of-memory error matches none of the grep patterns,
+  # so a failed engine printed NOTHING and the script carried on to embed a
+  # transcript that did not exist. Worse, when a stale _raw.json from an earlier
+  # run happened to be lying there, every step after it succeeded against the
+  # OLD transcript and the run reported success -- observed here, enrolling a
+  # speaker against a transcript eight minutes stale.
+  rm -f '$REMOTE/out/${SAFE}_raw.json'
+  TXLOG='$REMOTE/out/${SAFE}_transcribe.log'
+  set +e
+  $PYQ '$PIPE/transcribe_meeting.py' '$REMOTE/inbox/$SAFE.$EXT' --window $WINDOW \
       ${GPUFRAC:+--gpu-frac $GPUFRAC} \
-      --overlap $OVERLAP --glossary '$GLOSSARY' \
+      --overlap $OVERLAP --glossary $(printf '%q' "$GLOSSARY") \
       --out '$REMOTE/out/${SAFE}_raw.json' 2>&1 \
-    | grep -E '^gen |silence gate|repetition|windows of' || true
+    | tee \"\$TXLOG\" | grep -E '^gen |silence gate|repetition|windows of'
+  # PIPESTATUS[0], because grep legitimately matches nothing on a good run and
+  # its own status says nothing about whether transcription worked. Read it
+  # BEFORE anything else runs: an '|| true' on the pipeline would have reset it.
+  TX_RC=\${PIPESTATUS[0]}
+  set -e
+  if [ \"\$TX_RC\" -ne 0 ] || [ ! -s '$REMOTE/out/${SAFE}_raw.json' ]; then
+    echo '!! transcription failed. Last 25 lines:' >&2
+    tail -25 \"\$TXLOG\" >&2
+    exit 1
+  fi
 
   echo '==> embedding speakers'
-  OMP_NUM_THREADS=4 "$PY" '$PIPE/link/embed_batched.py' \
+  OMP_NUM_THREADS=4 $PYQ '$PIPE/link/embed_batched.py' \
       --run '$REMOTE/out/${SAFE}_raw.json' --wav '$REMOTE/inbox/$SAFE.$EXT' \
       --out '$REMOTE/out/${SAFE}_emb.npz' 2>&1 | tail -1
 
   echo '==> linking speakers (threshold: $THR)'
-  OMP_NUM_THREADS=4 "$PY" '$PIPE/link/link.py' --run '$REMOTE/out/${SAFE}_raw.json' \
+  OMP_NUM_THREADS=4 $PYQ '$PIPE/link/link.py' --run '$REMOTE/out/${SAFE}_raw.json' \
       --npz '$REMOTE/out/${SAFE}_emb.npz' --thr $THR \
       --out '$REMOTE/out/${SAFE}_linked.json' 2>&1 \
     | grep -E 'k_est=|FLOOR-VIOLATION' || true
 
   echo '==> identifying speakers'
-  MS_WORK='$REMOTE' "$PY" '$PIPE/identify.py' \
+  MS_WORK='$REMOTE' $PYQ '$PIPE/identify.py' \
       --clusters '$REMOTE/out/${SAFE}_linked_clusters.npz' --meeting '$SAFE' \
-      --roster '$ROSTER' --names '$REMOTE/out/${SAFE}_names.json' $ENROLL
+      --roster $(printf '%q' "$ROSTER") \
+      --names '$REMOTE/out/${SAFE}_names.json' ${ENROLL[@]+${ENROLL[*]@Q}}
 
-  "$PY" '$PIPE/mktxt.py' '$REMOTE/out/${SAFE}_linked.json' '$REMOTE/out/${SAFE}_raw.json' \
-      '$REMOTE/out/${SAFE}.txt' '$BASE' '$REMOTE/out/${SAFE}_names.json'
+  $PYQ '$PIPE/mktxt.py' '$REMOTE/out/${SAFE}_linked.json' '$REMOTE/out/${SAFE}_raw.json' \
+      '$REMOTE/out/${SAFE}.txt' $(printf '%q' "$BASE") '$REMOTE/out/${SAFE}_names.json'
 "
 
 echo "==> retrieving"

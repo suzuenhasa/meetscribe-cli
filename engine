@@ -29,11 +29,26 @@ PIDF="$WORK/run/engine.pid"
 LOG="$WORK/run/engine.log"
 PY="$(. "$HERE/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
 
-alive() { "$PY" "$HERE/pipeline/engined.py" --status --sock "$SOCK" >/dev/null 2>&1; }
+alive()   { "$PY" "$HERE/pipeline/engined.py" --status --sock "$SOCK" >/dev/null 2>&1; }
+# Is a daemon there, INCLUDING one that is still loading? alive() cannot tell:
+# the socket it tests for is bound at the very end of build_engine, so for the
+# 70-400s of a load a starting engine looks exactly like no engine. Starting a
+# second one onto the same card is not a harmless duplicate -- each sizes itself
+# from the card's TOTAL memory, so whichever reaches the allocator second dies,
+# and the survivor is no longer the one the pid file names.
+loading() {
+  local pid; pid="$(cat "$PIDF" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
 
 case "${1:-status}" in
   start)
     if alive; then echo "already running ($SOCK)"; exit 0; fi
+    if loading; then
+      echo "already starting (pid $(cat "$PIDF")) — it is still loading."
+      echo "watch it with:  $0 log"
+      exit 0
+    fi
     shift                       # anything left is passed through, e.g. --window 60
     mkdir -p "$WORK/run"
     # setsid so it outlives the shell that started it -- including an ssh
@@ -46,12 +61,23 @@ case "${1:-status}" in
         "$@" >"$LOG" 2>&1 </dev/null &
     echo $! > "$PIDF"
     echo "==> loading the engine; this takes ~70s once"
-    for _ in $(seq 1 150); do
-      [ -S "$SOCK" ] && { echo "==> ready — $(grep -m1 'engine resident' "$LOG" || true)"; exit 0; }
-      kill -0 "$(cat "$PIDF")" 2>/dev/null || { echo "!! it exited:"; tail -20 "$LOG"; exit 1; }
+    # 480s, not 300: the FIRST load on a machine costs 240-400s while
+    # torch.compile fills its cache, so a 5-minute bound timed out on exactly
+    # the cold box it mattered on -- and left the engine loading behind it, so
+    # the obvious retry collided with its own first attempt.
+    START_PID="$(cat "$PIDF")"
+    for _ in $(seq 1 240); do
+      alive && { echo "==> ready — $(grep -m1 'engine resident' "$LOG" || true)"; exit 0; }
+      # Ask about the process we started, not whatever the pid file says now.
+      kill -0 "$START_PID" 2>/dev/null || { echo "!! it exited:"; tail -20 "$LOG"; exit 1; }
       sleep 2
     done
-    echo "!! still not up after 5 minutes; see $LOG"; exit 1 ;;
+    # Still alive, just slow. Do NOT kill it and do NOT call this a failure --
+    # it is very likely about to succeed, and saying "failed" invites a second
+    # start on top of the first.
+    echo "!! still loading after 8 minutes. It is probably still coming up:"
+    echo "     $0 status     $0 log"
+    exit 1 ;;
   stop)
     PID="$(cat "$PIDF" 2>/dev/null || true)"
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
