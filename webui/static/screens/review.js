@@ -511,8 +511,12 @@
     } else if (r === 'no-profiles') {
       wrap.textContent = 'No voice is enrolled yet, so there is nothing to match a cluster against.';
     } else if (r === 'not-identified') {
-      wrap.textContent = 'Nothing can be reviewed yet: no meeting in the library has been ' +
-                         'identified on this machine.';
+      /* Name the artefact and the fix. "Not identified" alone reads as a state
+         you are meant to change from this screen, and it is not — the block
+         below lists which meetings and why. */
+      wrap.textContent = 'No meeting here can be identified yet. A transcript needs its ' +
+                         '.emb.npz beside it before any voice in it can be enrolled or ' +
+                         'matched — see below for which are missing.';
     } else if (r === 'only-outside-library') {
       wrap.textContent = 'Nothing in this library is waiting. The clusters still open belong to ' +
                          'meetings that are not here.';

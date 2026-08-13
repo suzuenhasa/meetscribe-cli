@@ -58,10 +58,6 @@
     return (h ? h + ':' : '') + mm + ':' + String(x).padStart(2, '0');
   }
 
-  function num(v) {
-    return (typeof v === 'number' && isFinite(v)) ? String(v) : '—';
-  }
-
   // "42:40 · 7 voices · 0 named", the design's meta line built from real counts.
   function metaLine(ctx, m) {
     var bits = [];
@@ -76,25 +72,47 @@
     return bits.join(' · ');
   }
 
-  // Only two states can occur in a library of finished transcripts: every voice
-  // placed, or some still anonymous. The queued/running tags in the design
-  // belong to the ingest queue, which is a different endpoint.
-  function status(m) {
+  /* Four states, because a filter has to distinguish what you can act on from
+     what you cannot. The old classifier knew only named-vs-not, which put a
+     meeting you can fix and one you cannot under the same "review" tag.
+
+       done      every voice has a name
+       review    voices unnamed AND scorable — the only actionable state
+       blocked   voices unnamed but not scorable (no .emb.npz beside it)
+       plain     no diarised voices to name at all
+  */
+  var STATES = {
+    review:  { label: 'needs a name', cls: 'tag tag-accent-2' },
+    blocked: { label: 'not scorable', cls: 'tag tag-neutral' },
+    done:    { label: 'named',        cls: 'tag tag-neutral' },
+    plain:   { label: 'transcribed',  cls: 'tag tag-neutral' }
+  };
+
+  function stateOf(m, blockedWhy) {
     var n = (typeof m.n_speakers === 'number') ? m.n_speakers : 0;
     var named = (typeof m.n_named === 'number') ? m.n_named : 0;
-    if (!n) {
-      return { label: 'transcribed', cls: 'tag tag-neutral',
-               why: 'This transcript has no diarised voices to name.' };
+    if (!n) return { key: 'plain', why: 'This transcript has no diarised voices to name.' };
+    if (named >= n) return { key: 'done', why: 'Every voice in this meeting has a name.' };
+    if (blockedWhy) {
+      return { key: 'blocked', why: blockedWhy };
     }
-    if (named >= n) {
-      return { label: 'transcribed', cls: 'tag tag-neutral', why: 'Every voice in this meeting has a name.' };
-    }
-    return {
-      label: 'review',
-      cls: 'tag tag-accent-2',
-      why: (n - named) + ' of ' + n + ' voices in this meeting have no name yet.'
-    };
+    return { key: 'review',
+             why: (n - named) + ' of ' + n + ' voices in this meeting have no name yet.' };
   }
+
+  var SORTS = [
+    ['recent',   'Newest first',   function (a, b) { return (b.mtime || 0) - (a.mtime || 0); }],
+    ['oldest',   'Oldest first',   function (a, b) { return (a.mtime || 0) - (b.mtime || 0); }],
+    ['title',    'Title A–Z',      function (a, b) {
+      return String(a.title || '').localeCompare(String(b.title || '')); }],
+    ['longest',  'Longest first',  function (a, b) {
+      return (b.duration_s || 0) - (a.duration_s || 0); }],
+    ['unnamed',  'Most unnamed',   function (a, b) {
+      return ((b.n_speakers || 0) - (b.n_named || 0)) - ((a.n_speakers || 0) - (a.n_named || 0)); }]
+  ];
+
+  var PAGE = 60;   // rows rendered before "Show more" — a long library must not
+                   // build thousands of nodes to show you the first screenful
 
   // ------------------------------------------------------------------ render
   window.MS.screens.library = {
@@ -126,7 +144,6 @@
       }
 
       var meetings = Array.isArray(lib && lib.meetings) ? lib.meetings : [];
-      var stats = (lib && lib.stats) ? lib.stats : {};
 
       // Meetings whose voices cannot be scored at all — used for an honest
       // tooltip on the "review" tag rather than a promise the Review screen
@@ -140,43 +157,130 @@
 
       clear(root);
 
-      var grid = el('div', 'display:grid;grid-template-columns:minmax(0,1fr) 250px;gap:56px;align-items:start;max-width:1180px');
-      var main = el('div');
-      grid.appendChild(main);
+      /* One column now. The right rail held a running total of hours and three
+         counters; a library is a thing you navigate, not a dashboard, and those
+         numbers answered no question you could act on. What replaced them is the
+         filter row: the same counts, but each one takes you to the rows it
+         describes. */
+      var main = el('div', 'max-width:900px');
+      root.appendChild(main);
 
       main.appendChild(el('h1', 'font-size:40px;margin:0 0 4px', 'Library'));
-      main.appendChild(el('p', 'font-size:13.5px;color:var(--color-neutral-700);max-width:52ch;margin:0 0 30px',
+      main.appendChild(el('p', 'font-size:13.5px;color:var(--color-neutral-700);max-width:52ch;margin:0 0 22px',
                           'Every meeting transcribed on this machine. A voice named once is recognised in all of them.'));
 
-      if (!meetings.length) {
-        main.appendChild(el('p', 'font-size:13.5px;color:var(--color-neutral-700);max-width:52ch;margin:0',
-                            'No transcripts in this library yet. Ingest some audio and they will appear here.'));
+      // classify once; both the filter counts and the rows read from this
+      var tagged = meetings.map(function (m) {
+        var id = m && m.id != null ? String(m.id) : '';
+        return { m: m, id: id, st: stateOf(m || {}, blocked[id]) };
+      });
+      var counts = { all: tagged.length, review: 0, blocked: 0, done: 0, plain: 0 };
+      tagged.forEach(function (t) { counts[t.st.key] = (counts[t.st.key] || 0) + 1; });
+
+      // Filter and sort live on ctx.state so opening a meeting and coming back
+      // does not silently reset what you were looking at.
+      ctx.state = ctx.state || {};
+      if (!ctx.state.libFilter) ctx.state.libFilter = 'all';
+      if (!ctx.state.libSort) ctx.state.libSort = 'recent';
+
+      var controls = el('div', 'display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;' +
+        'padding-bottom:11px;border-bottom:1px solid color-mix(in srgb, var(--color-text) 14%, transparent);margin-bottom:4px');
+      var filterRow = el('div', 'display:flex;align-items:baseline;gap:16px;flex-wrap:wrap');
+      controls.appendChild(filterRow);
+
+      var filterNodes = [];
+      var FILTERS = [
+        ['all', 'All'],
+        ['review', 'Needs a name'],
+        ['blocked', 'Not scorable'],
+        ['done', 'Named'],
+        ['plain', 'No voices']
+      ];
+      FILTERS.forEach(function (f) {
+        var key = f[0], n = key === 'all' ? counts.all : (counts[key] || 0);
+        // A filter that would show nothing is not offered, so the row only ever
+        // contains routes that go somewhere.
+        if (key !== 'all' && !n) return;
+        var on = ctx.state.libFilter === key;
+        var a = el('span',
+          'font-size:12.5px;cursor:pointer;padding-bottom:3px;' +
+          (on ? 'color:var(--color-text);border-bottom:2px solid var(--color-accent-600);'
+              : 'color:var(--color-neutral-700);border-bottom:2px solid transparent;'));
+        a.appendChild(document.createTextNode(f[1] + ' '));
+        a.appendChild(el('span',
+          'font-variant-numeric:tabular-nums;' + (on ? '' : 'color:var(--color-neutral-600);'), n));
+        a.setAttribute('role', 'button');
+        a.setAttribute('tabindex', '0');
+        function pick() { ctx.state.libFilter = key; ctx.state.libShown = PAGE; paint(); }
+        a.addEventListener('click', pick);
+        a.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); pick(); }
+        });
+        filterNodes.push({ key: key, node: a });
+        filterRow.appendChild(a);
+      });
+
+      function styleFilter(key, node) {
+        var on = ctx.state.libFilter === key;
+        node.setAttribute('style',
+          'font-size:12.5px;cursor:pointer;padding-bottom:3px;' +
+          (on ? 'color:var(--color-text);border-bottom:2px solid var(--color-accent-600);'
+              : 'color:var(--color-neutral-700);border-bottom:2px solid transparent;'));
       }
 
-      meetings.forEach(function (m) {
-        if (!m || typeof m !== 'object') return;
-        var id = m.id != null ? String(m.id) : '';
-        var open = function () {
-          if (id) {
-            ctx.state.meeting = id;
-            ctx.go('transcript', { id: id });
-          }
-        };
+      var sortWrap = el('div', 'margin-left:auto;display:flex;align-items:baseline;gap:7px');
+      sortWrap.appendChild(el('label', 'font-size:10.5px;letter-spacing:0.12em;text-transform:uppercase;color:var(--color-neutral-600)', 'Sort'));
+      var sortSel = document.createElement('select');
+      sortSel.className = 'input';
+      sortSel.setAttribute('style', 'font-size:12.5px;padding:3px 6px;width:auto');
+      SORTS.forEach(function (o) {
+        var opt = document.createElement('option');
+        opt.value = o[0]; opt.textContent = o[1];
+        sortSel.appendChild(opt);
+      });
+      sortSel.value = ctx.state.libSort;
+      sortSel.addEventListener('change', function () {
+        ctx.state.libSort = sortSel.value; ctx.state.libShown = PAGE; paint();
+      });
+      sortWrap.appendChild(sortSel);
+      controls.appendChild(sortWrap);
+      main.appendChild(controls);
 
-        var row = el('div', 'padding:15px 0;border-bottom:1px solid color-mix(in srgb, var(--color-text) 8%, transparent);cursor:pointer');
-        row.setAttribute('role', 'button');
-        row.setAttribute('tabindex', '0');
-        row.addEventListener('click', open);
-        row.addEventListener('keydown', function (ev) {
+      var listBox = el('div', null);
+      main.appendChild(listBox);
+
+      var actions = el('div', 'display:flex;gap:10px;margin-top:30px');
+      var ingest = el('button', 'flex:none', 'Ingest meetings');
+      ingest.className = 'btn btn-primary'; ingest.type = 'button';
+      ingest.addEventListener('click', function () { ctx.go('ingest'); });
+      actions.appendChild(ingest);
+      if (counts.review) {
+        var rb = el('button', 'flex:none',
+          'Review ' + counts.review + (counts.review === 1 ? ' meeting' : ' meetings'));
+        rb.className = 'btn btn-secondary'; rb.type = 'button';
+        rb.addEventListener('click', function () { ctx.go('review'); });
+        actions.appendChild(rb);
+      }
+      main.appendChild(actions);
+
+      function row(t) {
+        var m = t.m, id = t.id;
+        var open = function () {
+          if (id) { ctx.state.meeting = id; ctx.go('transcript', { id: id }); }
+        };
+        var r = el('div', 'padding:15px 0;border-bottom:1px solid color-mix(in srgb, var(--color-text) 8%, transparent);cursor:pointer');
+        r.setAttribute('role', 'button');
+        r.setAttribute('tabindex', '0');
+        r.addEventListener('click', open);
+        r.addEventListener('keydown', function (ev) {
           if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); }
         });
 
         var head = el('div', 'display:flex;align-items:baseline;gap:14px');
-
         var date = el('div', 'font-size:10.5px;letter-spacing:0.12em;text-transform:uppercase;color:var(--color-neutral-600);width:96px;flex:none;font-variant-numeric:tabular-nums',
                       shortDate(m));
         date.title = 'Transcript written ' + (m.date || '—') +
-                     '. The store keeps no recording date, so this is the file’s own.';
+                     '. The store keeps no recording date, so this is the file\u2019s own.';
         head.appendChild(date);
 
         var current = ctx.state && ctx.state.meeting === id;
@@ -185,96 +289,65 @@
           (current ? 'color:var(--color-accent-700);' : ''),
           m.title || id || 'Untitled'));
 
-        var st = status(m);
+        var spec = STATES[t.st.key] || STATES.plain;
         var tagWrap = el('div', 'margin-left:auto;flex:none');
-        var tag = el('span', null, st.label);
-        tag.className = st.cls;
-        tag.title = st.why + (blocked[id] ? ' ' + blocked[id] + '.' : '');
+        var tag = el('span', null, spec.label);
+        tag.className = spec.cls;
+        tag.title = t.st.why;
         tagWrap.appendChild(tag);
         head.appendChild(tagWrap);
+        r.appendChild(head);
 
-        row.appendChild(head);
         var meta = metaLine(ctx, m);
         if (meta) {
-          row.appendChild(el('div', 'font-size:12.5px;color:var(--color-neutral-700);margin:5px 0 0 110px;font-variant-numeric:tabular-nums',
-                             meta));
+          r.appendChild(el('div', 'font-size:12.5px;color:var(--color-neutral-700);margin:5px 0 0 110px;font-variant-numeric:tabular-nums',
+                           meta));
         }
-        main.appendChild(row);
-      });
-
-      // ------------------------------------------------------------- the rail
-      var aside = el('aside', 'padding-top:16px');
-      aside.appendChild(el('div', 'font-size:10.5px;letter-spacing:0.12em;text-transform:uppercase;color:var(--color-neutral-600);margin-bottom:14px',
-                           'On this machine'));
-
-      var hours = (typeof stats.hours === 'number' && isFinite(stats.hours))
-        ? stats.hours.toFixed(1) : '—';
-      var cmyk = el('div', 'font-size:66px;font-weight:600;margin-bottom:2px');
-      cmyk.className = 'cmyk-num';
-      var paper = el('span', null, hours);
-      paper.className = 'paper';
-      cmyk.appendChild(paper);
-      ['plate-c', 'plate-m', 'plate-y'].forEach(function (p) {
-        var s = el('span', null, hours);
-        s.className = 'plate ' + p;
-        s.setAttribute('aria-hidden', 'true');
-        cmyk.appendChild(s);
-      });
-      aside.appendChild(cmyk);
-      aside.appendChild(el('div', 'font-size:12.5px;color:var(--color-neutral-700);margin-bottom:26px',
-                           'hours of audio, transcribed'));
-
-      var list = el('div', 'display:flex;flex-direction:column;gap:11px;font-size:13px');
-      function statRow(label, value, valueStyle, why) {
-        var r = el('div', 'display:flex;justify-content:space-between');
-        r.appendChild(el('span', 'color:var(--color-neutral-700)', label));
-        r.appendChild(el('span', valueStyle || 'font-variant-numeric:tabular-nums', value));
-        if (why) r.title = why;
-        list.appendChild(r);
+        return r;
       }
 
-      statRow('Meetings', num(stats.meetings), null,
-              'Transcripts in this library.');
-      statRow('Voices on file', num(stats.profiles), null,
-              'Voice profiles in speakers.db — these are the voices recognised across meetings.');
+      function paint() {
+        clear(listBox);
+        // underline follows the selection; each node carries its own key so this
+        // cannot drift out of step with which filters were actually offered
+        filterNodes.forEach(function (f) { styleFilter(f.key, f.node); });
 
-      // "Awaiting a name" is the library's own unnamed cluster count, which is
-      // what the label says. It is not the same as the review queue: a cluster
-      // can need a name and still not be scorable (see the tag tooltips).
-      var awaiting = (typeof stats.unnamed === 'number') ? stats.unnamed : null;
-      statRow('Awaiting a name', num(awaiting),
-              awaiting ? 'font-variant-numeric:tabular-nums;color:var(--color-accent-2-700)'
-                       : 'font-variant-numeric:tabular-nums',
-              'Voices in these transcripts that nobody has named yet.');
+        var want = ctx.state.libFilter;
+        var rows = tagged.filter(function (t) { return want === 'all' || t.st.key === want; });
+        var cmp = (SORTS.filter(function (o) { return o[0] === ctx.state.libSort; })[0] || SORTS[0])[2];
+        rows = rows.slice().sort(cmp);
 
-      // The design's fourth line here was "Throughput 382× realtime". That
-      // figure is a README measurement, not anything this server reports, so
-      // the line is left out rather than hardcoded.
+        if (!rows.length) {
+          listBox.appendChild(el('p', 'font-size:13.5px;color:var(--color-neutral-700);margin:18px 0',
+            meetings.length ? 'No meeting matches this filter.'
+                            : 'No transcripts in this library yet. Ingest some audio and they will appear here.'));
+          return;
+        }
 
-      aside.appendChild(list);
+        var shown = Math.min(ctx.state.libShown || PAGE, rows.length);
+        for (var i = 0; i < shown; i++) listBox.appendChild(row(rows[i]));
 
-      var pending = review && review.counts && typeof review.counts.pending === 'number'
-        ? review.counts.pending : null;
-
-      var ingest = el('button', 'margin-top:28px', 'Ingest meetings');
-      ingest.className = 'btn btn-primary btn-block';
-      ingest.type = 'button';
-      ingest.addEventListener('click', function () { ctx.go('ingest'); });
-      aside.appendChild(ingest);
-
-      var reviewBtn = el('button', null,
-        pending ? 'Review ' + pending + (pending === 1 ? ' voice' : ' voices') : 'Review voices');
-      reviewBtn.className = 'btn btn-secondary btn-block';
-      reviewBtn.type = 'button';
-      if (pending === 0) {
-        reviewBtn.title = 'Nothing is waiting to be scored right now' +
-          (review && review.reason ? ' (' + review.reason + ')' : '') + '.';
+        if (shown < rows.length) {
+          var more = el('div', 'padding:16px 0;display:flex;align-items:baseline;gap:12px');
+          var btn = el('span', 'font-size:12.5px;cursor:pointer;color:var(--color-accent-700);border-bottom:1px solid var(--color-accent-300)',
+                       'Show ' + Math.min(PAGE, rows.length - shown) + ' more');
+          btn.setAttribute('role', 'button');
+          btn.setAttribute('tabindex', '0');
+          function grow() { ctx.state.libShown = shown + PAGE; paint(); }
+          btn.addEventListener('click', grow);
+          btn.addEventListener('keydown', function (ev) {
+            if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); grow(); }
+          });
+          more.appendChild(btn);
+          more.appendChild(el('span', 'font-size:12.5px;color:var(--color-neutral-600);font-variant-numeric:tabular-nums',
+                              shown + ' of ' + rows.length));
+          listBox.appendChild(more);
+        }
       }
-      reviewBtn.addEventListener('click', function () { ctx.go('review'); });
-      aside.appendChild(reviewBtn);
 
-      grid.appendChild(aside);
-      root.appendChild(grid);
+      ctx.state.libShown = ctx.state.libShown || PAGE;
+      paint();
+
     },
 
     destroy() {}

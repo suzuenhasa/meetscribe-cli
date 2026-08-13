@@ -15,6 +15,7 @@ embedding need a GPU, and everything else -- clustering, identification, renamin
 """
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -56,6 +57,7 @@ class Backend:
         self.host = host or ""
         self.work = Path(work) if work else ROOT
         self.name = f"remote ({self.host})" if self.host else "local"
+        self.proc = None                 # the running ./transcribe, if any
 
     def available(self):
         """Is there anything to run -- a local install, or a reachable box?"""
@@ -100,10 +102,20 @@ class Backend:
             with open(log, "a") as fh:
                 fh.write("\n$ " + " ".join(argv) + "\n")
                 fh.flush()
-                # transcribe writes its transcripts into the working directory
-                rc = subprocess.run(
+                # Popen rather than run(), so the process can be reached and
+                # stopped while it works -- a batch of forty recordings is long
+                # enough that starting one by mistake should not mean waiting it
+                # out. Held on the instance because the UI's cancel arrives on a
+                # different thread than the one waiting here.
+                proc = subprocess.Popen(
                     argv, cwd=out_dir, stdout=fh, stderr=subprocess.STDOUT,
-                    env={**os.environ, "MS_WORK": str(self.work)}).returncode
+                    env={**os.environ, "MS_WORK": str(self.work)},
+                    start_new_session=True)
+                self.proc = proc
+                try:
+                    rc = proc.wait()
+                finally:
+                    self.proc = None
 
             out = []
             for src, staged_path in staged:
@@ -125,6 +137,26 @@ class Backend:
             print(f"[backend] {len(files) - len(out)} of {len(files)} recording(s) "
                   f"did not complete — see {log}", flush=True)
         return out
+
+    def cancel(self):
+        """Stop the batch in flight. -> True if there was one.
+
+        The whole process group, not just the child: ./transcribe is a shell
+        script that runs python, ssh and rsync, and killing only the script
+        leaves those orphaned and still holding the GPU. start_new_session above
+        is what makes the group addressable.
+        """
+        proc = self.proc
+        if not proc or proc.poll() is not None:
+            return False
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                return False
+        return True
 
     def run_pipeline(self, audio, out_dir: Path, glossary="", on_stage=None):
         got = self.run_batch([audio], out_dir, glossary, "", on_stage)

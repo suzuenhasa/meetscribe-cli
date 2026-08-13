@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Provision meetscribe on a vast.ai instance.
+#
+# Point a template's PROVISIONING_SCRIPT at the RAW url of this file and vast
+# runs it once, as root, at boot -- logging to /var/log/portal/provisioning.log.
+# See vast/README.md for the template fields that go with it.
+#
+# It clones the repo, installs the pipeline, downloads the weights, and then
+# does one throwaway transcription so the engine's compile cache is populated
+# before you ever ask it for anything. That last step is the whole point: the
+# FIRST engine load on a machine costs 240-400s while torch.compile and
+# FlashInfer fill their caches, against ~70s every load after. Paying it here
+# means the box is warm when you arrive rather than when you are waiting.
+#
+# Safe to run twice. Everything below is either idempotent or guarded.
+set -euo pipefail
+
+MS_WORK="${MS_WORK:-/opt/meetscribe}"
+MS_REPO="${MS_REPO:-https://github.com/suzuenhasa/meetscribe-cli.git}"
+MS_REF="${MS_REF:-main}"
+# NOT /workspace: vast documents it as possibly shared between instances with
+# concurrent writers, and speakers.db is the one file here that cannot be
+# rebuilt from the audio.
+export HF_HOME="${HF_HOME:-$MS_WORK/.hf_home}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$MS_WORK/.vllm_cache}"
+
+log()  { printf '[meetscribe %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+die()  { printf '[meetscribe] FAILED: %s\n' "$*" >&2; exit 1; }
+
+log "work dir   $MS_WORK"
+log "ref        $MS_REF"
+log "hf cache   $HF_HOME"
+
+# ---------------------------------------------------------------- the GPU
+command -v nvidia-smi >/dev/null || die "no nvidia-smi; this template needs a GPU instance"
+nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader | sed 's/^/  /'
+
+# Ray ships started on some vast images and does nothing for us but hold VRAM
+# and pids. The stock vllm service refuses to start without VLLM_MODEL, so it is
+# already quiet, but stop it too rather than rely on that.
+for svc in ray vllm; do
+  supervisorctl stop "$svc" >/dev/null 2>&1 && log "stopped the stock $svc service" || true
+done
+
+# ---------------------------------------------------------------- the source
+if [ -d "$MS_WORK/.git" ]; then
+  log "updating the checkout"
+else
+  log "cloning $MS_REPO"
+  mkdir -p "$(dirname "$MS_WORK")"
+  # Clone bare-ish then fetch the ref, rather than --branch: --branch takes a
+  # branch or tag and NOT a commit sha, and the whole point of pinning MS_REF to
+  # a sha is that a moving ref is a thing someone else can change under you. A
+  # fallback that quietly cloned the default branch would defeat exactly that.
+  git clone --no-checkout --depth 1 "$MS_REPO" "$MS_WORK" || die "git clone"
+fi
+
+# One path for both cases, and it accepts a full sha, a tag or a branch.
+# ABBREVIATED shas do not work here: git fetch resolves a ref name on the remote
+# and an 8-character sha is not one, so it fails with "couldn't find remote ref"
+# -- verified against this repo. Say so rather than making someone read that.
+if [ "${#MS_REF}" -lt 40 ] && printf '%s' "$MS_REF" | grep -qE '^[0-9a-f]{6,39}$'; then
+  die "MS_REF looks like a shortened commit sha ($MS_REF). git fetch needs the
+       full 40 characters, or a branch or tag name."
+fi
+git -C "$MS_WORK" fetch --depth 1 origin "$MS_REF" \
+  || die "no such ref in $MS_REPO: $MS_REF"
+git -C "$MS_WORK" checkout -f FETCH_HEAD || die "git checkout $MS_REF"
+cd "$MS_WORK"
+log "at $(git rev-parse --short HEAD) $(git log -1 --format=%s | cut -c1-60)"
+
+# So ./transcribe --host <box> from a laptop can find the install without the
+# caller having to remember where the template put it.
+echo "$MS_WORK" > /etc/meetscribe-work
+
+# ---------------------------------------------------------------- the install
+# setup.sh is idempotent and re-runnable; on the vastai/vllm image most of the
+# heavy lifting (vLLM, torch, CUDA, ffmpeg) is already done, so this is mostly
+# the weights.
+log "running setup.sh — weights are ~2 GB on a cold box"
+MS_WORK="$MS_WORK" HF_HOME="$HF_HOME" bash setup.sh 2>&1 | sed 's/^/  /' \
+  || die "setup.sh — see the output above"
+
+log "verifying"
+MS_WORK="$MS_WORK" HF_HOME="$HF_HOME" bash setup.sh --check 2>&1 | sed 's/^/  /' \
+  || die "setup.sh --check did not pass"
+
+# ------------------------------------------------------------ warm the cache
+# One real transcription, on synthetic audio, purely to make the engine compile
+# itself now instead of the first time you use it. The transcript is garbage and
+# is thrown away -- what matters is VLLM_CACHE_ROOT and FlashInfer's cache being
+# populated for THIS gpu, since the compile cache is keyed by the card's model
+# name and cannot be baked ahead of time for an unknown rental.
+if [ "${MS_SKIP_WARM:-}" = "1" ]; then
+  log "MS_SKIP_WARM=1 — leaving the engine cold"
+else
+  WARM="$MS_WORK/.warm"
+  mkdir -p "$WARM"
+  if [ ! -f "$WARM/warm.wav" ]; then
+    # speech-shaped enough to produce windows; the content is irrelevant
+    ffmpeg -v error -f lavfi -i "sine=frequency=200:duration=45" \
+      -ac 1 -ar 16000 -c:a pcm_s16le "$WARM/warm.wav" \
+      || log "!! could not make the warm-up clip; skipping"
+  fi
+  if [ -f "$WARM/warm.wav" ]; then
+    log "warming the engine — this is the 240-400s you are paying so you do not have to later"
+    t0=$(date +%s)
+    ( cd "$WARM" && MS_WORK="$MS_WORK" HF_HOME="$HF_HOME" \
+        "$MS_WORK/transcribe" "$WARM" >"$WARM/warm.log" 2>&1 ) || true
+    # Judge this on whether the ENGINE came up, not on the exit code. A sine wave
+    # contains no speech, so the run legitimately finds nothing and exits
+    # nonzero -- while having done the entire job we wanted, which is to compile
+    # and cache the engine for this GPU.
+    if grep -q "engine up in" "$WARM/warm.log" 2>/dev/null; then
+      log "engine warm after $(( $(date +%s) - t0 ))s ($(grep -o 'engine up in [0-9.]*s' "$WARM/warm.log" | head -1))"
+    else
+      log "!! the engine did not come up (see $WARM/warm.log) — the install is"
+      log "   otherwise fine, but your first transcription will pay the compile"
+    fi
+    rm -f "$WARM"/*.txt "$WARM"/*.json "$WARM"/*.emb.npz
+  fi
+fi
+
+# ---------------------------------------------------------------- done
+date -u +%FT%TZ > "$MS_WORK/.provisioned"
+log ""
+log "ready. From your laptop:"
+log "    ./transcribe ~/recordings/ --host <this-box>"
+log "and for the browser UI, on the box:"
+log "    $MS_WORK/ui &     then   ssh -N -L 8765:localhost:8765 <this-box>"
+log "installed at $MS_WORK"

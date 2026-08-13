@@ -1,11 +1,12 @@
 /* Ingest — design/Meetscribe.dc.html lines 111-141.
 
-   Two real inputs, because the server reads audio off this machine and the
-   browser never uploads anything:
-     · a drop zone. A file dragged from the desktop only hands the page a path
-       in some browsers (Firefox gives text/uri-list, Chrome does not), so when
-       the path is withheld we fall through to the picker with the names ticked.
-     · a picker over /api/browse, which lists directories on this machine.
+   Audio reaches the server by being uploaded: a browser will not tell a page
+   where a chosen file lives, so a system file picker can only work if the bytes
+   travel with it. This screen therefore offers the OS picker for files and for a
+   folder, plus drag and drop, and POSTs each file to /api/upload before queuing
+   the paths it gets back. An earlier version browsed the server's own
+   directories from the page to avoid uploading; that was a lot of custom UI
+   standing in for a dialog every operating system already has.
    The queue table polls /api/queue and shows the stages the backend actually
    emits: queued/starting, upload, transcribe, embed, link, retrieve, done. */
 (function () {
@@ -118,24 +119,6 @@
   /* Paths out of a drop. Firefox and most terminals/editors put file:// URIs or
      a bare path on the dataTransfer; Chrome deliberately withholds them for OS
      file drags, in which case this returns [] and the caller falls back. */
-  function pathsFromDrop(dt) {
-    var raw = '', out = [], seen = {};
-    try { raw = dt.getData('text/uri-list') || ''; } catch (e) { raw = ''; }
-    if (!raw) { try { raw = dt.getData('text/plain') || ''; } catch (e2) { raw = ''; } }
-    String(raw).split(/[\r\n]+/).forEach(function (line) {
-      var s = line.trim();
-      if (!s || s.charAt(0) === '#') return;
-      if (/^file:\/\//i.test(s)) {
-        s = s.replace(/^file:\/\/[^/]*/i, '');
-        try { s = decodeURIComponent(s); } catch (e3) { /* keep it raw */ }
-      } else if (s.charAt(0) !== '/' && s.charAt(0) !== '~') {
-        return;
-      }
-      if (s && !seen[s]) { seen[s] = 1; out.push(s); }
-    });
-    return out;
-  }
-
   function stageRank(st) {
     if (st === 'queued') return 1;
     if (st === 'failed') return 2;
@@ -157,10 +140,11 @@
   }
 
   function counts(items) {
-    var c = { running: 0, waiting: 0, done: 0, failed: 0 };
+    var c = { running: 0, waiting: 0, held: 0, done: 0, failed: 0 };
     items.forEach(function (q) {
       var st = q.stage;
-      if (st === 'queued') c.waiting++;
+      if (st === 'held') c.held++;
+      else if (st === 'queued') c.waiting++;
       else if (st === 'done') c.done++;
       else if (st === 'failed') c.failed++;
       else c.running++;
@@ -238,6 +222,8 @@
       if (S.dead) return;
       S.queueErr = null;
       S.queue = (d && d.queue) || [];
+      S.waiting = (d && d.waiting) || 0;
+      S.running = !!(d && d.running);
       drawQueue(S);
       loadLengths(S);
       schedule(S, busy(S) ? 1000 : 5000);
@@ -276,10 +262,60 @@
     try { S.ctx.go('transcript', { id: id }); } catch (e) { /* no transcript screen */ }
   }
 
+  /* Queue control. An individual file cannot be stopped once its batch is
+     running -- the server hands every queued file to ONE ./transcribe so the
+     engine loads once, which is ~70s per batch instead of per file. Holding a
+     file before it starts, and cancelling the batch that is running, give the
+     same control without surrendering that. Holding everything but one and
+     pressing Run is how you process a single file. */
+  function act(S, payload) {
+    return S.ctx.api('/api/queue/act', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(function (r) {
+      poll(S);
+      return r;
+    }, function (e) {
+      say(S, errText(e), true);
+      throw e;
+    });
+  }
+
+  function rowActions(S, q) {
+    var st = String(q.stage || 'queued');
+    var wrap = h('div', { style: 'display:flex;gap:8px;justify-content:flex-end' });
+    function btn(label, payload, title) {
+      return h('span', {
+        style: 'font-size:11.5px;cursor:pointer;color:var(--color-accent-700);' +
+          'border-bottom:1px solid var(--color-accent-300)',
+        role: 'button', tabindex: '0', title: title || null,
+        onclick: function (ev) { ev.stopPropagation(); act(S, payload); }
+      }, label);
+    }
+    if (st === 'queued') {
+      wrap.appendChild(btn('hold', { action: 'hold', id: q.id },
+        'Keep this out of the next batch.'));
+      wrap.appendChild(btn('remove', { action: 'remove', id: q.id }));
+    } else if (st === 'held') {
+      wrap.appendChild(btn('release', { action: 'release', id: q.id },
+        'Put it back in line for the next batch.'));
+      wrap.appendChild(btn('remove', { action: 'remove', id: q.id }));
+    } else if (st === 'failed') {
+      wrap.appendChild(btn('retry', { action: 'retry', id: q.id }));
+      wrap.appendChild(btn('remove', { action: 'remove', id: q.id }));
+    } else if (st === 'done') {
+      wrap.appendChild(btn('clear', { action: 'remove', id: q.id },
+        'Take it off this list. The transcript stays in the library.'));
+    }
+    return wrap;
+  }
+
   function queueRow(S, q) {
     var st = String(q.stage || 'queued');
-    var running = RUNNING.indexOf(st) >= 0 || (st !== 'queued' && st !== 'done' && st !== 'failed');
-    var tag = 'tag ' + (st === 'queued' ? 'tag-outline'
+    var running = RUNNING.indexOf(st) >= 0
+      || (st !== 'queued' && st !== 'held' && st !== 'done' && st !== 'failed');
+    var tag = 'tag ' + (st === 'queued' || st === 'held' ? 'tag-outline'
       : st === 'done' ? 'tag-neutral'
         : st === 'failed' ? 'tag-accent-2' : 'tag-accent');
 
@@ -330,9 +366,31 @@
         h('div', { style: 'height:5px;background:color-mix(in srgb, var(--color-text) 8%, transparent)' },
           h('div', { style: bar }))),
       h('td', { style: 'text-align:right;font-variant-numeric:tabular-nums;color:var(--color-neutral-700)' },
-        elapsed)
+        elapsed),
+      h('td', null, rowActions(S, q))
     ]);
   }
+
+  /* A row is rebuilt only when something it displays has changed. The whole
+     table used to be cleared and reconstructed on every poll, which is fine for
+     six files and not for six hundred: a second-by-second rebuild of hundreds of
+     rows churns the DOM, drops any text you had selected, and grows with the
+     queue rather than with what actually moved. */
+  function rowSig(S, q) {
+    return [q.stage, q.pct, q.elapsed, q.started, q.meeting, q.error,
+            q.stage === 'done' && q.meeting ? S.lens[q.meeting] : null].join('\u0001');
+  }
+
+  var QFILTERS = [
+    ['all', 'All', null],
+    ['running', 'Running', function (q) { return RUNNING.indexOf(String(q.stage)) >= 0
+        || (q.stage !== 'queued' && q.stage !== 'done' && q.stage !== 'failed'); }],
+    ['queued', 'Waiting', function (q) { return q.stage === 'queued'; }],
+    ['held', 'Held', function (q) { return q.stage === 'held'; }],
+    ['failed', 'Failed', function (q) { return q.stage === 'failed'; }],
+    ['done', 'Done', function (q) { return q.stage === 'done'; }]
+  ];
+  var QPAGE = 80;
 
   function drawQueue(S) {
     if (S.dead || !S.tbody) return;
@@ -345,23 +403,119 @@
     } else {
       if (c.running) parts.push(c.running + ' running');
       if (c.waiting) parts.push(c.waiting + ' waiting');
+      if (c.held) parts.push(c.held + ' held');
       if (c.done) parts.push(c.done + ' done');
       if (c.failed) parts.push(c.failed + ' failed');
       S.qnote.textContent = parts.join(', ') +
         " · held in this server's memory, so a restart empties it";
     }
 
-    clear(S.tbody);
-    if (!items.length) {
-      S.tbody.appendChild(h('tr', null,
-        h('td', { colspan: '5', style: 'color:var(--color-neutral-700);font-size:13px' },
-          S.queueErr
-            ? 'The queue could not be read — ' + S.queueErr
-            : 'Nothing queued. This list is what the server has been asked to do since it started; ' +
-              'finished transcripts live in the library, not here.')));
+    /* Filter chips, so a long queue can be narrowed to the part you care about
+       -- with three running behind two hundred done, scrolling is not a way to
+       find them. Built once, restyled on each draw; a filter matching nothing is
+       not offered. */
+    if (S.qfilters) {
+      clear(S.qfilters);
+      if (items.length > 12) {
+        QFILTERS.forEach(function (f) {
+          var n = f[2] ? items.filter(f[2]).length : items.length;
+          if (f[0] !== 'all' && !n) return;
+          var on = (S.qfilter || 'all') === f[0];
+          var chip = h('span', {
+            style: 'font-size:12px;cursor:pointer;padding-bottom:2px;' +
+              (on ? 'color:var(--color-text);border-bottom:2px solid var(--color-accent-600);'
+                  : 'color:var(--color-neutral-700);border-bottom:2px solid transparent;'),
+            role: 'button', tabindex: '0',
+            onclick: function () { S.qfilter = f[0]; S.qshown = QPAGE; drawQueue(S); }
+          }, f[1] + ' ' + n);
+          S.qfilters.appendChild(chip);
+        });
+      }
+    }
+
+    if (S.qctl) {
+      clear(S.qctl);
+      /* Adding a file never starts it. This is the button that does, so it is
+         the only primary action on the screen and it says how much it is about
+         to commit to. */
+      if (c.waiting) {
+        S.qctl.appendChild(h('button', {
+          class: 'btn btn-primary', style: 'font-size:12.5px;padding:3px 12px',
+          title: 'Runs everything waiting as one batch. The engine loads once for '
+            + 'the batch, so this is far faster than starting files one at a time.',
+          onclick: function () { act(S, { action: 'run' }); }
+        }, 'Process queue (' + c.waiting + ')'));
+      }
+      if (S.running) {
+        S.qctl.appendChild(h('button', {
+          class: 'btn btn-secondary', style: 'font-size:12.5px;padding:3px 10px',
+          title: 'Stops the batch that is running. Files already transcribed keep their transcripts.',
+          onclick: function () { act(S, { action: 'cancel' }); }
+        }, 'Cancel the run'));
+      }
+    }
+
+    var want = QFILTERS.filter(function (f) { return f[0] === (S.qfilter || 'all'); })[0];
+    var shownItems = (want && want[2]) ? items.filter(want[2]) : items;
+
+    if (!shownItems.length) {
+      clear(S.tbody);
+      S.rowCache = Object.create(null);
+      S.tbody.appendChild(
+        h('tr', null,
+          h('td', { colspan: '6', style: 'color:var(--color-neutral-700);font-size:13px' },
+            S.queueErr
+              ? 'The queue could not be read — ' + S.queueErr
+              : items.length
+                ? 'Nothing in the queue matches this filter.'
+                : 'Nothing queued. This list is what the server has been asked to do since it '
+                  + 'started; finished transcripts live in the library, not here.')));
       return;
     }
-    items.forEach(function (q) { S.tbody.appendChild(queueRow(S, q)); });
+
+    var cap = Math.min(S.qshown || QPAGE, shownItems.length);
+    var visible = shownItems.slice(0, cap);
+
+    var cache = S.rowCache || (S.rowCache = Object.create(null));
+    var seen = Object.create(null);
+    var prev = null;
+    visible.forEach(function (q) {
+      var key = String(q.id || q.path || q.file);
+      seen[key] = true;
+      var sig = rowSig(S, q);
+      var hit = cache[key];
+      if (!hit || hit.sig !== sig) {
+        var tr = queueRow(S, q);
+        if (hit && hit.tr.parentNode === S.tbody) S.tbody.replaceChild(tr, hit.tr);
+        hit = cache[key] = { tr: tr, sig: sig };
+      }
+      // keep DOM order in step with sort order, moving only what is out of place
+      var want_after = prev ? prev.nextSibling : S.tbody.firstChild;
+      if (hit.tr !== want_after) S.tbody.insertBefore(hit.tr, want_after);
+      prev = hit.tr;
+    });
+    // drop rows that are no longer shown
+    Object.keys(cache).forEach(function (k) {
+      if (!seen[k]) {
+        if (cache[k].tr.parentNode === S.tbody) S.tbody.removeChild(cache[k].tr);
+        delete cache[k];
+      }
+    });
+    if (S.qmore) {
+      clear(S.qmore);
+      if (cap < shownItems.length) {
+        S.qmore.appendChild(h('span', {
+          style: 'font-size:12.5px;cursor:pointer;color:var(--color-accent-700);'
+            + 'border-bottom:1px solid var(--color-accent-300)',
+          role: 'button', tabindex: '0',
+          onclick: function () { S.qshown = cap + QPAGE; drawQueue(S); }
+        }, 'Show ' + Math.min(QPAGE, shownItems.length - cap) + ' more'));
+        S.qmore.appendChild(h('span', {
+          style: 'font-size:12.5px;color:var(--color-neutral-600);margin-left:12px;'
+            + 'font-variant-numeric:tabular-nums'
+        }, cap + ' of ' + shownItems.length));
+      }
+    }
   }
 
   // ----------------------------------------------------------------- ingest
@@ -397,187 +551,74 @@
     });
   }
 
+  /* Uploading, because the browser refuses to tell a page where a chosen file
+     lives -- it gives the contents and a bare name and nothing else. That is a
+     deliberate boundary, and it is why this screen used to carry its own
+     directory browser: the server reads audio by path, so the page had to name a
+     path some other way. Sending the bytes removes the need for any of that, and
+     the system picker then works for one file, many files or a whole folder with
+     no custom UI to get wrong.
+
+     One request per file so progress is per file and one failure does not lose
+     the batch. */
+  function uploadOne(S, file) {
+    return fetch('/api/upload', {
+      method: 'POST',
+      headers: { 'X-Filename': encodeURIComponent(file.name),
+                 'Content-Type': 'application/octet-stream' },
+      body: file
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (j) {
+        if (!res.ok || !j.path) throw new Error(j.error || (file.name + ': upload failed'));
+        return j.path;
+      });
+    });
+  }
+
+  function uploadAndQueue(S, fileList) {
+    var files = [];
+    for (var i = 0; i < fileList.length; i++) {
+      if (isAudio(fileList[i].name)) files.push(fileList[i]);
+    }
+    var skipped = fileList.length - files.length;
+    if (!files.length) {
+      say(S, skipped ? 'None of those ' + skipped + ' files is audio this can read.'
+                     : 'Nothing to add.', true);
+      return Promise.resolve();
+    }
+    var done = 0, paths = [], failed = [];
+    say(S, 'Uploading 0 of ' + files.length + '…');
+    // sequential: a folder of hour-long recordings saturates the link either
+    // way, and one at a time keeps the count honest and the server's disk
+    // writes ordered
+    return files.reduce(function (chain, f) {
+      return chain.then(function () {
+        return uploadOne(S, f).then(function (path) {
+          paths.push(path);
+        }).catch(function (e) {
+          failed.push(f.name + ' — ' + errText(e));
+        }).then(function () {
+          done++;
+          if (!S.dead) say(S, 'Uploading ' + done + ' of ' + files.length + '…');
+        });
+      });
+    }, Promise.resolve()).then(function () {
+      if (!paths.length) {
+        say(S, 'Nothing uploaded. ' + failed.join('; '), true);
+        return;
+      }
+      return send(S, paths).then(function () {
+        var note = [];
+        if (skipped) note.push(skipped + ' not audio');
+        if (failed.length) note.push(failed.length + ' failed to upload');
+        if (note.length) say(S, paths.length + ' queued · ' + note.join(', '), !!failed.length);
+      });
+    });
+  }
+
   // ----------------------------------------------------------------- picker
   /* /api/browse lists one directory at a time: {dir, parent, files, dirs}. It
      returns names, not sizes or durations, so this lists names. */
-  function openPicker(S, opts) {
-    opts = opts || {};
-    var selected = Object.create(null);
-    var pending = (opts.pending || []).slice(0, 40);
-    var cur = null;
-    var retried = false;
-
-    var panel = h('div', { class: 'dialog', style: 'width:min(620px,100%);gap:var(--space-3)' });
-    var close = null;
-    function shut() {
-      if (close) { try { close(); } catch (e) { /* already gone */ } }
-      close = null;
-      if (S.closeDialog) S.closeDialog = null;
-    }
-
-    var pathLine = h('div', {
-      style: 'font-size:12.5px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;' +
-        'color:var(--color-neutral-800);flex:1;min-width:0'
-    }, '…');
-    var upBtn = h('button', {
-      class: 'btn btn-secondary',
-      style: 'padding:4px 10px;font-size:12.5px',
-      onclick: function () { if (cur) go(parentOf(cur)); }
-    }, '↑ Up');
-
-    var jump = h('input', {
-      class: 'input', type: 'text', placeholder: '/path/to/a/folder',
-      style: 'font-size:13px'
-    });
-    jump.addEventListener('keydown', function (e) {
-      if (e.key === 'Enter') { e.preventDefault(); if (jump.value.trim()) go(jump.value.trim()); }
-    });
-
-    var listBox = h('div', {
-      style: 'max-height:300px;overflow:auto;border:1px solid var(--color-divider);' +
-        'border-radius:var(--radius-md);background:var(--color-bg)'
-    });
-
-    var tally = h('div', { style: SMALL });
-    var allBtn = h('button', {
-      class: 'btn btn-ghost', style: 'font-size:12.5px;padding:2px 6px',
-      onclick: function () { pickAll(); }
-    }, 'Select every file here');
-    var addBtn = h('button', { class: 'btn btn-primary', onclick: function () { commit(); } }, 'Add to the queue');
-    var dialogErr = h('div', { style: 'font-size:11.5px;color:var(--color-accent-2-700);line-height:1.5' });
-
-    var here = [];
-
-    function count() {
-      var n = 0, k;
-      for (k in selected) if (selected[k]) n++;
-      return n;
-    }
-
-    function refreshTally() {
-      var n = count();
-      tally.textContent = n === 0 ? 'nothing selected'
-        : n + (n === 1 ? ' file selected' : ' files selected');
-      addBtn.disabled = n === 0;
-      addBtn.textContent = n === 0 ? 'Add to the queue'
-        : 'Add ' + n + (n === 1 ? ' file' : ' files') + ' to the queue';
-    }
-
-    function pickAll() {
-      here.forEach(function (name) { selected[joinPath(cur, name)] = true; });
-      draw();
-    }
-
-    function draw() {
-      clear(listBox);
-      var dirs = (S.browse && S.browse.dirs) || [];
-      var files = here;
-
-      if (!dirs.length && !files.length) {
-        listBox.appendChild(h('div', { style: 'padding:14px 12px;font-size:13px;color:var(--color-neutral-700)' },
-          'No sub-folders and no audio in this folder.'));
-      }
-
-      dirs.forEach(function (name) {
-        listBox.appendChild(h('div', {
-          style: 'display:flex;align-items:center;gap:10px;padding:6px 12px;font-size:13.5px;cursor:pointer;' +
-            'border-bottom:1px solid color-mix(in srgb, var(--color-text) 6%, transparent)',
-          onclick: function () { go(joinPath(cur, name)); }
-        }, [
-          h('span', { style: 'color:var(--color-neutral-600)' }, '▸'),
-          h('span', { style: 'overflow-wrap:anywhere' }, name)
-        ]));
-      });
-
-      files.forEach(function (name) {
-        var full = joinPath(cur, name);
-        var box = h('input', { type: 'checkbox' });
-        box.checked = !!selected[full];
-        box.addEventListener('change', function () {
-          if (box.checked) selected[full] = true; else delete selected[full];
-          refreshTally();
-        });
-        listBox.appendChild(h('label', {
-          style: 'display:flex;align-items:center;gap:10px;padding:6px 12px;font-size:13.5px;cursor:pointer;' +
-            'border-bottom:1px solid color-mix(in srgb, var(--color-text) 6%, transparent)'
-        }, [box, h('span', { style: 'overflow-wrap:anywhere' }, name)]));
-      });
-
-      refreshTally();
-    }
-
-    function go(dir) {
-      dialogErr.textContent = '';
-      var url = dir ? '/api/browse?dir=' + encodeURIComponent(dir) : '/api/browse';
-      S.ctx.api(url).then(function (d) {
-        if (S.dead) return;
-        retried = false;
-        S.browse = { dirs: (d && d.dirs) || [] };
-        cur = (d && d.dir) || dir || '';
-        here = (d && d.files) || [];
-        if (cur) S.ctx.state.ingestDir = cur;
-        pathLine.textContent = cur || '(unknown folder)';
-        upBtn.disabled = !cur || cur === '/';
-        /* tick anything whose name came off the drop but arrived without a path */
-        var hit = 0;
-        pending.forEach(function (name) {
-          if (here.indexOf(name) >= 0) { selected[joinPath(cur, name)] = true; hit++; }
-        });
-        if (hit) dialogErr.textContent = 'Ticked ' + hit + ' of the dropped ' +
-          (pending.length === 1 ? 'file' : 'files') + ' found in this folder.';
-        draw();
-      }, function (e) {
-        if (S.dead) return;
-        if (!retried && dir && dir !== '/' && parentOf(dir) !== dir) {
-          /* a dropped folder-ish path that is really a file, or a typo */
-          retried = true;
-          go(parentOf(dir));
-          return;
-        }
-        dialogErr.textContent = errText(e);
-      });
-    }
-
-    function commit() {
-      var files = [], k;
-      for (k in selected) if (selected[k]) files.push(k);
-      if (!files.length) return;
-      addBtn.disabled = true;
-      addBtn.textContent = 'Adding…';
-      send(S, files).then(function () { shut(); }, function () {
-        if (S.dead) return;
-        dialogErr.textContent = S.status ? S.status.textContent : 'That did not work.';
-        refreshTally();
-      });
-    }
-
-    panel.appendChild(h('div', { class: 'dialog-title' }, 'Choose files'));
-    panel.appendChild(h('div', { class: 'dialog-body' },
-      'The server opens the audio itself, off this machine — nothing is uploaded from the browser, ' +
-      'so pick the files where they already are.'));
-    if (pending.length) {
-      panel.appendChild(h('div', {
-        style: 'font-size:11.5px;color:var(--color-accent-2-700);line-height:1.5'
-      }, 'Dropped ' + pending.slice(0, 4).join(', ') + (pending.length > 4 ? ' and ' + (pending.length - 4) + ' more' : '') +
-        ' — this browser hands the page the file but not the folder it came from. Find the folder and ' +
-        'they will be ticked for you.'));
-    }
-    panel.appendChild(h('div', { style: 'display:flex;align-items:center;gap:12px' }, [upBtn, pathLine]));
-    panel.appendChild(h('div', { class: 'field' }, [h('label', null, 'Or type a folder'), jump]));
-    panel.appendChild(listBox);
-    panel.appendChild(h('div', { style: 'display:flex;align-items:center;gap:12px' }, [tally, allBtn]));
-    panel.appendChild(dialogErr);
-    panel.appendChild(h('div', { class: 'dialog-actions' }, [
-      h('button', { class: 'btn btn-secondary', onclick: function () { shut(); } }, 'Cancel'),
-      addBtn
-    ]));
-
-    close = S.ctx.dialog(panel);
-    S.closeDialog = shut;
-    refreshTally();
-    go(opts.dir || S.ctx.state.ingestDir || '');
-  }
-
   // ----------------------------------------------------------------- screen
   MS.screens.ingest = {
     title: 'Ingest',
@@ -599,15 +640,38 @@
       }, 'Point it at a folder. Each stage writes to disk before the next one starts — the raw ' +
         'transcript, the embeddings and the linked transcript are separate files in the library.'));
 
-      // -- drop zone
+      // -- drop zone, with the SYSTEM pickers rather than a browser of our own
+      var filesInput = h('input', {
+        type: 'file', multiple: 'multiple', style: 'display:none',
+        accept: AUDIO_EXT.join(',')
+      });
+      filesInput.addEventListener('change', function () {
+        if (filesInput.files && filesInput.files.length) uploadAndQueue(S, filesInput.files);
+        filesInput.value = '';
+      });
+      var dirInput = h('input', { type: 'file', multiple: 'multiple', style: 'display:none' });
+      /* webkitdirectory is how a browser offers "pick a folder"; it is not in
+         the HTML attribute list h() knows, and Firefox needs the mozdirectory
+         alias, so both are set directly. Non-audio inside the folder is filtered
+         out on the way through. */
+      dirInput.setAttribute('webkitdirectory', '');
+      dirInput.setAttribute('mozdirectory', '');
+      dirInput.addEventListener('change', function () {
+        if (dirInput.files && dirInput.files.length) uploadAndQueue(S, dirInput.files);
+        dirInput.value = '';
+      });
+
       var zone = h('div', { style: ZONE }, [
         h('div', { style: 'font-size:21px;font-weight:600;margin-bottom:6px' }, 'Drop meeting audio here'),
         h('div', { style: 'font-size:12.5px;color:var(--color-neutral-700);margin-bottom:16px' },
           'wav · mp3 · m4a · flac · ogg · mp4 · webm'),
-        h('button', {
-          class: 'btn btn-primary',
-          onclick: function () { openPicker(S, {}); }
-        }, 'Choose files')
+        h('div', { style: 'display:flex;gap:10px;justify-content:center' }, [
+          h('button', { class: 'btn btn-primary',
+            onclick: function () { filesInput.click(); } }, 'Choose files'),
+          h('button', { class: 'btn btn-secondary',
+            onclick: function () { dirInput.click(); } }, 'Choose a folder')
+        ]),
+        filesInput, dirInput
       ]);
       page.appendChild(zone);
       S.zone = zone;
@@ -635,6 +699,18 @@
         S.qnote
       ]));
 
+      /* Filters sit above the table and only appear once the queue is long
+         enough to need them (drawQueue decides), so a handful of files is not
+         cluttered by controls for a problem it does not have. */
+      S.qfilters = h('div', { style: 'display:flex;align-items:baseline;gap:15px;flex-wrap:wrap' });
+      /* Queue-wide controls. "Hold new files" is what makes a batch something
+         you assemble rather than something that starts under you: add forty
+         recordings, look at them, then Run. */
+      S.qctl = h('div', { style: 'display:flex;align-items:center;gap:14px;margin-left:auto' });
+      page.appendChild(h('div', {
+        style: 'display:flex;align-items:center;gap:15px;flex-wrap:wrap;margin-bottom:9px'
+      }, [S.qfilters, S.qctl]));
+
       S.tbody = h('tbody');
       page.appendChild(h('table', { class: 'table' }, [
         h('thead', null, h('tr', null, [
@@ -642,10 +718,14 @@
           h('th', { style: 'width:80px' }, 'Length'),
           h('th', null, 'Stage'),
           h('th', { style: 'width:150px' }, 'Progress'),
-          h('th', { style: 'width:110px;text-align:right' }, 'Elapsed')
+          h('th', { style: 'width:110px;text-align:right' }, 'Elapsed'),
+          h('th', { style: 'width:120px' }, '')
         ])),
         S.tbody
       ]));
+
+      S.qmore = h('div', { style: 'padding:12px 0;display:flex;align-items:baseline' });
+      page.appendChild(S.qmore);
 
       S.stages = h('div', {
         style: 'font-size:11.5px;color:var(--color-neutral-700);margin-top:16px;line-height:1.5;max-width:70ch'
@@ -676,18 +756,15 @@
         var dt = e.dataTransfer;
         if (!dt) return;
 
-        var paths = pathsFromDrop(dt);
-        var audio = paths.filter(function (p) { return isAudio(p); });
-        if (audio.length) { send(S, audio).catch(function () { /* reported already */ }); return; }
-        if (paths.length) { openPicker(S, { dir: paths[0] }); return; }
-
-        var names = [], i;
-        if (dt.files) for (i = 0; i < dt.files.length; i++) names.push(dt.files[i].name);
-        if (!names.length) {
-          say(S, 'Nothing recognisable in that drop.', true);
+        /* A drop carries the FILES, which is all we need now that the bytes
+           travel. The old code tried to recover paths from the drag data --
+           which only Firefox provides -- and fell back to a picker when it
+           could not. Both are gone. */
+        if (dt.files && dt.files.length) {
+          uploadAndQueue(S, dt.files);
           return;
         }
-        openPicker(S, { pending: names });
+        say(S, 'Nothing recognisable in that drop.', true);
       });
 
       /* stop a stray drop anywhere else from navigating the page away */

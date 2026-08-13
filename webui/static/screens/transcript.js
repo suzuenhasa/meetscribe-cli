@@ -231,12 +231,17 @@
       var flagged = {};
       rows.forEach(function (r, i) {
         var wrap = el('div', 'cursor:pointer;');
+        /* The box the active line gets is drawn in this speaker's colour; the
+           rule lives in broadsheet.css and reads it from here, so the palette
+           stays in ink() and is not restated per row. */
+        wrap.className = 'transcript-line';
+        wrap.style.setProperty('--spk', inkOf(r.g, 'fill'));
         wrap.setAttribute('data-active', '0');
         var ref = { wrap: wrap, head: null, time: null, body: null, row: r };
 
         if (r.head) {
           var head = el('div', headStyle(r, false, i === 0));
-          var time = el('span', timeStyle(false), hms(r.start));
+          var time = el('span', timeStyle(false, r), hms(r.start));
           head.appendChild(time);
           head.appendChild(document.createTextNode(r.name));
           /* The design flags an unplaced voice in its turn head. With nobody
@@ -273,14 +278,18 @@
       body.appendChild(el('div', 'height:40px'));
     }
 
+    /* Active used to recolour the head and time to the global accent. With the
+       line now boxed in the SPEAKER's colour that reads as two different claims
+       about the same row, so the active treatment stays in one hue: the box, and
+       the timestamp brightening from neutral to that speaker's ink. */
     function headStyle(r, on, first) {
       return 'display:flex;align-items:baseline;gap:9px;margin:' + (first ? '0' : '22px') +
         ' 0 5px;font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:' +
-        (on ? 'var(--color-accent-700)' : inkOf(r.g, 'text'));
+        inkOf(r.g, 'text');
     }
-    function timeStyle(on) {
-      return 'font-variant-numeric:tabular-nums;letter-spacing:0.04em;color:var(--color-neutral-600);width:52px;flex:none;' +
-        (on ? 'color:var(--color-accent-700);' : '');
+    function timeStyle(on, r) {
+      return 'font-variant-numeric:tabular-nums;letter-spacing:0.04em;width:52px;flex:none;color:' +
+        (on && r ? inkOf(r.g, 'text') : 'var(--color-neutral-600)') + ';';
     }
     function bodyStyle(on) {
       return 'font-size:16.5px;line-height:1.62;margin-bottom:3px;color:' +
@@ -377,8 +386,7 @@
       var r = refs[i];
       if (!r) return;
       r.wrap.setAttribute('data-active', on ? '1' : '0');
-      if (r.head) r.head.style.color = on ? 'var(--color-accent-700)' : inkOf(r.row.g, 'text');
-      if (r.time) r.time.style.color = on ? 'var(--color-accent-700)' : 'var(--color-neutral-600)';
+      if (r.time) r.time.style.color = on ? inkOf(r.row.g, 'text') : 'var(--color-neutral-600)';
       if (r.body) {
         r.body.style.color = on ? 'var(--color-text)' : 'color-mix(in srgb, var(--color-text) 72%, transparent)';
       }

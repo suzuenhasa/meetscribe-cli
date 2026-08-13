@@ -171,3 +171,30 @@ textarea.input { min-height: 90px; resize: vertical; }
 .dialog-title { font-family: var(--font-heading); font-weight: var(--font-heading-weight); font-size: 20px; }
 .dialog-body { font-size: 14px; opacity: 0.85; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-2); }
+
+/* Transcript lines ------------------------------------------------------- */
+/* The active line is boxed in its own speaker's colour rather than only being
+   darkened. At 16.5px over 1.62 line-height a change in text opacity is easy to
+   lose while you are following audio, and the speaker's colour is already how
+   this page says who is talking — so the emphasis and the attribution become one
+   signal instead of two competing ones.
+
+   --spk is set per row by transcript.js from ink(), which is the single copy of
+   the palette. The fallback keeps the rule honest if a row is ever built without
+   one.
+
+   Border and padding exist at rest and are merely transparent, and the negative
+   margin cancels them, so a line does not jump sideways when it activates. */
+.transcript-line {
+  border-left: 2px solid transparent;
+  padding: 4px 0 4px 12px;
+  margin-left: -14px;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+.transcript-line[data-active="1"] {
+  background: color-mix(in srgb, var(--spk, var(--color-accent-600)) 9%, transparent);
+  border-left-color: var(--spk, var(--color-accent-600));
+}
+@media (prefers-reduced-motion: reduce) {
+  .transcript-line { transition: none; }
+}

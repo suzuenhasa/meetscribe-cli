@@ -839,10 +839,15 @@ def review_payload():
     if not pending:
         if not library_json():
             reason = "empty-library"
+        elif unidentified and not seen_live:
+            # BEFORE no-profiles, deliberately. With no embeddings a cluster can
+            # be neither matched nor ENROLLED, so reporting an empty profile
+            # store sends you to fix the one thing that cannot be fixed until
+            # this is: the library looks full, the message says nobody is
+            # enrolled, and enrolling is exactly what is impossible.
+            reason = "not-identified"
         elif not G:
             reason = "no-profiles"
-        elif unidentified and not seen_live:
-            reason = "not-identified"
         elif elsewhere:
             reason = "only-outside-library"
         else:
@@ -1208,7 +1213,10 @@ def enqueue(paths, glossary=""):
                   "error": None, "glossary": glossary}
             STATE["queue"].append(it)
             items.append(it)
-    threading.Thread(target=_drain, daemon=True).start()
+    # Adding a file does NOT start it. A batch runs when you press Process
+    # Queue and not before -- dropping forty recordings on this screen should
+    # not commit the GPU the moment the first one lands, and once a batch is in
+    # flight it is one process, so the decision to start is the last cheap one.
     return items
 
 
@@ -1289,6 +1297,38 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _index(self):
+        """index.html with a version stamped onto every local asset URL.
+
+        Cache-Control: no-cache asks a browser to revalidate, but with no
+        validator to revalidate against, browsers hold onto app.js and the screen
+        scripts anyway -- edit a screen, reload, see the old one, and conclude the
+        change did not work. Stamping the file's mtime into the URL makes a
+        changed file a different URL, which no cache can get wrong.
+        """
+        html = (STATIC / "index.html").read_text()
+
+        def stamp(m):
+            url = m.group(2)
+            rel = url.split("?")[0].lstrip("/")
+            if rel.startswith("static/"):
+                rel = rel[len("static/"):]
+            f = STATIC / rel
+            try:
+                v = int(f.stat().st_mtime)
+            except OSError:
+                return m.group(0)
+            return f'{m.group(1)}"{url}?v={v}"'
+
+        html = re.sub(r'(href=|src=)"(/static/[^"?]+)"', stamp, html)
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _file(self, path: Path, ctype=None):
         if not path.exists():
             return self._json({"error": "not found"}, 404)
@@ -1348,7 +1388,7 @@ class Handler(BaseHTTPRequestHandler):
         p, q = u.path, parse_qs(u.query)
         try:
             if p == "/" or p == "/index.html":
-                return self._file(STATIC / "index.html", "text/html; charset=utf-8")
+                return self._index()
             if p.startswith("/static/"):
                 f = (STATIC / p[len("/static/"):]).resolve()
                 if STATIC.resolve() in f.parents:
@@ -1370,7 +1410,14 @@ class Handler(BaseHTTPRequestHandler):
                 js = STATE["library"] / f"{q.get('id', [''])[0]}.json"
                 return self._audio(audio_for(js) if js.exists() else None)
             if p == "/api/queue":
-                return self._json({"queue": STATE["queue"][-40:]})
+                # the whole queue, not the last 40: the screen caps what it
+                # renders and offers filters, and a truncated list made "3
+                # waiting" disagree with the rows you could actually see
+                running = any(i["stage"] not in ("queued", "held", "done", "failed")
+                              for i in STATE["queue"])
+                waiting = sum(1 for i in STATE["queue"] if i["stage"] == "queued")
+                return self._json({"queue": STATE["queue"],
+                                   "waiting": waiting, "running": running})
             if p == "/api/voices":
                 return self._json(voices_payload())
             if p == "/api/review":
@@ -1403,9 +1450,64 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             return self._json({"error": str(e)}, 500)
 
+    def _upload(self, u):
+        """Take one file's bytes and put them where ingest can find them.
+
+        The browser will not tell a page where a chosen file lives -- it hands
+        over the contents and a bare name, never a path -- so a system file
+        picker can only work if the bytes come with it. That is the whole reason
+        the old custom directory browser existed, and uploading is what lets it
+        be deleted.
+
+        Raw body with the name in a header rather than multipart/form-data: the
+        stdlib parser for multipart is deprecated and gone in 3.13, and hand
+        rolling one to move bytes we already have in the body is work with a
+        failure mode and no benefit. One request per file, streamed to disk so a
+        two-hour recording is not read into memory first.
+        """
+        name = unquote(self.headers.get("X-Filename") or "").strip()
+        # a name is all the browser gives, and it is attacker-controlled: keep
+        # the basename only, so nothing can be written outside the inbox
+        name = os.path.basename(name.replace("\\", "/"))
+        if not name or name in (".", ".."):
+            return self._json({"error": "X-Filename missing or unusable"}, 400)
+        if Path(name).suffix.lower() not in AUDIO_EXT:
+            return self._json({"error": f"{name}: not an audio file this can read"}, 400)
+
+        inbox = STATE["library"] / "_inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        dst = inbox / name
+        stem, ext, i = dst.stem, dst.suffix, 1
+        while dst.exists():                      # never clobber a queued file
+            dst = inbox / f"{stem}-{i}{ext}"
+            i += 1
+
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return self._json({"error": "empty upload"}, 400)
+        left = n
+        try:
+            with open(dst, "wb") as fh:
+                while left > 0:
+                    chunk = self.rfile.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    left -= len(chunk)
+        except OSError as e:
+            return self._json({"error": f"could not write {dst.name}: {e}"}, 500)
+        if left:
+            dst.unlink(missing_ok=True)
+            return self._json({"error": "upload ended early"}, 400)
+        return self._json({"path": str(dst), "name": dst.name, "bytes": n})
+
     def do_POST(self):
         u = urlparse(self.path)
         try:
+            # uploads carry bytes, not JSON, so they are handled before the
+            # body is parsed
+            if u.path == "/api/upload":
+                return self._upload(u)
             n = int(self.headers.get("Content-Length") or 0)
             try:
                 body = json.loads(self.rfile.read(n) or b"{}")
@@ -1415,11 +1517,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "body must be a JSON object"}, 400)
 
             if u.path == "/api/ingest":
+                # Paths only, and they come from /api/upload -- the browser
+                # cannot name a file on disk, so everything reaching here was
+                # uploaded a moment ago and lives in the library's _inbox.
                 paths = []
                 for f in body.get("files", []):
-                    p = Path(f).expanduser()
-                    if p.is_file():
-                        paths.append(p)
+                    fp = Path(f).expanduser()
+                    if fp.is_file():
+                        paths.append(fp)
                 if not paths:
                     return self._json({"error": "no readable files"}, 400)
                 # the stored glossary is the default, so ingest and settings agree
@@ -1427,6 +1532,70 @@ class Handler(BaseHTTPRequestHandler):
                 if gl is None:
                     gl = ", ".join(glossary_terms())
                 return self._json({"queued": enqueue(paths, gl)})
+
+            if u.path == "/api/queue/act":
+                """hold | release | remove | retry per file; run | cancel for
+                the queue as a whole.
+
+                An individual file cannot be stopped once its batch is running:
+                _drain hands every queued file to ONE ./transcribe so the engine
+                loads once, which is the difference between ~70s per file and
+                ~70s per batch. Holding a file before it starts, and cancelling
+                the batch that is running, together give the same control without
+                giving that up.
+                """
+                act = str(body.get("action") or "")
+                ids = body.get("ids") or ([body["id"]] if body.get("id") else [])
+                ids = set(str(x) for x in ids)
+
+                if act == "cancel":
+                    stopped = STATE["backend"].cancel()
+                    with STATE["lock"]:
+                        for it in STATE["queue"]:
+                            if it["stage"] not in ("done", "failed", "queued", "held"):
+                                it["stage"] = "failed"
+                                it["error"] = "cancelled"
+                    return self._json({"cancelled": bool(stopped)})
+
+                if act == "run":
+                    with STATE["lock"]:
+                        n = sum(1 for it in STATE["queue"] if it["stage"] == "queued")
+                    if not n:
+                        return self._json({"error": "nothing waiting to run"}, 400)
+                    threading.Thread(target=_drain, daemon=True).start()
+                    return self._json({"started": n})
+
+                if act not in ("hold", "release", "remove", "retry"):
+                    return self._json({"error": f"unknown action {act!r}"}, 400)
+                if not ids:
+                    return self._json({"error": "no id given"}, 400)
+
+                changed = 0
+                with STATE["lock"]:
+                    keep = []
+                    for it in STATE["queue"]:
+                        if it["id"] not in ids:
+                            keep.append(it)
+                            continue
+                        if act == "remove":
+                            # only something not in flight: a running file has a
+                            # process behind it and vanishing its row would lie
+                            if it["stage"] in ("queued", "held", "done", "failed"):
+                                changed += 1
+                                continue
+                            keep.append(it)
+                        elif act == "hold" and it["stage"] == "queued":
+                            it["stage"] = "held"; changed += 1; keep.append(it)
+                        elif act == "release" and it["stage"] == "held":
+                            it["stage"] = "queued"; changed += 1; keep.append(it)
+                        elif act == "retry" and it["stage"] == "failed":
+                            it.update(stage="queued", pct=0, error=None,
+                                      started=None, elapsed=0)
+                            changed += 1; keep.append(it)
+                        else:
+                            keep.append(it)
+                    STATE["queue"][:] = keep
+                return self._json({"changed": changed})
 
             if u.path == "/api/voices/rename":
                 return self._json(*voice_rename(body))

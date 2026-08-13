@@ -156,6 +156,12 @@ if [ -d "$SRC" ]; then
     rm -f "./${b}.txt" "./${b}.json"
     rget "$REMOTE/out/${sf}.txt" "./${b}.txt"
     rget "$REMOTE/out/${sf}_linked.json" "./${b}.json"
+    # The per-segment embeddings, without which a transcript can be read but no
+    # voice in it can ever be named -- the UI needs them beside the .json to
+    # enrol anyone, and they are a couple of hundred KB. Not part of the
+    # completeness check below: a missing one costs identification, not the
+    # transcript, so it must not fail the run.
+    rget "$REMOTE/out/${sf}_emb.npz" "./${b}.emb.npz"
     if [ -s "./${b}.txt" ] && [ -s "./${b}.json" ]; then
       GOT=$((GOT + 1))
     else
@@ -226,5 +232,8 @@ rrun "
 echo "==> retrieving"
 rget "$REMOTE/out/${SAFE}.txt" "./${BASE}.txt"
 rget "$REMOTE/out/${SAFE}_linked.json" "./${BASE}.json"
+# Same as the batch path: without the embeddings a transcript can be read but no
+# voice in it can ever be named.
+rget "$REMOTE/out/${SAFE}_emb.npz" "./${BASE}.emb.npz"
 echo "    $(pwd)/${BASE}.txt"
 echo "    $(pwd)/${BASE}.json"
