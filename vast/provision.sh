@@ -76,13 +76,23 @@ done
 if [ -d "$MS_WORK/.git" ]; then
   log "updating the checkout"
 else
-  log "cloning $MS_REPO"
-  mkdir -p "$(dirname "$MS_WORK")"
-  # Clone bare-ish then fetch the ref, rather than --branch: --branch takes a
-  # branch or tag and NOT a commit sha, and the whole point of pinning MS_REF to
-  # a sha is that a moving ref is a thing someone else can change under you. A
-  # fallback that quietly cloned the default branch would defeat exactly that.
-  git clone --no-checkout --depth 1 "$MS_REPO" "$MS_WORK" || die "git clone"
+  log "setting up $MS_REPO in $MS_WORK"
+  mkdir -p "$MS_WORK"
+  # init + remote, NOT `git clone`. clone refuses a target that already has
+  # anything in it, and by this point $MS_WORK usually does: HF_HOME and
+  # VLLM_CACHE_ROOT are exported above and point inside it, and the image
+  # entrypoint started just before this creates them. Provisioning then died on
+  # "destination path already exists and is not an empty directory" having
+  # created the very directories it tripped over.
+  #
+  # It is also the more honest shape for what happens next. The fetch below
+  # takes MS_REF, and clone --branch accepts a branch or tag and NOT a commit
+  # sha -- the whole point of pinning MS_REF to a sha being that a moving ref is
+  # something someone else can change under you.
+  git init -q "$MS_WORK" || die "git init in $MS_WORK"
+  git -C "$MS_WORK" remote add origin "$MS_REPO" 2>/dev/null \
+    || git -C "$MS_WORK" remote set-url origin "$MS_REPO" \
+    || die "could not point $MS_WORK at $MS_REPO"
 fi
 
 # One path for both cases, and it accepts a full sha, a tag or a branch.
