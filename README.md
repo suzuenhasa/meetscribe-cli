@@ -26,9 +26,15 @@ once per batch however many files are in it, so it is listed separately:
 
 | GPU | VRAM | engine load | 16 kHz mono WAV | 44.1 kHz stereo MP3 | format gain |
 |---|---|---|---|---|---|
-| RTX 5090 | 32 GB | 75 s | **49 s — 459×** | 81 s — 278× | 1.65× |
+| RTX 5090 | 32 GB | 73 s | **48 s — 468×** | 80 s — 282× | 1.65× |
 | RTX 3090 | 24 GB | 63 s | 104 s — 217× | 130 s — 174× | 1.25× |
 | RTX 2060 | 6 GB | 114 s | 857 s — 26× | 966 s — 23× | 1.13× |
+
+The MP3 column depends on the host as well as the card — decoding is CPU work
+and it lands inside the same timer. Two RTX 3090s on different hosts measured
+174× and 142× on MP3 but 217× and 203× on WAV, so treat the MP3 figures as
+indicative rather than a property of the GPU. Engine load is also ~3× higher the
+very first time on a new machine, while `torch.compile` fills its cache.
 
 **Feeding it 16 kHz mono is free speed, but how much depends on your GPU.**
 Decoding MP3 and resampling 44.1 kHz down to the 16 kHz the model wants is real
