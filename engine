@@ -37,6 +37,13 @@ PY="$(. "$HERE/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
 # The marker is written by vast/provision.sh and removed when it is done, so a
 # plain ./setup.sh install never has one and is never blocked.
 provisioning_guard() {
+  # Provisioning itself runs this script -- the warm-up transcription, and
+  # ./engine start when supervisor did not. Without this exemption the guard
+  # blocked the very steps that make the box ready: the warm-up refused, so the
+  # compile cache stayed empty, so the engine took longer than provisioning's
+  # wait, so it reported "not resident" on a box that was otherwise perfect.
+  # One guard, three symptoms, none of them looking like the cause.
+  [ -z "${MS_PROVISIONING:-}" ] || return 0
   local m="$1/.provisioning"
   [ -f "$m" ] || return 0
   local since; since="$(cat "$m" 2>/dev/null)"

@@ -59,6 +59,11 @@ banner_failed() {
 # like bugs in the thing you ran rather than "it is not built yet".
 mkdir -p "$MS_WORK"
 date -u +%FT%TZ > "$MS_WORK/.provisioning"
+# ...and exempt our OWN children from it. See provisioning_guard in
+# ./transcribe: this script calls transcribe for the warm-up and engine
+# for the fallback start, and a guard that blocks those blocks the box
+# from ever becoming ready.
+export MS_PROVISIONING=1
 banner "
   ############################################################
   ##  meetscribe is STILL PROVISIONING — do not use it yet
