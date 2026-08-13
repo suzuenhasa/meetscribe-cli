@@ -31,6 +31,31 @@ log "work dir   $MS_WORK"
 log "ref        $MS_REF"
 log "hf cache   $HF_HOME"
 
+# ------------------------------------------------------------- the entrypoint
+# So this file can simply be PASTED into a vast template's On-start Script and
+# be the only thing you configure.
+#
+# SSH launch mode replaces the image's entrypoint with On-start, and that
+# entrypoint is what starts supervisord -- which runs the instance portal, the
+# tunnel manager, and the engine service registered further down. Pasting a
+# script here without starting it therefore silently loses all of them, and the
+# instance still boots and accepts ssh, so nothing tells you.
+#
+# Harmless when vast ran this as PROVISIONING_SCRIPT instead, which is the other
+# supported way in: supervisord is already up, and this does nothing.
+if ! supervisorctl status >/dev/null 2>&1; then
+  if [ -x /opt/instance-tools/bin/entrypoint.sh ]; then
+    log "starting the image entrypoint (supervisord, portal, tunnels)"
+    /opt/instance-tools/bin/entrypoint.sh >/var/log/entrypoint.log 2>&1 &
+    for _ in $(seq 1 30); do
+      supervisorctl status >/dev/null 2>&1 && break
+      sleep 1
+    done
+  else
+    log "no image entrypoint here; carrying on without supervisord"
+  fi
+fi
+
 # ---------------------------------------------------------------- the GPU
 command -v nvidia-smi >/dev/null || die "no nvidia-smi; this template needs a GPU instance"
 nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader | sed 's/^/  /'

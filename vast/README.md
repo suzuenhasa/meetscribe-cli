@@ -11,46 +11,52 @@ In the vast console, **Templates → New**:
 |---|---|
 | Image | `vastai/vllm:v0.27.1-cuda-12.9` |
 | Launch mode | **SSH**, direct SSH on |
-| On-start | `exec /opt/instance-tools/bin/entrypoint.sh` |
+| On-start Script | paste all of `vast/provision.sh` |
 | Ports | none |
 | Disk | 60 GB |
 
-Environment:
+That is the whole setup. Paste the script, set nothing else.
 
+To pin a version — and you should, because the default tracks `main` and `main`
+moves — edit the one line near the top of what you pasted:
+
+```bash
+MS_REF="${MS_REF:-main}"      ->      MS_REF="${MS_REF:-<full 40-char sha>}"
 ```
-PROVISIONING_SCRIPT=https://raw.githubusercontent.com/suzuenhasa/meetscribe-cli/<COMMIT>/vast/provision.sh
-MS_WORK=/opt/meetscribe
-MS_REF=<COMMIT>
-HF_HOME=/opt/meetscribe/.hf_home
-VLLM_CACHE_ROOT=/opt/meetscribe/.vllm_cache
-```
 
-Four of those are load-bearing in ways that are not obvious:
-
-**The on-start line is not optional.** SSH mode replaces the image's entrypoint,
-so without it supervisord never starts — and it fails *silently*, giving you an
-instance that looks fine and has provisioned nothing.
-
-**Pin `PROVISIONING_SCRIPT` to a commit, not `main`.** It is fetched over HTTPS
-and run as root, so whoever controls that URL's contents controls every instance
-you launch. A tag is not enough; tags move.
-
-Use the **full 40-character** sha in both places. `git fetch` resolves a name on
-the remote, and a shortened sha is not one — it fails with `couldn't find remote
-ref`. The script checks for this and says so rather than letting you find out
-from git.
+Use the **full 40 characters**. `git fetch` resolves a ref name on the remote and
+an abbreviated sha is not one, so it fails with `couldn't find remote ref`. The
+script checks for this and says so rather than letting you find out from git.
 
 **No ports.** SSH mode maps 22 and that is the whole interface — `./transcribe`
 works over ssh and rsync. The web UI has no authentication of any kind, and a
 vast box has a public IP, so it is reached through an ssh tunnel rather than
 published. See below.
 
-**`MS_WORK` is not `/workspace`.** Vast documents `/workspace` as possibly shared
-between instances with concurrent writers. `speakers.db` is the one file here
-that cannot be rebuilt from the audio.
+### The other way in
+
+vast also fetches a script from a URL, which is worth using if you would rather
+not paste a few hundred lines into a form, or want several templates sharing one
+script. Set these two instead of the On-start paste, and put
+`exec /opt/instance-tools/bin/entrypoint.sh` in On-start:
+
+```
+PROVISIONING_SCRIPT=https://raw.githubusercontent.com/suzuenhasa/meetscribe-cli/<sha>/vast/provision.sh
+MS_REF=<the same sha>
+```
+
+Pin it to a commit rather than a branch. It is fetched over HTTPS and run as
+root, so whoever controls that URL's contents controls every instance you
+launch, and a tag is not enough because tags move.
+
+Either way, `MS_WORK`, `HF_HOME` and `VLLM_CACHE_ROOT` are already the script's
+defaults (`/opt/meetscribe` and two directories under it) and do not need
+setting. `MS_WORK` is deliberately not `/workspace`: vast documents that as
+possibly shared between instances with concurrent writers, and `speakers.db` is
+the one file here that cannot be rebuilt from the audio.
 
 Optionally filter offers to machines that can actually run it: compute
-capability ≥ 7.0, and ≥ 8 GB of VRAM *per GPU* (that filter is per-GPU, not the
+capability >= 7.0, and >= 8 GB of VRAM *per GPU* (that filter is per-GPU, not the
 total across a multi-GPU box).
 
 ## What provisioning does
