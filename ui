@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Browse, search and name your meetings in a browser.
+#
+#   ./ui                          serve the library in ./library
+#   ./ui ~/meetings               serve a different library directory
+#   ./ui --port 8800              somewhere other than 8765
+#   ./ui --host msbox             send the GPU work to a box over ssh
+#
+# The library is a directory of transcripts, each a .json beside its audio.
+# Recordings you add are transcribed by the same ./transcribe the CLI uses, so
+# there is one pipeline here and not two.
+#
+# The server is Python standard library only and the front end is plain
+# JavaScript, so there is nothing to install beyond what ./setup.sh already put
+# there. Without the pipeline you can still read and search an existing library;
+# you just cannot transcribe anything new.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB="$HERE/library"
+PORT=8765
+HOST=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --port) PORT="$2"; shift 2 ;;
+    --host) HOST="$2"; shift 2 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    *) LIB="$1"; shift ;;
+  esac
+done
+
+# setup.sh records the interpreter that owns the dependencies. The server needs
+# only the standard library, but it imports the pipeline's modules to read the
+# profile store's schema and thresholds, so use the same interpreter.
+PY="$(. "$HERE/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
+
+mkdir -p "$LIB"
+echo "==> library  $LIB"
+echo "==> http://localhost:$PORT"
+# -u: the banner below the exec is the only sign the server came up, and
+# python buffers stdout when it is a pipe or a log file rather than a tty.
+MS_WORK="$HERE" exec "$PY" -u "$HERE/webui/server.py" --library "$LIB" --port "$PORT" \
+  ${HOST:+--host "$HOST"}

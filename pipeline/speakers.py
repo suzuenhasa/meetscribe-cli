@@ -56,8 +56,16 @@ REVIEW = 0.40          # below ACCEPT but above this -> tentative, needs a human
 MIN_ENROLL_SEC = 10.0
 
 
-def db():
-    c = sqlite3.connect(DB)
+def db(path=None):
+    """Open the profile store and make sure its schema exists.
+
+    `path` lets a caller open a store somewhere other than the default -- the UI
+    keeps one per library. It defaults to DB so every existing caller is
+    unaffected, and it exists so the schema has exactly ONE definition: the UI
+    used to carry its own copy of this DDL, which is two things to keep in step
+    over the one file in the project that cannot be rebuilt from the audio.
+    """
+    c = sqlite3.connect(path or DB)
     c.executescript("""
     CREATE TABLE IF NOT EXISTS speakers(
       id INTEGER PRIMARY KEY, name TEXT UNIQUE, created_at REAL);

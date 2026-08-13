@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meetscribe</title>
+<!-- Inline, so the tab icon costs neither a request nor a 404 on a machine
+     with no network. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23201e1d'/%3E%3Crect x='5' y='9' width='4' height='14' fill='%230088b0'/%3E%3Crect x='13' y='5' width='4' height='22' fill='%23f3f2f2'/%3E%3Crect x='21' y='12' width='4' height='8' fill='%23d6006c'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/broadsheet.css">
+<style>
+/* From the design's <helmet> (design/Meetscribe.dc.html lines 13-16), verbatim. */
+html, body { height: 100%; }
+input[type=range] { accent-color: var(--color-accent); }
+
+/* Shell-only rules. broadsheet.css is not edited; these apply to markup this
+   file and app.js own, and to nothing a screen renders. The design implies a
+   pointer affordance on the nav row but has no :hover state to copy, and an
+   inline style cannot express one. */
+#ms-nav [role="button"]:hover { color: var(--color-accent-700); }
+#ms-nav [role="button"] { -webkit-user-select: none; user-select: none; }
+</style>
+</head>
+<body>
+
+<!-- Design lines 18-36: the fixed masthead, the scrolling content area, and the
+     player bar as the third row of a full-height flex column. Style strings are
+     carried over from the design. Text that depends on real data (tagline,
+     counts, nav) is left empty here and filled by app.js — printing a claim
+     before the server has been asked would mean printing one that may be
+     false. -->
+<div id="ms-shell" style="height:100vh;display:flex;flex-direction:column;background:var(--color-bg);color:var(--color-text);overflow:hidden">
+
+  <div style="flex:none;padding:18px 40px 0">
+    <div style="display:flex;align-items:baseline;gap:22px">
+      <div style="font-size:27px;font-weight:600;letter-spacing:-0.025em;line-height:1">Meetscribe</div>
+      <div id="ms-tagline" style="font-size:10.5px;letter-spacing:0.16em;text-transform:uppercase;color:var(--color-neutral-700)"></div>
+      <div id="ms-counts" style="margin-left:auto;font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:var(--color-neutral-700);font-variant-numeric:tabular-nums"></div>
+    </div>
+    <div style="height:3px;background:var(--color-text);margin-top:11px"></div>
+    <div id="ms-nav" style="display:flex;align-items:center;gap:26px;padding:8px 0 9px"></div>
+    <div style="height:1px;background:var(--color-text)"></div>
+  </div>
+
+  <!-- Errors that happen outside a screen's render() land here rather than in
+       the console, where nobody would see them. -->
+  <div id="ms-alerts" style="flex:none;padding:0 40px"></div>
+
+  <div id="ms-scroll" style="flex:1;min-height:0;overflow:auto;padding:30px 40px 44px">
+    <div id="ms-screen">
+      <!-- Replaced by app.js on boot. If it is still here, app.js never ran. -->
+      <div id="ms-boot">
+        <h1 style="font-size:40px;margin:0 0 4px">Meetscribe did not start</h1>
+        <p style="font-size:13.5px;color:var(--color-neutral-700);max-width:60ch;margin:0 0 12px">
+          The page loaded but <code>/static/app.js</code> did not run, so no screen could be
+          mounted. Check the browser console for a load or syntax error, and check that the
+          server is serving <code>ui/static/</code>.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Design lines 312-343. Transcript screen only; app.js shows and fills it. -->
+  <div id="ms-player" style="flex:none;background:var(--color-surface);padding:13px 40px 15px;display:none"></div>
+
+</div>
+
+<script src="/static/app.js"></script>
+<script src="/static/screens/library.js"></script>
+<script src="/static/screens/transcript.js"></script>
+<script src="/static/screens/ingest.js"></script>
+<script src="/static/screens/voices.js"></script>
+<script src="/static/screens/review.js"></script>
+<script src="/static/screens/search.js"></script>
+<script src="/static/screens/settings.js"></script>
+</body>
+</html>

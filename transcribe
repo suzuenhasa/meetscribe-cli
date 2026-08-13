@@ -98,7 +98,9 @@ fi
 # A directory means batch: the engine loads once instead of per file (~66s each),
 # and embedding overlaps the next file's transcription.
 if [ -d "$SRC" ]; then
-  mapfile -t BATCH < <(find "$SRC" -maxdepth 1 -type f \( -iname '*.wav' -o -iname '*.mp3' \
+  # -L so a directory of SYMLINKS works: the UI stages a batch by linking rather
+  # than copying gigabytes of audio, and plain -type f does not match a symlink.
+  mapfile -t BATCH < <(find -L "$SRC" -maxdepth 1 -type f \( -iname '*.wav' -o -iname '*.mp3' \
       -o -iname '*.m4a' -o -iname '*.flac' -o -iname '*.ogg' -o -iname '*.mp4' \
       -o -iname '*.webm' \) | sort)
   [ ${#BATCH[@]} -gt 0 ] || { echo "no audio files in $SRC" >&2; exit 2; }
