@@ -46,6 +46,16 @@
     return n === null ? null : n.toFixed(2);
   }
 
+  function times(n) {
+    // What 'Sessions' counted: stored voiceprints, i.e. the number of times a
+    // person told this thing who a voice is. That is a fact about your input,
+    // not about the recordings -- it sat beside Meetings looking like a
+    // synonym and was neither. Say it in words so it cannot be misread as a
+    // count of anything in the library.
+    if (!n) return 'never';
+    return n === 1 ? 'once' : n === 2 ? 'twice' : n + ' times';
+  }
+
   function plural(n, one, many) {
     return String(n) + ' ' + (Number(n) === 1 ? one : many);
   }
@@ -242,7 +252,7 @@
         var speech = '—', speechTitle = '';
         var en = num(v.enrolled_s);
         if (v.sessions && en !== null) {
-          speech = secs(en) + ' s across ' + plural(v.sessions, 'session', 'sessions');
+          speech = secs(en) + ' s, named ' + times(v.sessions);
           if (ctx.fmt && typeof ctx.fmt.dur === 'function') {
             try { speechTitle = ctx.fmt.dur(en); } catch (_3) { speechTitle = ''; }
           }
@@ -352,9 +362,8 @@
         var thead = el('thead');
         var hr = el('tr');
         hr.appendChild(el('th', null, 'Name'));
-        hr.appendChild(el('th', 'width:90px;text-align:right', 'Sessions'));
         hr.appendChild(el('th', 'width:120px;text-align:right', 'Enrolled'));
-        hr.appendChild(el('th', 'width:100px;text-align:right', 'Meetings'));
+        hr.appendChild(el('th', 'width:100px;text-align:right', 'Transcripts'));
         hr.appendChild(el('th', 'width:110px;text-align:right', 'Last heard'));
         thead.appendChild(hr);
         table.appendChild(thead);
@@ -378,9 +387,6 @@
           tr.appendChild(el('td', 'font-weight:' + (on ? 600 : 400) + ';' +
             (nearFloor(p) ? 'color:var(--color-accent-2-700);' : ''), p.name));
 
-          tr.appendChild(el('td', RIGHT, p.sessions === undefined || p.sessions === null
-                                          ? '—' : String(p.sessions)));
-
           var en = num(p.enrolled_s);
           var tdEn = el('td', RIGHT, en === null ? '—' : secs(en) + ' s');
           if (en !== null && ctx.fmt && typeof ctx.fmt.dur === 'function') {
@@ -390,9 +396,9 @@
 
           var tdM = el('td', RIGHT, p.meetings === undefined || p.meetings === null
                                      ? '—' : String(p.meetings));
-          if (Array.isArray(p.meeting_ids) && p.meeting_ids.length) {
-            tdM.title = p.meeting_ids.join(', ');
-          }
+          tdM.title = (Array.isArray(p.meeting_ids) && p.meeting_ids.length)
+            ? p.meeting_ids.join(', ')
+            : 'transcripts this voice appears in, named or recognised';
           tr.appendChild(tdM);
 
           var tdL = el('td', RIGHT + ';color:var(--color-neutral-700)',
@@ -440,7 +446,7 @@
         var bits = [];
         var en = num(v.enrolled_s);
         if (v.sessions && en !== null) {
-          bits.push(secs(en) + ' s of speech across ' + plural(v.sessions, 'session', 'sessions') + '.');
+          bits.push(secs(en) + ' s of speech, named ' + times(v.sessions) + '.');
         } else {
           bits.push('Nothing is enrolled under this name yet.');
         }

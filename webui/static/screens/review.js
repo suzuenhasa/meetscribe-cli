@@ -24,6 +24,8 @@
     return n;
   }
 
+  function lbl(c) { return (c && (c.cluster_label || c.cluster)) || '—'; }
+
   function isNum(x) {
     return typeof x === 'number' && isFinite(x);
   }
@@ -367,7 +369,8 @@
     var box = el('div', 'margin-bottom:46px;max-width:760px');
 
     var head = el('div', 'display:flex;align-items:baseline;gap:14px;margin-bottom:3px');
-    head.appendChild(el('div', 'font-size:25px;font-weight:600', c.cluster || '—'));
+    head.appendChild(el('div', 'font-size:25px;font-weight:600',
+      c.cluster_label || c.cluster || '—'));
     head.appendChild(el('div',
       'font-size:12.5px;color:var(--color-neutral-700);font-variant-numeric:tabular-nums',
       secondsLine(c)));
@@ -570,7 +573,8 @@
       var row = el('div', 'display:flex;align-items:baseline;gap:12px;font-size:12.5px;' +
         'padding:6px 0;border-bottom:1px solid color-mix(in srgb, var(--color-text) 8%, transparent)');
       row.appendChild(el('span', 'flex:none;color:var(--color-neutral-800)',
-        (c.meeting_title || c.meeting || '—') + ' · ' + (c.cluster || '—')));
+        (c.meeting_title || c.meeting || '—') + ' · ' +
+        (c.cluster_label || c.cluster || '—')));
       row.appendChild(el('span', 'font-size:11px;color:var(--color-neutral-600)',
         outcomeWord(c.band)));
       var right = el('div',
@@ -641,22 +645,22 @@
     if (!r) return null;
     var who = (r.speaker && r.speaker.name) || nm || '';
     if (r.outcome === 'left-unknown') {
-      return { text: c.cluster + ' left unknown. It stays out of the review list until it is ' +
+      return { text: lbl(c) + ' left unknown. It stays out of the review list until it is ' +
                      'identified again.' };
     }
     if (r.enrolled === false && r.enroll_reason) {
       return {
         warn: true,
-        text: c.cluster + ' is ' + (who || 'named') + ' in this transcript, but nothing was ' +
+        text: lbl(c) + ' is ' + (who || 'named') + ' in this transcript, but nothing was ' +
               'stored to recognise the voice again' +
               (r.detail ? ': ' + r.detail : ' (' + r.enroll_reason + ').')
       };
     }
     if (r.enrolled === true) {
-      return { text: c.cluster + ' is ' + who + ', and this cluster is now enrolled: ' +
+      return { text: lbl(c) + ' is ' + who + ', and this cluster is now enrolled: ' +
                      'the voice will be matched in later meetings.' };
     }
-    return { text: c.cluster + ' accepted as ' + (who || 'the best match') + '.' };
+    return { text: lbl(c) + ' accepted as ' + (who || 'the best match') + '.' };
   }
 
   // ----------------------------------------------------------------- screen

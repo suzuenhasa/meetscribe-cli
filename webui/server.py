@@ -793,20 +793,45 @@ def review_payload():
                 pending.append(_pending(stem, stem, g, b, best, cand[1:3],
                                         cents[g]["seconds"], detail.get(g, {}),
                                         "live", True, None))
+        elif cents and not G:
+            # Embeddings are here and nobody is enrolled yet, so every cluster is
+            # NAMEABLE: there is nothing to match against, but the voiceprint
+            # needed to enrol one is sitting right there in the npz.
+            #
+            # This used to fall through to the inert list below, which said
+            # "nobody is enrolled yet, so there is nothing to match against" and
+            # offered no action at all -- while the Voices screen said a profile
+            # appears "the first time a cluster is named on the Review screen".
+            # The two screens pointed at each other and neither could enrol
+            # anyone, so a fresh install could never get its first voice into the
+            # store from the browser. Only ./speakers name could, which is not
+            # something the UI ever mentions.
+            #
+            # Nothing is being matched here, so there is no band and no
+            # candidate: just a cluster, its speech time and its samples,
+            # waiting for a name. Everything after the first one goes through
+            # the scoring path above.
+            seen_live.add(stem)
+            for g in sorted(cents, key=lambda k: -cents[k]["seconds"]):
+                n_clusters += 1
+                if any((k, g) in latest and latest[(k, g)][6] in HUMAN for k in mkeys) \
+                        or any(g in names.get(k, {}) for k in mkeys):
+                    continue
+                pending.append(_pending(
+                    stem, stem, g, "unknown",
+                    {"id": None, "name": None, "score": 0.0}, [],
+                    cents[g]["seconds"], detail.get(g, {}), "live", True, None))
         else:
-            r = "no-profiles" if (cents and not G) else why
             unidentified.append({
                 "meeting": stem, "title": stem, "clusters": len(detail),
-                "reason": r,
+                "reason": why,
                 "detail": {
                     "no-embeddings": f"{stem}.emb.npz is not beside this transcript, so "
                                      "its voices cannot be scored against the profile "
                                      "store on this machine",
-                    "no-profiles": "nobody is enrolled yet, so there is nothing to "
-                                   "match against",
                     "no-embedded-clusters": "the embeddings cover none of this "
                                             "meeting's clusters",
-                }.get(r, r),
+                }.get(why, why),
             })
 
     # anything the pipeline decided elsewhere and left open. Only the two scores
@@ -873,7 +898,11 @@ def _pending(key, stem, cluster, b, best, others, secs, detail, source, can_enro
         "meeting": key,                     # the key the profile store uses
         "meeting_id": stem,                 # the library meeting, when it resolves
         "meeting_title": stem or key,
-        "cluster": cluster,
+        "cluster": cluster,                 # G01 -- the id, for payloads and logs
+        # ...and what a person calls it. The transcript has always shown
+        # "Speaker 2"; Review showed "G01" for the same voice, so the two screens
+        # named the same thing differently and neither said they were the same.
+        "cluster_label": speaker_label(cluster),
         "band": b,                          # unknown | review | margin
         "seconds": secs,
         "seconds_reason": None if secs is not None else "transcript-not-in-library",
@@ -895,6 +924,64 @@ def _pending(key, stem, cluster, b, best, others, secs, detail, source, can_enro
         "decided_at": at,
         "decided_at_str": fmt_date(at) if at else None,
     }
+
+
+def reidentify(conn):
+    """Re-score every meeting against the profile store and record what is
+    certain. -> number of clusters newly named.
+
+    Identification happens in two places and only one of them used to write
+    anything down. identify.py runs ONCE, when a recording is processed, against
+    whoever was enrolled at that moment -- so a voice enrolled later is never
+    applied to the meetings it is already in. The Review screen scores those
+    meetings live and gets the right answer, then drops any cluster it is
+    confident about because there is nothing to ask about. Nothing persisted it.
+
+    The result was a transcript reading "Speaker 3" for a voice the Review screen
+    was, on the same data, naming correctly -- and no way to reconcile the two.
+
+    Enrolling is the moment the gallery changes, so it is the moment to redo
+    this. It is cosine arithmetic over stored centroids, not GPU work: a library
+    of a few hundred meetings is milliseconds.
+    """
+    G = gallery(conn)
+    if not G:
+        return 0
+    keys, names, t, now = meeting_keys(), all_cluster_names(), tun(), time.time()
+    written = 0
+    for js in library_json():
+        stem = js.stem
+        cents, _ = meeting_centroids(stem)
+        if not cents:
+            continue
+        mkeys = [k for k, v in keys.items() if v == stem] or [stem]
+        # One person cannot be two clusters in one meeting. Whoever is already
+        # named here holds their slot, and the biggest cluster gets first claim
+        # on the rest -- the same rule the live path applies, which the accept
+        # path did not, and which is how one voice ended up on two clusters.
+        taken = {info["id"]: cl for k in mkeys
+                 for cl, info in names.get(k, {}).items() if info.get("id")}
+        for g in sorted(cents, key=lambda k: -cents[k]["seconds"]):
+            if any(g in names.get(k, {}) for k in mkeys):
+                continue
+            cand = score_cluster(cents[g]["centroid"], G)
+            if not cand:
+                continue
+            best = cand[0]
+            second = cand[1]["score"] if len(cand) > 1 else 0.0
+            if band(best["score"], second, t) != "accept" or best["id"] in taken:
+                continue
+            taken[best["id"]] = g
+            conn.execute(
+                "INSERT INTO decisions(meeting, cluster, speaker_id, score, second,"
+                " threshold, level, roster, outcome, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (stem, g, best["id"], best["score"], second, t["accept"],
+                 "centroid", None, "accept", now))
+            written += 1
+    if written:
+        conn.commit()
+    return written
 
 
 def resolve_cluster(body):
@@ -995,7 +1082,11 @@ def resolve_cluster(body):
              second if best else (prev[2] if prev else None), t["accept"], "centroid",
              None, "accept", now))
         conn.commit()
+        # The gallery just changed, so every meeting already in the library can
+        # now be scored against a voice that did not exist when it was processed.
+        also = reidentify(conn) if enrolled else 0
         return {"ok": True, "outcome": "accept", "meeting": meeting, "cluster": cluster,
+                "also_named": also,
                 "speaker": {"id": sid, "name": name},
                 "score": best["score"] if best else None,
                 "seconds": secs, "enrolled": enrolled,
