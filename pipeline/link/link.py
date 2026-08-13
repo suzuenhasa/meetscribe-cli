@@ -30,9 +30,13 @@ k is also estimated independently by eigengap and by silhouette, purely as a
 cross-check on the threshold-based k.
 """
 import argparse, json, os, sys
+# scipy is imported inside silhouette_k() and cluster() rather than here. Both are
+# reachable only via --sweep, a diagnostic nothing in the pipeline passes, and the
+# real path is cluster_speakers.cluster(), which is numpy only. Importing
+# scipy.cluster.hierarchy at module scope cost ~0.3s of the 0.37s this script took
+# to run -- per recording, so ~35s across a queue of 120 short ones, to load code
+# that never executed.
 import numpy as np
-from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.spatial.distance import squareform
 
 _here = os.path.dirname(os.path.abspath(__file__))
 for _p in (_here, os.path.dirname(_here), os.path.dirname(os.path.dirname(_here))):
@@ -86,6 +90,8 @@ def eigengap_k(S, kmax=15):
 
 
 def silhouette_k(D, kmax=15):
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import squareform
     from sklearn.metrics import silhouette_score
     Z = linkage(squareform(D, checks=False), method="average")
     best, scores = None, {}
@@ -101,6 +107,8 @@ def silhouette_k(D, kmax=15):
 
 
 def cluster(A, secs, thr_cos, min_core, refine_iters):
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import squareform
     core = np.where(secs >= min_core)[0]
     Ac = A[core]
     S = Ac @ Ac.T
