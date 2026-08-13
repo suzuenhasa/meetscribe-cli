@@ -18,3 +18,9 @@ _meetscribe_src/
 !glossary.txt.example
 *.json
 *.npz
+
+# A library is someone's meetings and their audio. It is created at runtime,
+# next to the checkout by default, and must never be committed -- the uploads
+# under _inbox/ and the transcripts beside them are exactly the private data
+# this tool exists to keep on your own machine.
+library/
