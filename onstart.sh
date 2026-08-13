@@ -22,7 +22,7 @@ set -euo pipefail
 
 MS_WORK="${MS_WORK:-/opt/meetscribe}"
 MS_REPO="${MS_REPO:-https://github.com/suzuenhasa/meetscribe-cli.git}"
-MS_REF="${MS_REF:-main}"
+MS_REF="${MS_REF:-463d797bb6a00022a3d933b13fe32cc51e6d2f2e}"
 # NOT /workspace: vast documents it as possibly shared between instances with
 # concurrent writers, and speakers.db is the one file here that cannot be
 # rebuilt from the audio.
@@ -30,46 +30,7 @@ export HF_HOME="${HF_HOME:-$MS_WORK/.hf_home}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$MS_WORK/.vllm_cache}"
 
 log()  { printf '[meetscribe %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
-die()  { rm -f "${MS_WORK:-/opt/meetscribe}/.provisioning"; banner_failed "$*"; printf '[meetscribe] FAILED: %s\n' "$*" >&2; exit 1; }
-
-# ---------------------------------------------------------------- the banner
-# vast marks an instance ready when the CONTAINER boots, which is minutes before
-# this script finishes -- so ssh lets you in, everything looks installed, and
-# nothing says the box is still building itself. Then ./transcribe runs against a
-# half-provisioned tree, or loads its own engine next to the one provisioning is
-# about to start, and the failure has nothing to do with what you did.
-#
-# So say it where you cannot miss it: the login banner. It is rewritten at each
-# stage and replaced when the box is genuinely ready.
-banner() { printf '%s\n' "$*" > /etc/motd; }
-banner_failed() {
-  banner "
-  ############################################################
-  ##  meetscribe PROVISIONING FAILED
-  ##
-  ##  $1
-  ##
-  ##  full log:  /var/log/onstart.log
-  ##  Nothing below /opt/meetscribe is trustworthy yet.
-  ############################################################
-"
-}
-# The machine-readable half of the banner. ./transcribe and ./engine refuse to
-# run while this exists, because a half-installed tree fails in ways that look
-# like bugs in the thing you ran rather than "it is not built yet".
-mkdir -p "$MS_WORK"
-date -u +%FT%TZ > "$MS_WORK/.provisioning"
-banner "
-  ############################################################
-  ##  meetscribe is STILL PROVISIONING — do not use it yet
-  ##
-  ##  Started $(date -u +%H:%M:%S)Z. It takes about 5-8 minutes:
-  ##  ~2 GB of weights, then a one-off engine compile.
-  ##
-  ##  watch:   tail -f /var/log/onstart.log
-  ##  done:    this banner changes, and .provisioned appears
-  ############################################################
-"
+die()  { printf '[meetscribe] FAILED: %s\n' "$*" >&2; exit 1; }
 
 log "work dir   $MS_WORK"
 log "ref        $MS_REF"
@@ -281,23 +242,6 @@ fi
 
 # ---------------------------------------------------------------- done
 date -u +%FT%TZ > "$MS_WORK/.provisioned"
-rm -f "$MS_WORK/.provisioning"
-if up 2>/dev/null; then ENGINE_LINE="##  Engine resident — transcriptions skip the ~70s load."
-else ENGINE_LINE="##  Engine NOT resident; runs load their own (~70s each).";
-fi
-banner "
-  ############################################################
-  ##  meetscribe is READY
-  ##
-  $ENGINE_LINE
-  ##
-  ##  one file or a folder:   $MS_WORK/transcribe rec.mp3
-  ##  from your laptop:       ./transcribe ~/recordings/ --host <this-box>
-  ##  browser UI:             $MS_WORK/ui &
-  ##                          ssh -N -L 8765:localhost:8765 <this-box>
-  ##  engine:                 $MS_WORK/engine status|start|stop
-  ############################################################
-"
 log ""
 log "ready. From your laptop:"
 log "    ./transcribe ~/recordings/ --host <this-box>"

@@ -36,6 +36,24 @@ need_host() {
   [ -n "$HOST" ] || { echo "no pipeline at $PIPE, and no --host given." >&2
     echo "Either run ./setup.sh here, or point at a box: --host <sshhost>" >&2; exit 2; }
 }
+# Refuse while the box is still building itself. vast marks an instance ready
+# when the CONTAINER boots, minutes before provisioning finishes, so ssh lets you
+# in and this directory already looks like an install. Running now fails in ways
+# that read as bugs in this script -- a missing weight, an engine that will not
+# fit beside the one provisioning is about to start -- rather than as "wait".
+# The marker is written by vast/provision.sh and removed when it is done, so a
+# plain ./setup.sh install never has one and is never blocked.
+provisioning_guard() {
+  local m="$1/.provisioning"
+  [ -f "$m" ] || return 0
+  local since; since="$(cat "$m" 2>/dev/null)"
+  echo "meetscribe is still being set up on this machine (started ${since:-recently})." >&2
+  echo "It takes about 5-8 minutes: ~2 GB of weights, then a one-off engine compile." >&2
+  echo "  watch it:   tail -f /var/log/onstart.log" >&2
+  echo "  it is done when:  $1/.provisioned exists" >&2
+  exit 75            # EX_TEMPFAIL: try again shortly, nothing is wrong
+}
+
 THR="auto"
 ROSTER=""
 ENROLL=()
@@ -107,6 +125,8 @@ fi
 # a broken install rather than the wrong python. Resolve it ONCE, here, and pass the
 # literal path down; computing it inside each remote snippet turns into a quoting
 # fight with no upside.
+[ "$LOCAL" -eq 1 ] && provisioning_guard "$REMOTE"
+
 if [ "$LOCAL" -eq 1 ]; then
   PY="$(. "$REMOTE/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
 else
