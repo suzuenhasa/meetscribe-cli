@@ -15,12 +15,18 @@ So: load it once at boot and keep it. The daemon owns the engine and runs jobs
 against it; the client is a stdlib-only pipe that forwards argv and streams the
 output back, so it starts instantly and never imports vLLM.
 
-FALLING BACK IS NORMAL, not an error path. The client exits NO_DAEMON when there
-is no daemon, when the socket is stale, or when the daemon's engine cannot serve
-the job's window/overlap -- and ./transcribe then runs batch.py directly, paying
-the load exactly as it did before this file existed. Every reason is printed. A
-box with no daemon behaves exactly as it used to, which is what makes this safe
-to have on by default.
+NONE OF THIS IS REQUIRED. ./setup.sh does not install a daemon, does not start
+one, and does not know this file exists; only ./engine start and the vast
+provisioning script ever run one. A normal install has no daemon and behaves
+exactly as it did before this file was written.
+
+FALLING BACK IS THEREFORE THE DEFAULT, not an error path. The client exits
+NO_DAEMON when there is no daemon, when the socket is stale, when the daemon
+died mid-job, or when its engine was built for a different window/overlap -- and
+./transcribe then runs batch.py directly, paying the load as it always did. The
+first of those is silent, because on most installs it is simply the truth and
+not news; the others each print what happened, because each means something was
+there and went wrong.
 """
 import argparse
 import json
@@ -81,7 +87,13 @@ class Stream:
 # --------------------------------------------------------------- the client
 def submit(sock_path, argv):
     if not Path(sock_path).exists():
-        print(f"==> no resident engine at {sock_path}; loading one", file=sys.stderr)
+        # SILENTLY. No socket is the normal state of an install that never runs
+        # a daemon, which is most of them -- ./setup.sh does not create one and
+        # nothing but ./engine start and the vast provisioning script ever will.
+        # Saying "no resident engine" on every run would be a message about a
+        # feature the user is not using, in the default path, forever. The cases
+        # below are different: each one means something was there and went
+        # wrong, which is worth a line.
         return NO_DAEMON
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -92,8 +104,22 @@ def submit(sock_path, argv):
         s.settimeout(10)
         s.connect(sock_path)
         s.settimeout(None)
+    except ConnectionRefusedError:
+        # Nothing is bound to it. On a unix socket that is unambiguous -- a
+        # daemon that is still starting has not created the file yet, because
+        # serve() unlinks before it binds -- so this file is litter from one
+        # that died. Remove it, or the "engine died" line below would greet
+        # every run from now on, on a box whose owner may have stopped it on
+        # purpose. Say it once, on the run that cleans up, and never again.
+        try:
+            Path(sock_path).unlink()
+            print("==> cleared the socket of an engine that is no longer running",
+                  file=sys.stderr)
+        except OSError:
+            print(f"==> stale engine socket at {sock_path} that I cannot remove; "
+                  f"loading an engine instead", file=sys.stderr)
+        return NO_DAEMON
     except OSError as e:
-        # Almost always a socket file left behind by a daemon that died.
         print(f"==> resident engine not answering ({e}); loading one instead",
               file=sys.stderr)
         return NO_DAEMON
@@ -190,6 +216,19 @@ def serve(sock_path, window, overlap, gpu_frac):
     os.chmod(sock_path, 0o600)      # the library is the user's meetings
     srv.listen(16)                  # jobs queue here; see the accept loop below
     print(f"listening on {sock_path}", flush=True)
+
+    # Take the socket file with us when told to stop. supervisorctl stop sends
+    # SIGTERM, whose default action is to die without running anything -- which
+    # left the file behind, so every later run found a socket with nothing
+    # listening and reported a dead engine on a box whose owner had stopped it
+    # deliberately. os._exit rather than a clean unwind: there is no state here
+    # worth flushing, and stopping mid-job is what stopping means.
+    def _bye(signum, _frame):
+        p.unlink(missing_ok=True)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _bye)
+    signal.signal(signal.SIGINT, _bye)
 
     parser = batch.build_parser()
     while True:
