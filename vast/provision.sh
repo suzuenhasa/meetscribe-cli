@@ -22,7 +22,7 @@ set -euo pipefail
 
 MS_WORK="${MS_WORK:-/opt/meetscribe}"
 MS_REPO="${MS_REPO:-https://github.com/suzuenhasa/meetscribe-cli.git}"
-MS_REF="${MS_REF:-9aebf135d95fc2c52d248ba6fd39720feee20215}"
+MS_REF="${MS_REF:-87596bb6a5389070e87484d8f0e9a0eae3175ed7}"
 # NOT /workspace: vast documents it as possibly shared between instances with
 # concurrent writers, and speakers.db is the one file here that cannot be
 # rebuilt from the audio.
