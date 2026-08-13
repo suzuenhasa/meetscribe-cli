@@ -15,6 +15,7 @@ Two reasons this exists rather than calling transcribe_meeting.py per file:
 """
 import argparse
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -136,6 +137,62 @@ class Embedder:
         self.reader.join(timeout=30)
         self.log.close()
         return dict(self.acks)
+
+
+def _run_module(spec):
+    """Run one pipeline script in-process. -> (key, returncode, captured output)
+
+    spec is (key, script_path, argv). Called in a pool worker, which pays each
+    import once and then handles many recordings -- the point of the exercise,
+    since these scripts cost far more to start than to run. Measured per
+    recording: link.py 0.13s of which ~0.10 is importing numpy, identify.py
+    0.116s against 0.103s to import numpy and sqlite3, mktxt.py 0.036s against
+    0.034s for a bare interpreter. Launching them three times per file was almost
+    entirely launch.
+
+    runpy rather than importing and calling main(), because mktxt.py has no
+    main() -- it is top-level script code reading sys.argv. Re-executing a module
+    body is cheap and its imports still hit sys.modules from the previous call,
+    which is where the saving actually comes from.
+
+    stdout is captured and returned rather than printed, so a pool cannot
+    interleave two recordings' diagnostics; the caller replays them in order.
+    Exceptions become a nonzero code, which is what the subprocess version gave
+    and what the artifact checking downstream expects.
+    """
+    import contextlib, io, runpy, sys as _sys, traceback
+    key, path, argv = spec
+    buf = io.StringIO()
+    old = _sys.argv
+    try:
+        _sys.argv = argv
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            runpy.run_path(path, run_name="__main__")
+        return key, 0, buf.getvalue()
+    except SystemExit as e:
+        return key, int(e.code or 0), buf.getvalue()
+    except Exception:
+        return key, 1, buf.getvalue() + traceback.format_exc()
+    finally:
+        _sys.argv = old
+
+
+def _pool_init(pipe_dir):
+    """Put the pipeline on the path so workers can import its modules."""
+    import sys as _sys
+    for p in (pipe_dir, f"{pipe_dir}/link"):
+        if p not in _sys.path:
+            _sys.path.insert(0, p)
+
+
+def post_workers():
+    """How many post-processing workers to run. Scales with the box.
+
+    These tasks are ~10-30ms of work each once imports are paid, so a handful of
+    workers saturates them; the cap keeps a 256-core host from spawning 256
+    interpreters to do a few seconds of work.
+    """
+    return max(1, min(os.cpu_count() or 2, 8))
 
 
 def main():
@@ -371,57 +428,90 @@ def main():
     print(flush=True)
     env = {**os.environ, "OMP_NUM_THREADS": "4", "MS_WORK": WORK}
     broken, broken_names = [], set()
-    for name, f in pending:
-        if name in failed:
-            continue
-        # Inherit stdout/stderr rather than discarding them. link.py is where
-        # CLUSTER, LOW-SEPARATION and FLOOR-VIOLATION are reported, and the
-        # troubleshooting docs tell people to read exactly those -- while the
-        # docs also recommend folder mode, which is this path. Discarding them
-        # here also hid link.py crashing outright.
-        #
-        # And CHECK the return codes. These ran unchecked, so when link.py died
-        # on one recording the run still printed its meeting count and exited 0,
-        # with that transcript simply absent -- 122 embeddings and 121 texts,
-        # which nothing reported. A missing output is a failure, not a quiet
-        # difference in the file count.
-        steps = [
-            ("link", [PY, f"{PIPE}/link/link.py", "--run", str(out / f"{name}_raw.json"),
-                      "--npz", str(out / f"{name}_emb.npz"), "--thr", a.thr,
-                      "--out", str(out / f"{name}_linked.json")]),
-            ("identify", [PY, f"{PIPE}/identify.py",
-                          "--clusters", str(out / f"{name}_linked_clusters.npz"),
-                          "--meeting", name, "--roster", a.roster,
-                          "--names", str(out / f"{name}_names.json")]),
-            ("render", [PY, f"{PIPE}/mktxt.py", str(out / f"{name}_linked.json"),
-                        str(out / f"{name}_raw.json"), str(out / f"{name}.txt"),
-                        titles.get(name, f.stem),
-                        str(out / f"{name}_names.json")]),
-        ]
+    todo = [(name, f) for name, f in pending if name not in failed]
+
+    # Post-processing runs IN-PROCESS in a worker pool, in three phases, rather
+    # than as three subprocesses per recording. These scripts cost far more to
+    # start than to run, so 120 recordings meant 360 interpreter launches for a
+    # few seconds of actual work -- once the GPU work was pooled, this became the
+    # bottleneck. A worker imports numpy, scipy and sqlite3 once and then handles
+    # many files.
+    #
+    # Phased rather than per-file end to end, because the steps have a dependency
+    # chain (link writes the npz identify reads, identify writes the names mktxt
+    # reads) and because identify WRITES to speakers.db on every run -- a
+    # decisions row per cluster, not only when enrolling. Running it serially in
+    # the parent keeps sqlite single-writer. It can afford to be serial: its
+    # 0.116s was 0.103s of import, so the work itself is milliseconds.
+    #
+    # spawn, not fork: this process holds a CUDA context and forking one is
+    # unsafe. spawn also gives each worker the clean import we want anyway.
+    def argv_link(name):
+        return [f"{PIPE}/link/link.py", "--run", str(out / f"{name}_raw.json"),
+                "--npz", str(out / f"{name}_emb.npz"), "--thr", a.thr,
+                "--out", str(out / f"{name}_linked.json")]
+
+    def argv_identify(name):
+        return [f"{PIPE}/identify.py", "--clusters", str(out / f"{name}_linked_clusters.npz"),
+                "--meeting", name, "--roster", a.roster,
+                "--names", str(out / f"{name}_names.json")]
+
+    def argv_render(name, f):
+        return [f"{PIPE}/mktxt.py", str(out / f"{name}_linked.json"),
+                str(out / f"{name}_raw.json"), str(out / f"{name}.txt"),
+                titles.get(name, f.stem), str(out / f"{name}_names.json")]
+
+    os.environ["MS_WORK"] = WORK
+    rc_link, rc_render = {}, {}
+    if todo:
+        ctx = multiprocessing.get_context("spawn")
+        nworkers = min(post_workers(), len(todo))
+        with ctx.Pool(nworkers, initializer=_pool_init, initargs=(PIPE,)) as pool:
+            for key, rc, output in pool.imap_unordered(
+                    _run_module, [(n, f"{PIPE}/link/link.py", argv_link(n)) for n, _ in todo]):
+                rc_link[key] = (rc, output)
+        # identify in the parent: single sqlite writer, and cheap once imported
+        rc_ident = {}
+        for name, _ in todo:
+            if rc_link.get(name, (1, ""))[0] == 0:
+                rc_ident[name] = _run_module((name, f"{PIPE}/identify.py", argv_identify(name)))[1:]
+        with ctx.Pool(nworkers, initializer=_pool_init, initargs=(PIPE,)) as pool:
+            ready = [(n, f) for n, f in todo if rc_link.get(n, (1, ""))[0] == 0]
+            for key, rc, output in pool.imap_unordered(
+                    _run_module, [(n, f"{PIPE}/mktxt.py", argv_render(n, f)) for n, f in ready]):
+                rc_render[key] = (rc, output)
+    else:
+        rc_ident = {}
+
+    # Replay each recording's diagnostics together and in queue order -- link.py
+    # is where CLUSTER, LOW-SEPARATION and FLOOR-VIOLATION are reported, and the
+    # troubleshooting docs tell people to read exactly those.
+    for name, f in todo:
+        for step, table in (("link", rc_link), ("identify", rc_ident),
+                            ("render", rc_render)):
+            rc, output = table.get(name, (0, ""))
+            if output.strip():
+                print(output.rstrip(), flush=True)
         # link and render are load-bearing. identify only decorates the result
         # with names it recognises, and mktxt is explicitly written to run
-        # without it -- so aborting the chain when identify fails destroys a
-        # transcript that would have rendered fine as "Speaker N". That is the
-        # same missing-output failure this loop exists to catch, caused by the
-        # catching.
+        # without it -- so treating an identify failure as fatal would destroy a
+        # transcript that would have rendered fine as "Speaker N".
         bad = None
-        for step, argv in steps:
-            rc = subprocess.run(argv, env=env).returncode
-            if rc == 0:
-                continue
-            if step == "identify":
-                print(f"  !! identify failed ({rc}) for {name} — speakers stay "
-                      f"numbered in this transcript", flush=True)
-                continue
-            bad = f"{name} ({step} exited {rc})"
-            break
+        for step, table in (("link", rc_link), ("render", rc_render)):
+            rc = table.get(name, (1, ""))[0]
+            if rc != 0:
+                bad = f"{name} ({step} exited {rc})"
+                break
+        if rc_ident.get(name, (0, ""))[0] != 0:
+            print(f"  !! identify failed for {name} — speakers stay numbered",
+                  flush=True)
         if bad is None:
             # Every step claimed success; confirm it actually left the artifacts
             # behind, since a step can exit 0 and still write nothing.
-            missing = [p.name for p in (out / f"{name}_linked.json", out / f"{name}.txt")
-                       if not p.exists() or p.stat().st_size == 0]
-            if missing:
-                bad = f"{name} (missing {', '.join(missing)})"
+            gone = [p.name for p in (out / f"{name}_linked.json", out / f"{name}.txt")
+                    if not p.exists() or p.stat().st_size == 0]
+            if gone:
+                bad = f"{name} (missing {', '.join(gone)})"
         if bad:
             broken.append(bad)
             broken_names.add(name)
