@@ -130,17 +130,24 @@ fi
 # It matters most for exactly the case the batch path cannot help -- a single
 # recording, where 70s of loading sits in front of a few seconds of work.
 #
-# autorestart, and NOT autostart: provisioning starts it below once the weights
-# are actually present. A service that starts at boot on a half-provisioned box
-# just fails and backs off.
+# autostart, so the engine comes back when the INSTANCE does. Stopping and
+# starting a vast instance keeps the disk and reruns the entrypoint, so the
+# weights and caches survive but nothing is loaded -- without this the second
+# boot silently costs 70s on every transcription, which is the whole problem
+# this section exists to remove.
+#
+# Safe because of where this file is written: everything above had to succeed
+# first, so this config only ever exists on a box that is fully installed. There
+# is no half-provisioned boot for it to fail on.
 MS_PY="$(. "$MS_WORK/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
 cat > /etc/supervisor/conf.d/meetscribe-engine.conf <<EOF
 [program:meetscribe-engine]
 command=$MS_PY -u $MS_WORK/pipeline/engined.py --serve
 directory=$MS_WORK
-autostart=false
+autostart=true
 autorestart=true
 startsecs=45
+startretries=10
 stopwaitsecs=60
 environment=MS_WORK="$MS_WORK",HF_HOME="$HF_HOME",VLLM_CACHE_ROOT="$VLLM_CACHE_ROOT",OMP_NUM_THREADS="8",TOKENIZERS_PARALLELISM="false",VLLM_LOGGING_LEVEL="WARNING"
 stdout_logfile=/var/log/portal/meetscribe-engine.log
