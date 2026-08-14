@@ -312,6 +312,11 @@ export OMP_NUM_THREADS=8 TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
 export MS_PY="$PY"
 EOF
   ok "wrote $WORK/env.sh"
+  # So `./transcribe --host thisbox` from another machine can find the install
+  # without being told where it is. Best effort: it needs root, and not having
+  # it only means the caller has to pass MS_REMOTE.
+  echo "$WORK" > /etc/meetscribe-work 2>/dev/null \
+    && ok "recorded the install path in /etc/meetscribe-work" || true
 
   # The profile store. Created empty and left in place on re-runs: it is the one
   # piece of state here that cannot be rebuilt from the audio, because it holds

@@ -119,6 +119,30 @@ if [ -n "$HOST" ]; then
 elif [ -f "$PIPE/transcribe_meeting.py" ] && [ -z "${MS_FORCE_REMOTE:-}" ]; then
   LOCAL=1
 fi
+
+# Where the install lives ON THE BOX, which is not where this script lives.
+# REMOTE defaults to this checkout, which is right when you are ON the machine
+# with the pipeline and wrong the moment you are not: every remote command below
+# is built from it, so a laptop at ~/src/meetscribe-cli asked a box to run
+# ~/src/meetscribe-cli/pipeline/engined.py and got "No such file or directory"
+# for a file that was never going to be there.
+#
+# setup.sh and the provisioning script both record the path in
+# /etc/meetscribe-work. Fall back to looking in the usual places, and say so
+# plainly rather than failing halfway through a run with a path the user never
+# typed. MS_REMOTE still overrides everything.
+if [ "$LOCAL" -eq 0 ] && [ -n "$HOST" ] && [ -z "${MS_REMOTE:-}" ] && [ -z "${MS_WORK:-}" ]; then
+  REMOTE="$(ssh "$HOST" '
+    if [ -s /etc/meetscribe-work ]; then cat /etc/meetscribe-work; exit; fi
+    for d in /opt/meetscribe "$HOME/meetscribe-cli" /workspace/meetscribe-cli              /opt/meetscribe-cli "$HOME/meetscribe"; do
+      [ -x "$d/transcribe" ] && { echo "$d"; exit; }
+    done' 2>/dev/null | tail -1)"
+  [ -n "$REMOTE" ] || { echo "cannot find a meetscribe install on $HOST." >&2
+    echo "Run ./setup.sh there, or name the directory: MS_REMOTE=/path ./transcribe ..." >&2
+    exit 2; }
+  PIPE="$REMOTE/pipeline"
+  echo "==> using $HOST:$REMOTE"
+fi
 # VLLM_CACHE_ROOT travels with the install for the same reason everything else
 # does: vLLM's compiled graph is cached per model, per engine config and per GPU
 # model name, and the FIRST build of it costs 120-400s against ~70s for every one
