@@ -230,7 +230,12 @@ ok "torch unchanged"
 
 # ------------------------------------------------------------------- weights
 say "Models (~2 GB on a cold box — this is the slow part)"
-mkdir -p "$HF_HOME" "$WORK/runs" "$WORK/out" "$WORK/inbox" "$WORK/wsp_ckpt/resnet293"
+# inbox/ and library/ are the two directories a person actually uses: drop
+# recordings in one, find meetings in the other. They have to exist before the
+# first run, since ./transcribe with no argument means the inbox and the README
+# tells you to copy into it.
+mkdir -p "$HF_HOME" "$WORK/runs" "$WORK/out" "$WORK/inbox" "$WORK/library" \
+         "$WORK/wsp_ckpt/resnet293"
 if [ "$CHECK" -eq 1 ]; then
   "$PY" -c "
 from huggingface_hub import snapshot_download as d; d('$MODEL', local_files_only=True)" >/dev/null 2>&1 \

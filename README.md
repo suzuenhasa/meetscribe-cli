@@ -108,19 +108,48 @@ assumption, not a limitation.
 
 ## Use
 
+Drop recordings in `inbox/` and run it:
+
 ```bash
-./transcribe ~/recordings/              a folder
-./transcribe "weekly sync.mp3"          one file
+cp ~/recordings/*.mp3 inbox/
+./transcribe
 ```
 
-Writes a `.txt`, a `.json`, an `.emb.npz` and a `.clusters.npz` per recording
-into an `out/` beside the audio — `--out <dir>` to put them elsewhere. `wav mp3 m4a flac
-ogg opus aac m4b aiff wma mp4 webm mkv`, any sample rate — anything not already
-16 kHz mono is converted first, in parallel, which is most of the speed above.
+Each one becomes a directory in `library/`:
 
-Use a folder whenever you have more than one file — the engine loads once for the
-batch instead of per file, and each meeting's embedding overlaps the next one's
-transcription.
+```
+library/
+  one-trust-network-to-rule-9ajq9/
+    meeting.json                              id, title, duration
+    one-trust-network-to-rule-audio.mp3       your original
+    one-trust-network-to-rule-transcript.txt
+    one-trust-network-to-rule-transcript.json
+    one-trust-network-to-rule-embeddings.npz
+    one-trust-network-to-rule-clusters.npz
+    clips/G00-1.mp3 …                         a few seconds of each voice
+```
+
+The inbox is a worklist: files leave it as they finish, so anything still there
+has not been done.
+
+`./transcribe ~/somewhere/` uses that folder instead, and copies rather than
+moves — only the inbox empties, because only the inbox is a worklist.
+`./transcribe one.mp3` does a single file.
+
+`wav mp3 m4a flac ogg opus aac m4b aiff wma mp4 webm mkv`, any sample rate.
+Anything not already 16 kHz mono is converted first, all files at once, which is
+most of the speed above.
+
+A batch is faster than one file at a time: the engine loads once for the whole
+queue, windows are pooled across recordings, and each meeting's embedding
+overlaps the next one's transcription.
+
+### The five characters on the end
+
+`one-trust-network-to-rule-9ajq9` — the slug is for you, the id is for the
+software. `speakers.db` records decisions against the **id**, so you can rename
+the directory, tidy the files inside it, or reorganise the whole library, and
+everything ever decided about that meeting still points at it.
 
 ---
 
@@ -146,10 +175,24 @@ Monday's "Speaker 1" is unrelated to Tuesday's. Name someone once and they are
 recognised from then on.
 
 ```bash
-./speakers who "standup.json"              # the voices, and what each said
-./speakers play "standup.json" G02         # hear one (needs an audio device)
-./speakers name standup G02 "Bob Smith"    # remember that voice
+./speakers meetings                        # what is in the library
+./speakers who one-trust                   # the voices, and what each said
+./speakers play one-trust G02              # hear one (needs an audio device)
+./speakers name one-trust G02 "Bob Smith"  # remember that voice
 ```
+
+A meeting is anything that identifies one: its id, its directory, a path, or
+enough of the title to be unambiguous.
+
+Naming someone applies to meetings you **already have**, not just future ones:
+
+```bash
+./speakers apply             # what would change
+./speakers apply --apply     # re-identify and re-render
+```
+
+One enrolment, every transcript they appear in. It costs nothing — cosine
+arithmetic over centroids already on disk, no GPU and no re-transcription.
 
 Then every later meeting reports what it found:
 
@@ -174,7 +217,13 @@ Also: `./speakers list`, `./speakers rename <id> "New Name"`,
 `./speakers forget <id>`.
 
 `speakers.db` is the only thing here that cannot be rebuilt from the audio.
-Back it up.
+Back it up. With `--host` it travels to the box for the run and comes back, so
+the profiles are yours and a destroyed instance costs nothing.
+
+`clips/` holds a few seconds of each speaker, cut from the original — about a
+megabyte against fifty. They are what makes naming possible after you archive or
+delete the recordings, so a library stays useful when the audio is gone. They are
+never used to compute a voiceprint; that only ever comes from the original.
 
 ---
 
@@ -190,7 +239,8 @@ Back it up.
 | `--thr` | `auto` | speaker-clustering cut |
 | `--gpu-frac` | auto | VRAM vLLM reserves |
 | `--host` | — | run the GPU work on a remote box over ssh |
-| `--out` | `out/` beside the audio | where results go |
+| `--out` | `library/` | where meetings are kept |
+| `--replace` | — | overwrite a meeting id in place, keeping its history |
 
 The defaults are measured, not guessed. `--window` longer is slower *and* no more
 accurate. `--thr` used to be a constant and a wrong value silently merged every
@@ -245,6 +295,15 @@ one vLLM at a time. Otherwise `supervisorctl stop ray`.
 **`ModuleNotFoundError`** running the pipeline scripts directly — use the
 interpreter setup chose: `source env.sh && "$MS_PY" pipeline/batch.py ...`
 
+**A voice is enrolled but old transcripts still say Speaker 3.** `./speakers
+apply --apply`. Identification runs when a recording is processed, against
+whoever was enrolled then; this re-runs it over everything you already have.
+
+**One person enrolled twice.** Two voiceprints for the same voice both score
+~1.000, so the 0.10 margin can never be met and they come out `?` forever.
+`./speakers list` shows it — two entries, near-identical speech time.
+`./speakers forget <id>` on the duplicate.
+
 **Anything else** — `./setup.sh --check`.
 
 ---
@@ -252,10 +311,43 @@ interpreter setup chose: `source env.sh && "$MS_PY" pipeline/batch.py ...`
 ## Layout
 
 ```
-transcribe            one file or a folder
-speakers              who / play / clips / name / rename / forget
+inbox/                drop recordings here; empties as they finish
+library/              one directory per meeting
+speakers.db           who people are — the one thing not rebuildable
+
+transcribe            the inbox, a folder, or one file
+speakers              meetings / who / play / name / apply / list / forget
 engine                start / stop the resident engine, so runs skip the load
 setup.sh              installs everything; --check verifies
 preview.py            backs speakers who / play / clips
 pipeline/             the pipeline itself, run in place
+pipeline/library.py   the naming rules: slugs, ids, where things go
+pipeline/migrate_ids.py   re-key a store written before ids existed
 ```
+
+## Running it on someone else's GPU
+
+`--host` means one thing: where the compute happens. Everything else is
+unchanged — your audio, your library and your profiles stay on your machine.
+
+```bash
+./transcribe --host msbox
+```
+
+It uploads the audio, runs, brings back whole meeting directories, and syncs
+`speakers.db` up before the run and back after, so the box identifies against
+your people and anything it learns comes home. The box holds a copy for as long
+as it is working; destroy the instance and you lose nothing.
+
+`~/.ssh/config`:
+
+```
+Host msbox
+  HostName 1.2.3.4
+  Port 22
+  User root
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+`export MS_HOST=msbox` saves typing it. `vast/provision.sh` sets a rented box up
+from nothing — see `vast/README.md`.

@@ -119,7 +119,8 @@ done
 # anything still sitting there afterwards has not been processed -- a property
 # you can see at a glance, which pointing at arbitrary directories never gives
 # you. An argument still means that path, for the one-off someone sends you.
-if [ -z "$SRC" ] && [ -d "$HERE/inbox" ]; then
+if [ -z "$SRC" ]; then
+  mkdir -p "$HERE/inbox"
   SRC="$HERE/inbox"
 fi
 
@@ -217,7 +218,6 @@ case "$(cd "$(dirname "${SRC%/}")" 2>/dev/null && pwd)/$(basename "${SRC%/}")" i
   "$HERE/inbox") MOVEAUDIO="--move-audio" ;;
 esac
 mkdir -p "$LIBRARY" || { echo "cannot write to $LIBRARY" >&2; exit 2; }
-[ -n "$MOVEAUDIO" ] && echo "==> from the inbox: audio moves into the library"
 
 # A directory means batch: the engine loads once instead of per file (~66s each),
 # and embedding overlaps the next file's transcription.
@@ -232,7 +232,7 @@ if [ -d "$SRC" ]; then
       -o -iname '*.aac' -o -iname '*.m4b' -o -iname '*.aiff' -o -iname '*.wma' \
       -o -iname '*.mp4' -o -iname '*.webm' -o -iname '*.mkv' \) | sort)
   [ ${#BATCH[@]} -gt 0 ] || { echo "no audio files in $SRC" >&2; exit 2; }
-  echo "==> ${#BATCH[@]} files in $(basename "$SRC")"
+  echo "==> ${#BATCH[@]} files in $(basename "$SRC")${MOVEAUDIO:+ (they move into the library)}"
   if [ -f "./glossary.txt" ]; then
     FILE_TERMS="$(grep -vE '^\s*(#|$)' ./glossary.txt | paste -sd, -)"
     [ -n "$FILE_TERMS" ] && GLOSSARY="${GLOSSARY:+$GLOSSARY,}$FILE_TERMS"
