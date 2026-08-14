@@ -33,13 +33,31 @@ def load(arg):
 
 
 def audio_for(js: Path, doc):
-    for ext in AUDIO_EXT:
-        c = js.with_suffix(ext)
-        if c.exists():
-            return c
+    """The recording this transcript came from, wherever it ended up.
+
+    Beside the transcript is the common case, and it stops being true the moment
+    transcripts are kept apart from the audio -- an out/ directory beside the
+    recordings, which is a perfectly ordinary way to keep a folder tidy. Look up
+    one level too, and in the audio path the run recorded, before giving up:
+    "NOT FOUND beside the transcript" is a true statement about a file sitting
+    one directory away, and it takes play and clips with it.
+    """
+    for d in (js.parent, js.parent.parent):
+        for ext in AUDIO_EXT:
+            c = d / (js.stem + ext)
+            if c.exists():
+                return c
     rec = doc.get("audio")
-    if rec and Path(rec).exists():
-        return Path(rec)
+    if rec:
+        rec = Path(rec)
+        if rec.exists():
+            return rec
+        # The path a REMOTE run recorded is the box's, not yours. The name still
+        # tells you what to look for here.
+        for d in (js.parent, js.parent.parent):
+            c = d / rec.name
+            if c.exists():
+                return c
     return None
 
 
