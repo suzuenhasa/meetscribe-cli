@@ -12,6 +12,7 @@ zeros into the speaker vector.
 import argparse, json, os, sys, time, traceback
 from collections import defaultdict
 
+from pathlib import Path
 import numpy as np
 import soundfile as sf
 import torch
@@ -176,6 +177,11 @@ def main():
     ap.add_argument("--config", default=os.path.join(WORK, "wsp_ckpt/resnet293/config.yaml"))
     ap.add_argument("--ckpt", default=os.path.join(WORK, "wsp_ckpt/resnet293/avg_model.pt"))
     args = ap.parse_args()
+    # Before anything is loaded. The check also sits in embed_file, which is
+    # where --serve jobs arrive, but doing it here means a one-shot refusal
+    # costs nothing rather than a model load and a fight for the card.
+    if args.wav:
+        _refuse_clips(args.wav)
     if args.serve:
         return serve(args)
     if not (args.run and args.wav and args.out):
@@ -184,8 +190,23 @@ def main():
     print(embed_file(model, fp16, scale_pcm, args, args.run, args.wav, args.out))
 
 
+def _refuse_clips(path):
+    """Clips are for ears, never for voiceprints.
+
+    They are lossy and they are fragments picked for being easy to listen to,
+    not for being representative. An embedding built from one would be quietly
+    wrong forever, and wrong in a way nothing downstream could detect -- so the
+    rule is enforced here rather than left to everyone remembering it."""
+    p = Path(path)
+    if "clips" in p.parts:
+        raise SystemExit(
+            f"refusing to embed {p.name}: it is a clip, cut for listening to. "
+            f"Embeddings come from the original recording only.")
+
+
 def embed_file(model, fp16, scale_pcm, args, run, wav_path, out_path):
     """Embed one recording and write its npz. -> the WROTE summary line."""
+    _refuse_clips(wav_path)
     audio, sr = sf.read(wav_path, dtype="float32", always_2d=False)
     if audio.ndim > 1:
         audio = audio.mean(1)          # mix, do not discard a channel

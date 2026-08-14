@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import transcribe_meeting as TM
+import clips as CLIPS
 import library as LIB
 import postproc
 from moss_transcribe_diarize.inference_utils import load_audio_item
@@ -254,6 +255,9 @@ def build_parser():
     ap.add_argument("--library", default=None,
                     help="where finished meetings are kept, one directory each: "
                          "library/<slug>-<id>/")
+    ap.add_argument("--no-clips", action="store_true",
+                    help="do not cut per-speaker clips. They are what lets you "
+                         "name a voice after the source audio is gone.")
     ap.add_argument("--move-audio", action="store_true",
                     help="move the source into the meeting directory rather "
                          "than copying it. What the inbox does, since a worklist "
@@ -739,6 +743,21 @@ def run_job(a, resident=None):
         except OSError as e:
             print(f"  !! could not put {f.name[:40]} beside its transcript "
                   f"({type(e).__name__}) — it is still at {f}", flush=True)
+
+    # A few seconds of each speaker, so the library is still usable for naming
+    # people after the source audio is archived or deleted. Cheap, and the only
+    # thing that makes "keep the transcripts, drop the audio" a real option.
+    if not a.no_clips:
+        n_clips = 0
+        for name, _ in pending:
+            if name in broken_names:
+                continue
+            m = meetings[name]
+            aud = m.audio()
+            if aud:
+                n_clips += CLIPS.cut(aud, m.file("transcript", "json"), m.clips_dir)
+        if n_clips:
+            print(f"cut {n_clips} clips for naming voices", flush=True)
 
     if scratch is not None and scratch.is_dir():
         # These are a decode cache, not an artifact -- 8x the size of the source

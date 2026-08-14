@@ -89,7 +89,15 @@ def cmd_who(args):
     aud = audio_for(js, doc)
     print(f"\n{js.stem}   {doc.get('duration_s', 0)/60:.1f} min   "
           f"{len(groups)} voice{'s' if len(groups) != 1 else ''}")
-    print(f"audio: {aud if aud else 'NOT FOUND beside the transcript — play unavailable'}\n")
+    n_clips = len(list((js.parent / "clips").glob("*.mp3")))
+    if aud:
+        print(f"audio: {aud}\n")
+    elif n_clips:
+        # The normal state of a library whose originals have been pruned, not a
+        # problem: clips are what naming a voice needs.
+        print(f"audio: pruned — {n_clips} clips here, enough to play and name\n")
+    else:
+        print("audio: NOT FOUND, and no clips — play unavailable\n")
     for g, e in groups.items():
         print(f"  {g}   {e['secs']/60:5.1f} min   {len(e['segs'])} turns")
         for s in best_clips(e["segs"], 2):
@@ -118,13 +126,27 @@ def cmd_play(args):
     groups = by_cluster(doc)
     if cid not in groups:
         raise SystemExit(f"no {cid} here. Voices: {', '.join(groups)}")
-    aud = audio_for(js, doc)
-    if not aud:
-        raise SystemExit(f"no audio next to {js.name}. Keep the recording beside "
-                         f"the transcript, or pass its folder.")
     play = player()
     if not play:
         raise SystemExit("need ffplay or mpv to play audio (apt-get install -y ffmpeg)")
+
+    # Cut clips first. They are a few hundred KB against tens of MB, they are
+    # what survives archiving or deleting the source, and playing them needs no
+    # seeking into a 74-minute file.
+    cut = sorted((js.parent / "clips").glob(f"{cid}-*.mp3"))[:n]
+    if cut:
+        print(f"\n{cid} — {groups[cid]['secs']/60:.1f} min of speech, "
+              f"playing {len(cut)} clips")
+        for c in cut:
+            print(f"  {c.name}", flush=True)
+            subprocess.run(play(c, 0.0, 12.0),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+
+    aud = audio_for(js, doc)
+    if not aud:
+        raise SystemExit(f"no clips and no audio beside {js.name}. Transcribe it "
+                         f"again to cut clips, or put the recording back.")
     clips = best_clips(groups[cid]["segs"], n)
     print(f"\n{cid} — {groups[cid]['secs']/60:.1f} min of speech, playing {len(clips)} clips")
     for s in clips:
