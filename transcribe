@@ -115,6 +115,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# No argument means the inbox. It is a worklist: drop audio in, run this, and
+# anything still sitting there afterwards has not been processed -- a property
+# you can see at a glance, which pointing at arbitrary directories never gives
+# you. An argument still means that path, for the one-off someone sends you.
+if [ -z "$SRC" ] && [ -d "$HERE/inbox" ]; then
+  SRC="$HERE/inbox"
+fi
+
 # An explicit --host (or MS_HOST) means the box, full stop, whatever is sitting
 # in this directory. Otherwise use a local install if there is a usable one.
 if [ -n "$HOST" ]; then
@@ -199,14 +207,17 @@ pull_profiles() {
 # times however many meetings, mixed in with whatever else was there, and a
 # different place each time depending on where you ran it from. Beside the audio
 # they stay with the thing they describe. --out puts them somewhere else.
-if [ -n "$OUTDIR" ]; then
-  DEST="$OUTDIR"
-elif [ -d "$SRC" ]; then
-  DEST="$SRC/out"
-else
-  DEST="$(cd "$(dirname "$SRC")" && pwd)/out"
-fi
-mkdir -p "$DEST" || { echo "cannot write to $DEST" >&2; exit 2; }
+# The library: one directory per meeting, here, whatever machine did the work.
+LIBRARY="${OUTDIR:-${MS_LIBRARY:-$HERE/library}}"
+# Audio MOVES out of the inbox, because a worklist should empty as work
+# completes. Anywhere else it is copied: emptying a directory the caller merely
+# pointed at is not ours to do.
+MOVEAUDIO=""
+case "$(cd "$(dirname "${SRC%/}")" 2>/dev/null && pwd)/$(basename "${SRC%/}")" in
+  "$HERE/inbox") MOVEAUDIO="--move-audio" ;;
+esac
+mkdir -p "$LIBRARY" || { echo "cannot write to $LIBRARY" >&2; exit 2; }
+[ -n "$MOVEAUDIO" ] && echo "==> from the inbox: audio moves into the library"
 
 # A directory means batch: the engine loads once instead of per file (~66s each),
 # and embedding overlaps the next file's transcription.
@@ -239,9 +250,18 @@ if [ -d "$SRC" ]; then
   for f in "${BATCH[@]}"; do
     b="$(basename "${f%.*}")"; e="${f##*.}"
     sf="$(echo "$b" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
-    [ "$LOCAL" -eq 1 ] || echo "    uploading $(basename "$f")"
-    rput "$f" "$STAGE/$sf.$e"
-    REMOTE_ARGS+=("$STAGE/$sf.$e")
+    if [ "$LOCAL" -eq 1 ]; then
+      # No staging when the pipeline is right here. Staging existed to give the
+      # file a name that survives the trip over ssh, and the library does its
+      # own naming now -- so a local run was copying every recording once for
+      # nothing, and --move-audio moved the COPY and left the original sitting
+      # in the inbox, which is the opposite of a worklist emptying.
+      REMOTE_ARGS+=("$f")
+    else
+      echo "    uploading $(basename "$f")"
+      rput "$f" "$STAGE/$sf.$e"
+      REMOTE_ARGS+=("$STAGE/$sf.$e")
+    fi
     [ $FIRST -eq 0 ] && printf ',' >> "$TITLES"; FIRST=0
     python3 -c 'import json,sys; print(json.dumps(sys.argv[1])+":"+json.dumps(sys.argv[2]), end="")' "$sf" "$b" >> "$TITLES"
   done
@@ -260,6 +280,7 @@ if [ -d "$SRC" ]; then
            TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
     cd '$REMOTE'
     ARGS=(${REMOTE_ARGS[*]@Q} --out-dir '$REMOTE/out' \
+      --library '$REMOTE/library' $MOVEAUDIO \
       --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC})
@@ -277,43 +298,25 @@ if [ -d "$SRC" ]; then
   pull_profiles
 
   echo "==> retrieving"
-  GOT=0; WANT=0; MISSING=(); SEEN=" "
-  for f in "${BATCH[@]}"; do
-    b="$(basename "${f%.*}")"
-    sf="$(echo "$b" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
-    # Two inputs can sanitise to the same remote stem, and there is only ONE
-    # remote transcript for them. Counting per input would claim to have
-    # delivered two files that are the same file.
-    case "$SEEN" in *" $sf "*) continue ;; esac
-    SEEN="$SEEN$sf "; WANT=$((WANT + 1))
-    # Clear the destinations first. rget deliberately swallows failure so one
-    # absent file cannot abort the loop -- which means it leaves whatever was
-    # already here, and a transcript from an EARLIER run would be counted as
-    # delivered by this one, hiding exactly the omission this check exists for.
-    rm -f "$DEST/${b}.txt" "$DEST/${b}.json"
-    rget "$REMOTE/out/${sf}.txt" "$DEST/${b}.txt"
-    rget "$REMOTE/out/${sf}_linked.json" "$DEST/${b}.json"
-    # The per-segment embeddings, without which a transcript can be read but no
-    # voice in it can ever be named -- the UI needs them beside the .json to
-    # enrol anyone, and they are a couple of hundred KB. Not part of the
-    # completeness check below: a missing one costs identification, not the
-    # transcript, so it must not fail the run.
-    rget "$REMOTE/out/${sf}_emb.npz" "$DEST/${b}.emb.npz"
-    # What naming a voice needs. Without it ./speakers name can only run against
-    # the box, so enrolling depended on an instance still existing -- and the
-    # profiles you built there died with it.
-    rget "$REMOTE/out/${sf}_linked_clusters.npz" "$DEST/${b}.clusters.npz"
-    if [ -s "$DEST/${b}.txt" ] && [ -s "$DEST/${b}.json" ]; then
-      GOT=$((GOT + 1))
-    else
-      MISSING+=("$b")
-    fi
-  done
-  echo "    $GOT of $WANT transcripts in $DEST"
-  if [ "${#MISSING[@]}" -gt 0 ]; then
-    echo "    !! no transcript for: ${MISSING[*]}" >&2
-    [ "$BATCH_RC" -eq 0 ] && BATCH_RC=1
+  # Whole meeting directories, not files. Each holds its transcript, embeddings,
+  # clips and meeting.json, and the directory IS the unit -- rebuilding that
+  # from filenames here would be a second implementation of the naming rules, in
+  # bash, guaranteed to drift from the one in library.py.
+  #
+  # The whole library rather than just this run's folders: rsync sends only what
+  # is new, and a box is scratch that gets destroyed, so there is nothing on it
+  # that is not also meant to be here.
+  mkdir -p "$LIBRARY"
+  if [ "$LOCAL" -eq 0 ]; then
+    rsync -a -e "ssh" "$HOST:$REMOTE/library/" "$LIBRARY/" 2>/dev/null || true
   fi
+  # A remote run moved the box's copy into the box's library; the local original
+  # is still here, and the inbox only empties if we empty it.
+  if [ "$LOCAL" -eq 0 ] && [ -n "$MOVEAUDIO" ] && [ "$BATCH_RC" -eq 0 ]; then
+    for f in "${BATCH[@]}"; do rm -f "$f"; done
+  fi
+  GOT=$(find "$LIBRARY" -maxdepth 2 -name meeting.json 2>/dev/null | wc -l)
+  echo "    $GOT meeting$([ "$GOT" = 1 ] || echo s) in $LIBRARY"
   exit "$BATCH_RC"
 fi
 
@@ -362,6 +365,7 @@ if [ ${#ENROLL[@]} -eq 0 ]; then
     $PYQ '$PIPE/engined.py' --submit -- '$REMOTE/inbox/$SAFE.$EXT' \
       --out-dir '$REMOTE/out' --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
+      --library '$REMOTE/library' $MOVEAUDIO \
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}
   " || SINGLE_RC=$?
   # 97 is "no usable daemon" and is the one code that means fall through; any
@@ -435,11 +439,15 @@ fi
 pull_profiles
 
 echo "==> retrieving"
-rget "$REMOTE/out/${SAFE}.txt" "$DEST/${BASE}.txt"
-rget "$REMOTE/out/${SAFE}_linked.json" "$DEST/${BASE}.json"
-# Same as the batch path: without the embeddings a transcript can be read but no
-# voice in it can ever be named.
-rget "$REMOTE/out/${SAFE}_emb.npz" "$DEST/${BASE}.emb.npz"
-rget "$REMOTE/out/${SAFE}_linked_clusters.npz" "$DEST/${BASE}.clusters.npz"
-echo "    $DEST/${BASE}.txt"
-echo "    $DEST/${BASE}.json"
+# Same as the batch path: the meeting directory is the unit, and the library is
+# where it belongs regardless of which machine did the work.
+mkdir -p "$LIBRARY"
+if [ "$LOCAL" -eq 0 ]; then
+  rsync -a -e "ssh" "$HOST:$REMOTE/library/" "$LIBRARY/" 2>/dev/null || true
+fi
+M="$(ls -dt "$LIBRARY"/*/ 2>/dev/null | head -1)"
+if [ -n "$M" ]; then
+  echo "    ${M%/}"
+else
+  echo "    !! nothing arrived in $LIBRARY" >&2
+fi
