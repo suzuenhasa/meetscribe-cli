@@ -303,14 +303,10 @@ banner "
   ##
   ##  one file or a folder:   $MS_WORK/transcribe rec.mp3
   ##  from your laptop:       ./transcribe ~/recordings/ --host <this-box>
-  ##  browser UI:             $MS_WORK/ui &
-  ##                          ssh -N -L 8765:localhost:8765 <this-box>
   ##  engine:                 $MS_WORK/engine status|start|stop
   ############################################################
 "
 log ""
 log "ready. From your laptop:"
 log "    ./transcribe ~/recordings/ --host <this-box>"
-log "and for the browser UI, on the box:"
-log "    $MS_WORK/ui &     then   ssh -N -L 8765:localhost:8765 <this-box>"
 log "installed at $MS_WORK"

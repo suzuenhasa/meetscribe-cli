@@ -68,8 +68,8 @@ So don't make it load:
 ```
 
 Everything uses it when it is there and loads its own engine when it is not, so
-this is only ever an optimisation: `./transcribe` and the web UI behave the same
-either way, and stopping it is safe at any time, including mid-queue — a running
+this is only ever an optimisation: `./transcribe` behaves the same either way,
+and stopping it is safe at any time, including mid-queue — a running
 job finishes on the engine it already has.
 
 It holds VRAM while it runs. After 15 minutes idle it hands the card back and
@@ -114,7 +114,8 @@ assumption, not a limitation.
 ```
 
 Writes a `.txt` and a `.json` into the directory you run from. `wav mp3 m4a flac
-ogg mp4 webm`, any sample rate.
+ogg opus aac m4b aiff wma mp4 webm mkv`, any sample rate — anything not already
+16 kHz mono is converted first, in parallel, which is most of the speed above.
 
 Use a folder whenever you have more than one file — the engine loads once for the
 batch instead of per file, and each meeting's embedding overlaps the next one's
@@ -252,7 +253,6 @@ interpreter setup chose: `source env.sh && "$MS_PY" pipeline/batch.py ...`
 transcribe            one file or a folder
 speakers              who / play / clips / name / rename / forget
 engine                start / stop the resident engine, so runs skip the load
-ui                    the browser front end
 setup.sh              installs everything; --check verifies
 preview.py            backs speakers who / play / clips
 pipeline/             the pipeline itself, run in place

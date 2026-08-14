@@ -29,9 +29,8 @@ an abbreviated sha is not one, so it fails with `couldn't find remote ref`. The
 script checks for this and says so rather than letting you find out from git.
 
 **No ports.** SSH mode maps 22 and that is the whole interface — `./transcribe`
-works over ssh and rsync. The web UI has no authentication of any kind, and a
-vast box has a public IP, so it is reached through an ssh tunnel rather than
-published. See below.
+works over ssh and rsync, and a vast box has a public IP -- there is nothing here
+that should be listening on it.
 
 ### The other way in
 
@@ -89,15 +88,7 @@ did; it is just slower to start.
 ```bash
 # from your laptop, audio stays local, only the GPU work goes over
 ./transcribe ~/recordings/ --host <box>
-
-# the browser UI, on the box, reached through a tunnel
-ssh <box> '/opt/meetscribe/ui /opt/meetscribe/library &'
-ssh -N -L 8765:localhost:8765 <box>
-# then http://localhost:8765
 ```
-
-Do **not** bind the UI to `0.0.0.0` to skip the tunnel. It has no login, and the
-library it serves is your meetings.
 
 ## Checking it worked
 
