@@ -85,10 +85,30 @@ did; it is just slower to start.
 
 ## Using it
 
+From your laptop. The audio, the library and the profile store stay on your
+machine; only the GPU work goes over.
+
 ```bash
-# from your laptop, audio stays local, only the GPU work goes over
-./transcribe ~/recordings/ --host <box>
+cp ~/recordings/*.mp3 inbox/
+./transcribe --host <box>
 ```
+
+Meetings come back into `library/`, one directory each. `speakers.db` goes up
+before the run so the box identifies against your people, and comes back after
+with whatever it decided — so destroying the instance costs you nothing, which
+is the point of renting one.
+
+`~/.ssh/config` saves repeating the address:
+
+```
+Host msbox
+  HostName <ip>
+  Port <port>
+  User root
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+then `./transcribe --host msbox`, or `export MS_HOST=msbox` and drop the flag.
 
 ## Checking it worked
 
