@@ -17,9 +17,11 @@ import argparse
 import json
 import multiprocessing
 import os
+import shutil
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from pathlib import Path
 
@@ -176,6 +178,65 @@ def post_workers():
     return max(1, min(os.cpu_count() or 2, 8))
 
 
+def to_16k_mono(files, scratch):
+    """Decode everything that is not already 16 kHz mono, in parallel. -> [Path]
+
+    The model wants 16 kHz mono, so anything else is decoded and resampled
+    before it sees it. That work has to happen; the question is where. Doing it
+    in the file loop below means one file at a time with the GPU idle -- measured
+    on a 5090 host, 6.7s for a 74-minute mp3 and 20s for a 100-minute opus,
+    single-threaded, because a codec bitstream is a dependency chain and does not
+    thread within one stream.
+
+    Across FILES it is embarrassingly parallel, so do it here, all at once,
+    before the engine is asked for anything. Same 379 minutes of audio on the
+    same box: 115.2s as mp3, 60.1s as wav, for 6s of parallel ffmpeg.
+
+    Files already 16 kHz mono are passed through untouched. Anything ffmpeg
+    cannot read is passed through as well and left for the loader to fail on
+    properly, with the filename in the message.
+    """
+    def already_ok(f):
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+                 "stream=sample_rate,channels,codec_name", "-of", "csv=p=0", str(f)],
+                capture_output=True, text=True, timeout=30).stdout.strip()
+            codec, rate, ch = (out.split(",") + ["", "", ""])[:3]
+            return codec == "pcm_s16le" and rate == "16000" and ch == "1"
+        except Exception:
+            return False
+
+    todo = [f for f in files if not already_ok(f)]
+    if not todo:
+        return list(files)
+    scratch.mkdir(parents=True, exist_ok=True)
+    print(f"converting {len(todo)} file(s) to 16 kHz mono, {min(8, len(todo))} at a time",
+          flush=True)
+    t0 = time.time()
+
+    def one(f):
+        dst = scratch / f"{f.stem}.wav"
+        n = 1
+        while dst.exists():
+            dst = scratch / f"{f.stem}-{n}.wav"
+            n += 1
+        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(f),
+                            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst)],
+                           capture_output=True)
+        if r.returncode == 0 and dst.exists() and dst.stat().st_size > 44:
+            return f, dst
+        print(f"  !! could not convert {f.name[:50]} — using it as it is", flush=True)
+        return f, f
+
+    swap = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(todo))) as pool:
+        for src, dst in pool.map(one, todo):
+            swap[src] = dst
+    print(f"  converted in {time.time()-t0:.1f}s", flush=True)
+    return [swap.get(f, f) for f in files]
+
+
 def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("audio", nargs="+")
@@ -197,6 +258,11 @@ def build_parser():
                          "a value only to override that.")
     ap.add_argument("--no-overlap-embed", action="store_true",
                     help="wait for each embed instead of overlapping it")
+    ap.add_argument("--no-convert", action="store_true",
+                    help="do not pre-decode to 16 kHz mono. The decode still "
+                         "happens, just one file at a time inside the run with "
+                         "the GPU waiting -- measured at roughly half the "
+                         "throughput on a 5090.")
     return ap
 
 
@@ -257,6 +323,14 @@ def run_job(a, resident=None):
     titles = {}
     if a.titles and Path(a.titles).is_file():
         titles = json.load(open(a.titles))
+
+    # Before anything touches the GPU. Names are keyed off the stem, which the
+    # conversion preserves, so nothing downstream can tell the difference except
+    # by being faster.
+    scratch = None
+    if not a.no_convert:
+        scratch = out / "_wav"
+        files = to_16k_mono(files, scratch)
 
     t_start = time.time()
     ptxt = TM.build_prompt(a.glossary)
@@ -608,6 +682,12 @@ def run_job(a, resident=None):
             broken.append(bad)
             broken_names.add(name)
         print(flush=True)
+
+    if scratch is not None and scratch.is_dir():
+        # These are a decode cache, not an artifact -- 8x the size of the source
+        # and reproducible from it. Leaving them behind fills the disk on a box
+        # doing a library.
+        shutil.rmtree(scratch, ignore_errors=True)
 
     total = time.time() - t_start
     # Exclude post-processing failures too, not just embedding ones, or the

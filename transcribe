@@ -161,14 +161,21 @@ if [ -d "$SRC" ]; then
     [ -n "$FILE_TERMS" ] && GLOSSARY="${GLOSSARY:+$GLOSSARY,}$FILE_TERMS"
   fi
   [ -n "$GLOSSARY" ] && echo "==> glossary: $GLOSSARY"
-  rrun "mkdir -p '$REMOTE/inbox' '$REMOTE/out'"
+  # A directory PER RUN, not the shared inbox. Staging renames each file to a
+  # sanitised form, so staging into the directory you were given writes new files
+  # beside your originals -- and the next run over that directory picks those up
+  # as more recordings. Run it twice on one folder and you transcribe everything
+  # twice, under two names, which is also how two inputs came to claim one output
+  # name. Nothing else needs these to outlive the run.
+  STAGE="$REMOTE/inbox/run-$$"
+  rrun "mkdir -p '$STAGE' '$REMOTE/out'"
   REMOTE_ARGS=(); TITLES="$(mktemp)"; printf '{' > "$TITLES"; FIRST=1
   for f in "${BATCH[@]}"; do
     b="$(basename "${f%.*}")"; e="${f##*.}"
     sf="$(echo "$b" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
     [ "$LOCAL" -eq 1 ] || echo "    uploading $(basename "$f")"
-    rput "$f" "$REMOTE/inbox/$sf.$e"
-    REMOTE_ARGS+=("$REMOTE/inbox/$sf.$e")
+    rput "$f" "$STAGE/$sf.$e"
+    REMOTE_ARGS+=("$STAGE/$sf.$e")
     [ $FIRST -eq 0 ] && printf ',' >> "$TITLES"; FIRST=0
     python3 -c 'import json,sys; print(json.dumps(sys.argv[1])+":"+json.dumps(sys.argv[2]), end="")' "$sf" "$b" >> "$TITLES"
   done
@@ -198,6 +205,8 @@ if [ -d "$SRC" ]; then
     [ \$rc -eq 97 ] && { $PYQ '$PIPE/batch.py' \"\${ARGS[@]}\"; rc=\$?; }
     exit \$rc
   " || BATCH_RC=$?
+
+  rrun "rm -rf '$STAGE'" || true
 
   echo "==> retrieving"
   GOT=0; WANT=0; MISSING=(); SEEN=" "
