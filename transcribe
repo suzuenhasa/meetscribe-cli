@@ -259,6 +259,10 @@ if [ -d "$SRC" ]; then
     # completeness check below: a missing one costs identification, not the
     # transcript, so it must not fail the run.
     rget "$REMOTE/out/${sf}_emb.npz" "./${b}.emb.npz"
+    # What naming a voice needs. Without it ./speakers name can only run against
+    # the box, so enrolling depended on an instance still existing -- and the
+    # profiles you built there died with it.
+    rget "$REMOTE/out/${sf}_linked_clusters.npz" "./${b}.clusters.npz"
     if [ -s "./${b}.txt" ] && [ -s "./${b}.json" ]; then
       GOT=$((GOT + 1))
     else
@@ -393,5 +397,6 @@ rget "$REMOTE/out/${SAFE}_linked.json" "./${BASE}.json"
 # Same as the batch path: without the embeddings a transcript can be read but no
 # voice in it can ever be named.
 rget "$REMOTE/out/${SAFE}_emb.npz" "./${BASE}.emb.npz"
+rget "$REMOTE/out/${SAFE}_linked_clusters.npz" "./${BASE}.clusters.npz"
 echo "    $(pwd)/${BASE}.txt"
 echo "    $(pwd)/${BASE}.json"

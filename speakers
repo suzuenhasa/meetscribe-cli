@@ -93,9 +93,37 @@ case "$CMD" in
     MEETING="$1"; CLUSTER="$2"; NAME="$3"
     # accept the transcript path as well as the bare meeting name
     MEETING="$(basename "$MEETING")"; MEETING="${MEETING%.json}"; MEETING="${MEETING%.txt}"
+    RAW="$MEETING"
     MEETING="$(echo "$MEETING" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
-    run "$PIPE/identify.py" --clusters "$REMOTE/out/${MEETING}_linked_clusters.npz" \
-        --meeting "$MEETING" --enroll "${CLUSTER}=${NAME}"
+
+    # HERE first. ./transcribe brings the clusters file back with the transcript,
+    # so naming a voice is something you can do where your files are -- without a
+    # box, and without one having to still exist. Only fall through to the remote
+    # out/ when there is nothing local, which is the case where you transcribed
+    # straight on the box and never pulled anything down.
+    CL=""
+    for c in "./${RAW}.clusters.npz" "./${MEETING}.clusters.npz" \
+             "./${MEETING}_linked_clusters.npz" "./out/${MEETING}.clusters.npz" \
+             "./out/${MEETING}_linked_clusters.npz"; do
+      [ -f "$c" ] && { CL="$c"; break; }
+    done
+    if [ -n "$CL" ]; then
+      # A local file means a local run, whatever --host says: the store this
+      # writes to is the one in THIS install, which is the copy that outlives
+      # any box.
+      LOCAL=1; PIPE="$HERE/pipeline"; REMOTE="$HERE"
+      run "$PIPE/identify.py" --clusters "$CL" \
+          --meeting "$MEETING" --enroll "${CLUSTER}=${NAME}"
+    else
+      [ "$LOCAL" -eq 1 ] && [ ! -f "$REMOTE/out/${MEETING}_linked_clusters.npz" ] && {
+        echo "no clusters for $MEETING here." >&2
+        echo "Looked for ${RAW}.clusters.npz and ${MEETING}.clusters.npz in $(pwd)" >&2
+        echo "and out/ beside it. Transcribe it first, or name it on the box:" >&2
+        echo "  ./speakers name '$RAW' $CLUSTER '$NAME' --host <box>" >&2
+        exit 2; }
+      run "$PIPE/identify.py" --clusters "$REMOTE/out/${MEETING}_linked_clusters.npz" \
+          --meeting "$MEETING" --enroll "${CLUSTER}=${NAME}"
+    fi
     echo
     echo "  Re-run transcribe on that meeting to see the name in the transcript,"
     echo "  or just transcribe the next one — they are recognised from now on."
