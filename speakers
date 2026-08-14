@@ -9,6 +9,9 @@
 #   ./speakers rename <id> "New Name"
 #   ./speakers forget <id>                            delete a person + voiceprints
 #
+# Add --host <box> to any of these to work against a remote install; who/play/
+# clips always run here, because they read the transcript and the audio.
+#
 # <meeting> is the safe name printed when you transcribed — the basename with
 # spaces turned into dashes. `./speakers meetings` lists what is available.
 set -euo pipefail
@@ -43,6 +46,32 @@ run() {  # run a command where the pipeline lives
 }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --host, taken from anywhere in the arguments. It only understood MS_HOST
+# before, and even then kept using the LOCAL install path -- so on a laptop with
+# a clone it silently read the laptop's empty profile store instead of the box's.
+# Same fault ./transcribe had: the path this script sits in is not the path the
+# install is at when the install is somewhere else.
+ARGS=()
+for a in "$@"; do
+  case "${_next:-}" in host) HOST="$a"; _next=""; continue ;; esac
+  case "$a" in --host) _next=host ;; *) ARGS+=("$a") ;; esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+if [ -n "$HOST" ] && [ -z "${MS_REMOTE:-}" ] && [ -z "${MS_WORK:-}" ]; then
+  LOCAL=0
+  REMOTE="$(ssh "$HOST" '
+    if [ -s /etc/meetscribe-work ]; then cat /etc/meetscribe-work; exit; fi
+    for d in /opt/meetscribe "$HOME/meetscribe-cli" /workspace/meetscribe-cli \
+             /opt/meetscribe-cli "$HOME/meetscribe"; do
+      [ -x "$d/speakers" ] && { echo "$d"; exit; }
+    done' 2>/dev/null | tail -1)"
+  [ -n "$REMOTE" ] || { echo "cannot find a meetscribe install on $HOST." >&2
+    echo "Run ./setup.sh there, or name it: MS_REMOTE=/path ./speakers ... --host $HOST" >&2
+    exit 2; }
+  PIPE="$REMOTE/pipeline"
+fi
 
 CMD="${1:-list}"; shift || true
 case "$CMD" in

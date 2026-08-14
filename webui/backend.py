@@ -25,7 +25,10 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent                       # the meetscribe-cli checkout
 TRANSCRIBE = ROOT / "transcribe"
 
-AUDIO_EXT = (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".mp4", ".webm")
+# .opus is the default for yt-dlp and for a lot of recorders; leaving it out
+# made a folder of them look empty. All of these are things ffmpeg decodes.
+AUDIO_EXT = (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac",
+             ".m4b", ".aiff", ".wma", ".mp4", ".webm", ".mkv")
 
 
 def _stage(files, into: Path):
