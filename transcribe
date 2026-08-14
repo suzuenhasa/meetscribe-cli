@@ -170,6 +170,26 @@ fi
 # truncated the snippet mid-path and ran a fragment.
 PYQ="$(printf '%q' "$PY")"
 
+# The profile store follows the WORK, not the machine. Without this a --host run
+# identifies against the BOX's profiles, writes its decisions into the box's
+# store, and both die with the instance -- so the one thing meetscribe exists to
+# remember is the one thing a rented GPU cannot keep. Yours goes up before the
+# run and comes back after; the box borrows it for as long as it is working.
+#
+# Local runs already use this file directly, so there is nothing to move.
+DB="${MS_SPEAKER_DB:-$HERE/speakers.db}"
+push_profiles() {
+  [ "$LOCAL" -eq 1 ] && return 0
+  [ -s "$DB" ] || return 0
+  rput "$DB" "$REMOTE/speakers.db"
+}
+pull_profiles() {
+  [ "$LOCAL" -eq 1 ] && return 0
+  # Straight back over yours. The box only ever had a copy of this file, and the
+  # only thing that can have changed on it is what this run just decided.
+  rget "$REMOTE/speakers.db" "$DB"
+}
+
 # A directory means batch: the engine loads once instead of per file (~66s each),
 # and embedding overlaps the next file's transcription.
 if [ -d "$SRC" ]; then
@@ -209,6 +229,7 @@ if [ -d "$SRC" ]; then
   done
   printf '}' >> "$TITLES"
   rput "$TITLES" "$REMOTE/out/_titles.json"; rm -f "$TITLES"
+  push_profiles
   # Do NOT let set -e abort here. batch.py now exits nonzero when any single
   # recording fails, and the rest of the batch has still succeeded -- aborting
   # would throw away every good transcript over one bad file, having already
@@ -235,6 +256,7 @@ if [ -d "$SRC" ]; then
   " || BATCH_RC=$?
 
   rrun "rm -rf '$STAGE'" || true
+  pull_profiles
 
   echo "==> retrieving"
   GOT=0; WANT=0; MISSING=(); SEEN=" "
@@ -296,6 +318,7 @@ rrun "mkdir -p '$REMOTE/inbox' '$REMOTE/out'; supervisorctl stop ray >/dev/null 
 
 [ "$LOCAL" -eq 1 ] || echo "==> uploading $(du -h "$SRC" | cut -f1)"
 rput "$SRC" "$REMOTE/inbox/$SAFE.$EXT"
+push_profiles
 
 echo "==> transcribing"
 # A single recording is where a resident engine matters most: the five steps
@@ -390,6 +413,8 @@ fi
   $PYQ '$PIPE/mktxt.py' '$REMOTE/out/${SAFE}_linked.json' '$REMOTE/out/${SAFE}_raw.json' \
       '$REMOTE/out/${SAFE}.txt' $(printf '%q' "$BASE") '$REMOTE/out/${SAFE}_names.json'
 "
+
+pull_profiles
 
 echo "==> retrieving"
 rget "$REMOTE/out/${SAFE}.txt" "./${BASE}.txt"
