@@ -186,3 +186,25 @@ def find(ref, lib=None):
     low = ref.lower()
     hits = [m for m in ms if low in m.path.name.lower() or low in m.title.lower()]
     return hits[0] if len(hits) == 1 else None
+
+
+# ---------------------------------------------------------------- the CLI
+# So ./speakers can resolve a meeting without reimplementing any of the above in
+# bash. Prints one field per line for whatever it was asked about.
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        for m in all_meetings():
+            print(f"{m.path.name}\t{m.id}\t{m.title}")
+        raise SystemExit(0)
+    m = find(sys.argv[1])
+    if m is None:
+        raise SystemExit(2)
+    what = sys.argv[2] if len(sys.argv) > 2 else "path"
+    print({"path": str(m.path), "id": m.id, "title": m.title,
+           "stem": m.stem,
+           "clusters": str(m.file("clusters", "npz")),
+           "transcript": str(m.file("transcript", "json")),
+           "text": str(m.file("transcript", "txt")),
+           "audio": str(m.audio() or ""),
+           }.get(what, str(m.path)))

@@ -94,6 +94,25 @@ case "$CMD" in
     # accept the transcript path as well as the bare meeting name
     MEETING="$(basename "$MEETING")"; MEETING="${MEETING%.json}"; MEETING="${MEETING%.txt}"
     RAW="$MEETING"
+
+    # Ask library.py, rather than guessing at filenames. It resolves an id, a
+    # folder name, a path, or enough of the title to be unambiguous -- and it
+    # returns the meeting's ID, which is what identify.py keys on now. Naming a
+    # voice therefore survives the folder being renamed or the meeting being
+    # re-run with --replace.
+    MDIR="$(MS_WORK="$REMOTE" "$PY" "$PIPE/library.py" "$RAW" path 2>/dev/null)" || MDIR=""
+    if [ -n "$MDIR" ]; then
+      MID="$(MS_WORK="$REMOTE" "$PY" "$PIPE/library.py" "$RAW" id)"
+      CL="$(MS_WORK="$REMOTE" "$PY" "$PIPE/library.py" "$RAW" clusters)"
+      [ -f "$CL" ] || { echo "no clusters in $MDIR — transcribe it first." >&2; exit 2; }
+      run "$PIPE/identify.py" --clusters "$CL" --meeting "$MID" \
+          --enroll "${CLUSTER}=${NAME}"
+      echo
+      echo "  Re-run transcribe on that meeting to see the name in the transcript,"
+      echo "  or just transcribe the next one — they are recognised from now on."
+      exit 0
+    fi
+
     MEETING="$(echo "$MEETING" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
 
     # HERE first. ./transcribe brings the clusters file back with the transcript,
