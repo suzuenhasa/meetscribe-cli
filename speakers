@@ -7,6 +7,9 @@
 #   ./speakers play <meeting> G02 [n]                 HEAR that voice
 #   ./speakers list                                   who is on file
 #   ./speakers name <meeting> <cluster> "Bob Smith"   remember this voice
+#   ./speakers apply [--apply]                        re-label meetings you
+#                                                     already have with what
+#                                                     the store now knows
 #
 #   ./speakers rename <id> "New Name"
 #   ./speakers forget <id>                            delete a person + voiceprints
@@ -96,6 +99,13 @@ case "$CMD" in
     ;;
   list)
     run "$PIPE/speakers.py" list
+    ;;
+  apply|relabel)
+    # A voice named once should be recognised everywhere, INCLUDING backwards.
+    # identify.py runs when a recording is processed, against whoever was
+    # enrolled then, so naming someone afterwards left every meeting they were
+    # already in still calling them Speaker 3.
+    run "$PIPE/relabel.py" "$@"
     ;;
   meetings)
     # From the library, via library.py, so this cannot drift from the naming
