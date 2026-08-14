@@ -190,6 +190,29 @@ def reap_orphans():
         time.sleep(3)       # let the driver actually hand the memory back
 
 
+def code_stamp():
+    """Newest mtime among the modules the daemon holds in memory.
+
+    A daemon imports batch, transcribe_meeting and postproc ONCE, at startup, and
+    keeps them for its lifetime. Editing those files afterwards changes nothing
+    until it restarts -- the running engine goes on executing the code it loaded.
+    That is the correct behaviour for a long-lived process and a genuinely
+    confusing one to debug: a fix is deployed, the file on disk contains it, and
+    the run behaves as though it does not. It cost a full round of "why did my
+    change do nothing" here.
+
+    So record what was loaded and let anyone ask. Not a reload -- swapping code
+    under a running queue is worse than the confusion it would save."""
+    newest = 0.0
+    d = Path(__file__).resolve().parent
+    for f in list(d.glob("*.py")) + list((d / "link").glob("*.py")):
+        try:
+            newest = max(newest, f.stat().st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
 def serve(sock_path, window, overlap, gpu_frac):
     reap_orphans()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -264,6 +287,7 @@ def serve(sock_path, window, overlap, gpu_frac):
     signal.signal(signal.SIGINT, _bye)
 
     parser = batch.build_parser()
+    loaded_at, started = code_stamp(), time.time()
 
     def handle(conn):
         """Serve one connection. Returns True if the engine must shut down."""
@@ -277,6 +301,10 @@ def serve(sock_path, window, overlap, gpu_frac):
             try:
                 req = json.loads(line)
             except ValueError:
+                return False
+
+            if req.get("cmd") == "stamp":
+                send(f, {"stamp": loaded_at, "started": started})
                 return False
 
             if req.get("cmd") == "release":
@@ -429,8 +457,26 @@ def main():
         # next connection until the current one is done. Status claiming the
         # engine is down while it is busy transcribing is worse than useless:
         # ./engine start reads it, and would have started a second engine.
+        # Ask what code it is holding. A daemon imports batch, transcribe_meeting
+        # and postproc once at startup and keeps them, so an edit since then is
+        # on disk and NOT in the running engine -- which looks exactly like the
+        # edit having no effect.
+        stale = None
+        try:
+            f = s.makefile("rwb")
+            send(f, {"cmd": "stamp"})
+            m = json.loads(f.readline() or "{}")
+            if m.get("stamp") and code_stamp() > m["stamp"] + 1:
+                stale = code_stamp() - m["stamp"]
+        except Exception:
+            pass
         s.close()
         print(f"resident engine up at {sock_path}")
+        if stale:
+            print(f"!! it is running code from before your last edit "
+                  f"({stale/60:.0f} min older than pipeline/ on disk).")
+            print(f"   restart it to pick that up:  engine restart")
+            return 2
         return 0
 
     if a.release:

@@ -57,7 +57,13 @@ provisioning_guard() {
 # status stays answerable while provisioning: it is how you check.
 case "${1:-status}" in start|restart) provisioning_guard "$WORK" ;; esac
 
-alive()   { "$PY" "$HERE/pipeline/engined.py" --status --sock "$SOCK" >/dev/null 2>&1; }
+# 0 = up, 2 = up but holding code older than pipeline/ on disk. BOTH are up.
+# Treating 2 as dead would have `start` launch a second engine onto a card that
+# already has one, which is the worst outcome available here.
+alive() {
+  "$PY" "$HERE/pipeline/engined.py" --status --sock "$SOCK" >/dev/null 2>&1
+  case "$?" in 0|2) return 0 ;; *) return 1 ;; esac
+}
 # Is a daemon there, INCLUDING one that is still loading? alive() cannot tell:
 # the socket it tests for is bound at the very end of build_engine, so for the
 # 70-400s of a load a starting engine looks exactly like no engine. Starting a
@@ -138,7 +144,15 @@ case "${1:-status}" in
     fi ;;
   restart) "$0" stop; "$0" start ;;
   status)
-    if alive; then echo "running — $SOCK"; else echo "not running"; exit 1; fi ;;
+    # rc 2 from --status means "up, but holding code older than pipeline/ on
+    # disk" -- it prints why. Not a failure: the engine works, it is just not
+    # the engine you think you deployed.
+    OUT="$("$PY" "$HERE/pipeline/engined.py" --status --sock "$SOCK" 2>&1)"; RC=$?
+    case "$RC" in
+      0) echo "running — $SOCK" ;;
+      2) echo "running — $SOCK"; echo "$OUT" | tail -n +2 ;;
+      *) echo "not running"; exit 1 ;;
+    esac ;;
   log) tail -n "${2:-40}" "$LOG" ;;
   -h|--help) sed -n '2,22p' "$0" ;;
   *) echo "usage: $0 {start|stop|restart|status|log}" >&2; exit 2 ;;

@@ -2,8 +2,13 @@
 # Provision meetscribe on a vast.ai instance.
 #
 # PASTE THIS WHOLE FILE into a vast template's "On-start Script" and set nothing
-# else. Pin a version by editing MS_REF's default below to a full 40-character
-# commit sha; left as `main` it installs whatever main happens to be.
+# else.
+#
+# It tracks main. To pin a version instead, put a FULL 40-character commit sha in
+# MS_REF below -- worth doing when you need a box launched today to match one
+# from last month, or when someone other than you can push to the repo. Otherwise
+# a pin is a liability: it goes stale silently, and a sha that a history rewrite
+# removed fails the clone outright.
 #
 # (It also works as a PROVISIONING_SCRIPT url, which is worth using if you want
 # several templates sharing one script -- see vast/README.md. Then On-start is
@@ -22,7 +27,7 @@ set -euo pipefail
 
 MS_WORK="${MS_WORK:-/opt/meetscribe}"
 MS_REPO="${MS_REPO:-https://github.com/suzuenhasa/meetscribe-cli.git}"
-MS_REF="${MS_REF:-87596bb6a5389070e87484d8f0e9a0eae3175ed7}"
+MS_REF="${MS_REF:-main}"
 # NOT /workspace: vast documents it as possibly shared between instances with
 # concurrent writers, and speakers.db is the one file here that cannot be
 # rebuilt from the audio.
