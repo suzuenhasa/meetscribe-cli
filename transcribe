@@ -3,6 +3,7 @@
 #
 #   ./transcribe "Product Marketing Meeting.mp3"
 #   ./transcribe ~/recordings/              a whole folder — engine loads ONCE
+#   ./transcribe ~/recordings/ --out ~/done  results somewhere other than out/
 #   ./transcribe podcast.mp3 --overlap 0     # disable window context (default 5s)
 #   ./transcribe ~/recordings/ --gpu-frac 0.80   # override the derived VRAM split
 #   ./transcribe podcast.mp3 --glossary "Sreeram Kannan,EigenCloud,EigenDA"
@@ -78,6 +79,7 @@ OVERLAP="5"
 GPUFRAC=""
 SRC=""
 GLOSSARY=""
+OUTDIR=""
 
 rrun() {   # execute a shell snippet where the pipeline lives
   if [ "$LOCAL" -eq 1 ]; then bash -c "$1"
@@ -107,6 +109,7 @@ while [ $# -gt 0 ]; do
     --overlap) OVERLAP="$2"; shift 2 ;;
     --gpu-frac) GPUFRAC="$2"; shift 2 ;;
     --host)   HOST="$2"; shift 2 ;;
+    --out)    OUTDIR="$2"; shift 2 ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *)        SRC="$1"; shift ;;
   esac
@@ -190,6 +193,21 @@ pull_profiles() {
   rget "$REMOTE/speakers.db" "$DB"
 }
 
+# Where the results go: out/ BESIDE the audio, not wherever you happened to be
+# standing. Transcribing a folder used to scatter a .txt, a .json, an .emb.npz
+# and a .clusters.npz per recording into the current directory -- four files
+# times however many meetings, mixed in with whatever else was there, and a
+# different place each time depending on where you ran it from. Beside the audio
+# they stay with the thing they describe. --out puts them somewhere else.
+if [ -n "$OUTDIR" ]; then
+  DEST="$OUTDIR"
+elif [ -d "$SRC" ]; then
+  DEST="$SRC/out"
+else
+  DEST="$(cd "$(dirname "$SRC")" && pwd)/out"
+fi
+mkdir -p "$DEST" || { echo "cannot write to $DEST" >&2; exit 2; }
+
 # A directory means batch: the engine loads once instead of per file (~66s each),
 # and embedding overlaps the next file's transcription.
 if [ -d "$SRC" ]; then
@@ -272,26 +290,26 @@ if [ -d "$SRC" ]; then
     # absent file cannot abort the loop -- which means it leaves whatever was
     # already here, and a transcript from an EARLIER run would be counted as
     # delivered by this one, hiding exactly the omission this check exists for.
-    rm -f "./${b}.txt" "./${b}.json"
-    rget "$REMOTE/out/${sf}.txt" "./${b}.txt"
-    rget "$REMOTE/out/${sf}_linked.json" "./${b}.json"
+    rm -f "$DEST/${b}.txt" "$DEST/${b}.json"
+    rget "$REMOTE/out/${sf}.txt" "$DEST/${b}.txt"
+    rget "$REMOTE/out/${sf}_linked.json" "$DEST/${b}.json"
     # The per-segment embeddings, without which a transcript can be read but no
     # voice in it can ever be named -- the UI needs them beside the .json to
     # enrol anyone, and they are a couple of hundred KB. Not part of the
     # completeness check below: a missing one costs identification, not the
     # transcript, so it must not fail the run.
-    rget "$REMOTE/out/${sf}_emb.npz" "./${b}.emb.npz"
+    rget "$REMOTE/out/${sf}_emb.npz" "$DEST/${b}.emb.npz"
     # What naming a voice needs. Without it ./speakers name can only run against
     # the box, so enrolling depended on an instance still existing -- and the
     # profiles you built there died with it.
-    rget "$REMOTE/out/${sf}_linked_clusters.npz" "./${b}.clusters.npz"
-    if [ -s "./${b}.txt" ] && [ -s "./${b}.json" ]; then
+    rget "$REMOTE/out/${sf}_linked_clusters.npz" "$DEST/${b}.clusters.npz"
+    if [ -s "$DEST/${b}.txt" ] && [ -s "$DEST/${b}.json" ]; then
       GOT=$((GOT + 1))
     else
       MISSING+=("$b")
     fi
   done
-  echo "    $GOT of $WANT transcripts in $(pwd)"
+  echo "    $GOT of $WANT transcripts in $DEST"
   if [ "${#MISSING[@]}" -gt 0 ]; then
     echo "    !! no transcript for: ${MISSING[*]}" >&2
     [ "$BATCH_RC" -eq 0 ] && BATCH_RC=1
@@ -417,11 +435,11 @@ fi
 pull_profiles
 
 echo "==> retrieving"
-rget "$REMOTE/out/${SAFE}.txt" "./${BASE}.txt"
-rget "$REMOTE/out/${SAFE}_linked.json" "./${BASE}.json"
+rget "$REMOTE/out/${SAFE}.txt" "$DEST/${BASE}.txt"
+rget "$REMOTE/out/${SAFE}_linked.json" "$DEST/${BASE}.json"
 # Same as the batch path: without the embeddings a transcript can be read but no
 # voice in it can ever be named.
-rget "$REMOTE/out/${SAFE}_emb.npz" "./${BASE}.emb.npz"
-rget "$REMOTE/out/${SAFE}_linked_clusters.npz" "./${BASE}.clusters.npz"
-echo "    $(pwd)/${BASE}.txt"
-echo "    $(pwd)/${BASE}.json"
+rget "$REMOTE/out/${SAFE}_emb.npz" "$DEST/${BASE}.emb.npz"
+rget "$REMOTE/out/${SAFE}_linked_clusters.npz" "$DEST/${BASE}.clusters.npz"
+echo "    $DEST/${BASE}.txt"
+echo "    $DEST/${BASE}.json"

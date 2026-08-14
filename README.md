@@ -113,7 +113,8 @@ assumption, not a limitation.
 ./transcribe "weekly sync.mp3"          one file
 ```
 
-Writes a `.txt` and a `.json` into the directory you run from. `wav mp3 m4a flac
+Writes a `.txt`, a `.json`, an `.emb.npz` and a `.clusters.npz` per recording
+into an `out/` beside the audio — `--out <dir>` to put them elsewhere. `wav mp3 m4a flac
 ogg opus aac m4b aiff wma mp4 webm mkv`, any sample rate — anything not already
 16 kHz mono is converted first, in parallel, which is most of the speed above.
 
@@ -189,6 +190,7 @@ Back it up.
 | `--thr` | `auto` | speaker-clustering cut |
 | `--gpu-frac` | auto | VRAM vLLM reserves |
 | `--host` | — | run the GPU work on a remote box over ssh |
+| `--out` | `out/` beside the audio | where results go |
 
 The defaults are measured, not guessed. `--window` longer is slower *and* no more
 accurate. `--thr` used to be a constant and a wrong value silently merged every
