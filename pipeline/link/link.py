@@ -159,6 +159,10 @@ def main():
     ap.add_argument("--npz", required=True)
     ap.add_argument("--ref", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--clusters-out", default=None,
+                    help="where the per-speaker centroids go. Defaults beside "
+                         "--out, which is what the flat layout relied on; the "
+                         "library names it <slug>-clusters.npz instead.")
     ap.add_argument("--thr", default="auto",
                     help="cosine cut, or 'auto' to self-calibrate per meeting "
                          "(constrained AHC + max merge-gap; see cluster_speakers.py)")
@@ -221,7 +225,7 @@ def main():
         json.dump(R, open(args.out, "w"))
         print(f"WROTE {args.out}")
         cs = np.array([secs[lab == c].sum() for c in range(k)])
-        np.savez(args.out.replace(".json", "_clusters.npz"),
+        np.savez(args.clusters_out or args.out.replace(".json", "_clusters.npz"),
                  centroid=Cf.astype(np.float32),
                  cluster=np.array([f"G{c:02d}" for c in range(k)]),
                  secs=cs.astype(np.float32), meeting=np.array(name))

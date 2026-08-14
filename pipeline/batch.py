@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import transcribe_meeting as TM
+import library as LIB
 import postproc
 from moss_transcribe_diarize.inference_utils import load_audio_item
 
@@ -179,7 +180,14 @@ def post_workers():
 
 
 def to_16k_mono(files, scratch):
-    """Decode everything that is not already 16 kHz mono, in parallel. -> [Path]
+    """Decode everything that is not already 16 kHz mono, in parallel.
+
+    -> ([Path to feed the model], {that path: the original it came from})
+
+    The mapping matters: the converted wav is a decode CACHE, 8x the size of the
+    source and reproducible from it in seconds, so it is what the model reads and
+    the original is what the library keeps. Losing track of which was which
+    parked a 73 MB wav beside the transcript and left the mp3 where it was.
 
     The model wants 16 kHz mono, so anything else is decoded and resampled
     before it sees it. That work has to happen; the question is where. Doing it
@@ -209,7 +217,7 @@ def to_16k_mono(files, scratch):
 
     todo = [f for f in files if not already_ok(f)]
     if not todo:
-        return list(files)
+        return list(files), {}
     scratch.mkdir(parents=True, exist_ok=True)
     print(f"converting {len(todo)} file(s) to 16 kHz mono, {min(8, len(todo))} at a time",
           flush=True)
@@ -234,13 +242,25 @@ def to_16k_mono(files, scratch):
         for src, dst in pool.map(one, todo):
             swap[src] = dst
     print(f"  converted in {time.time()-t0:.1f}s", flush=True)
-    return [swap.get(f, f) for f in files]
+    out = [swap.get(f, f) for f in files]
+    return out, {swap[k]: k for k in swap if swap[k] != k}
 
 
 def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("audio", nargs="+")
-    ap.add_argument("--out-dir", default=f"{WORK}/out")
+    ap.add_argument("--out-dir", default=f"{WORK}/out",
+                    help="scratch for intermediates")
+    ap.add_argument("--library", default=None,
+                    help="where finished meetings are kept, one directory each: "
+                         "library/<slug>-<id>/")
+    ap.add_argument("--move-audio", action="store_true",
+                    help="move the source into the meeting directory rather "
+                         "than copying it. What the inbox does, since a worklist "
+                         "should empty as work completes.")
+    ap.add_argument("--replace", default=None,
+                    help="overwrite this meeting id in place rather than making "
+                         "a new one, so everything decided about it survives")
     ap.add_argument("--window", type=float, default=30.0)
     ap.add_argument("--overlap", type=float, default=5.0)
     ap.add_argument("--glossary", default="")
@@ -327,10 +347,10 @@ def run_job(a, resident=None):
     # Before anything touches the GPU. Names are keyed off the stem, which the
     # conversion preserves, so nothing downstream can tell the difference except
     # by being faster.
-    scratch = None
+    scratch, origin = None, {}
     if not a.no_convert:
         scratch = out / "_wav"
-        files = to_16k_mono(files, scratch)
+        files, origin = to_16k_mono(files, scratch)
 
     t_start = time.time()
     ptxt = TM.build_prompt(a.glossary)
@@ -413,6 +433,8 @@ def run_job(a, resident=None):
     # would accumulate them without limit.
     max_pooled_samples = int(4 * 3600 * TM.SR)
 
+    libdir = Path(a.library) if a.library else LIB.library_dir(WORK)
+    meetings = {}          # folder name -> Meeting
     inflight = {}          # name -> per-file state awaiting its windows
     pool = []              # (name, window_index, request)
     pooled_samples = 0
@@ -423,7 +445,7 @@ def run_job(a, resident=None):
         st = inflight.pop(name)
         f, wav, dur = st["f"], st["wav"], st["dur"]
         segs, cov, _ = TM.assemble(st["outs"], st["offsets"], st["cores"], wav, dur)
-        raw = out / f"{name}_raw.json"
+        raw = meetings[name].file("raw", "json")
         json.dump({"audio": str(f), "duration_s": round(dur, 2), "window_s": a.window,
                    "n_windows": len(st["outs"]), "coverage": round(cov, 4),
                    "segments": segs}, open(raw, "w"))
@@ -439,7 +461,7 @@ def run_job(a, resident=None):
         # Queue the embedding and move straight on. Never silence the worker: an
         # early version sent stderr to DEVNULL and every embed failed invisibly,
         # leaving a "successful" run with no vectors.
-        npz = out / f"{name}_emb.npz"
+        npz = meetings[name].file("embeddings", "npz")
         if deferred:
             queued.append((raw, f, npz))
         else:
@@ -447,6 +469,9 @@ def run_job(a, resident=None):
                 print(f"\n!! embedding worker died — see {out}/_embed.log", flush=True)
             if a.no_overlap_embed:
                 emb.wait_for(npz)
+        meetings[name].write(duration_s=round(dur, 2), n_segments=len(segs),
+                             coverage=round(cov, 4), window_s=a.window,
+                             overlap_s=a.overlap, transcribed_at=time.time())
         pending.append((name, f))
         print(f"  {f.name[:44]:44} {dur/60:5.1f} min  {len(st['outs']):4d} win  "
               f"{len(segs):4d} segs  coverage {cov:.0%}", flush=True)
@@ -465,23 +490,24 @@ def run_job(a, resident=None):
             pooled_samples -= len(inflight[name]["wav"])
             finish(name)
 
-    used = {}
     for f in files:
-        name = safe(f.stem)
-        # Two inputs can sanitise to ONE name -- "A Guide.wav" and "A-Guide.wav"
-        # both become A-Guide -- and every artifact below is keyed by it. Left
-        # alone they share a _raw.json and a _emb.npz and overwrite each other
-        # mid-run, so link.py reads a transcript beside embeddings from a
-        # different recording and dies indexing off the end of the shorter one.
-        # It looks like a clustering bug and is a name collision.
-        if name in used:
-            used[name] += 1
-            name = f"{name}-{used[name]}"
-            print(f"  !! {f.name[:40]} collides with {used['__last__']} once "
-                  f"sanitised — writing it as {name}", flush=True)
+        # A directory per meeting, made before anything is decoded, so a meeting
+        # has an identity from the moment it exists rather than acquiring one if
+        # it happens to succeed.
+        #
+        # This is also what ends the name-collision class of bug structurally
+        # instead of by suffixing: the folder is unique by construction, and the
+        # files inside only have to be unique WITHIN it. "A Guide.wav" and
+        # "A-Guide.wav" get two directories and cannot reach each other.
+        if a.replace:
+            m = LIB.find(a.replace, lib=libdir)
+            if m is None:
+                raise SystemExit(f"no meeting {a.replace!r} in {libdir}")
         else:
-            used[name] = 0
-        used['__last__'] = f.name
+            src = origin.get(f, f)
+            m = LIB.create(titles.get(safe(src.stem), src.stem), src.name, lib=libdir)
+        name = m.path.name
+        meetings[name] = m
         try:
             wav = load_audio_item(str(f), sampling_rate=TM.SR)
             reqs, offsets, cores = TM.plan_windows(wav, ptxt, a.window, a.overlap)
@@ -542,14 +568,14 @@ def run_job(a, resident=None):
         acks = embed_all(queued, "releasing the engine before embedding")
     elif emb is held:
         # Wait for this run's work, and leave the worker up for the next one.
-        acks = emb.drain(out / f"{n}_emb.npz" for n, _ in pending)
+        acks = emb.drain(meetings[n].file("embeddings", "npz") for n, _ in pending)
     else:
         acks = emb.close()
 
     def missing(names_and_files):
         return [(n, f) for n, f in names_and_files
-                if not acks.get(str(out / f"{n}_emb.npz"), {}).get("ok")
-                or not (out / f"{n}_emb.npz").exists()]
+                if not acks.get(str(meetings[n].file("embeddings", "npz")), {}).get("ok")
+                or not meetings[n].file("embeddings", "npz").exists()]
 
     # RECOVERY. Neither predicting the split nor measuring free VRAM after load
     # is sufficient: the engine's footprint grows once requests actually flow, so
@@ -560,7 +586,8 @@ def run_job(a, resident=None):
     # costs one retry instead of the run.
     lost = missing(pending)
     if lost and not deferred:
-        again = [(out / f"{n}_raw.json", f, out / f"{n}_emb.npz") for n, f in lost]
+        again = [(meetings[n].file("raw", "json"), f,
+                  meetings[n].file("embeddings", "npz")) for n, f in lost]
         if release_engine():
             acks.update(embed_all(
                 again, f"embedding did not fit alongside the engine for "
@@ -597,19 +624,27 @@ def run_job(a, resident=None):
     # spawn, not fork: this process holds a CUDA context and forking one is
     # unsafe. spawn also gives each worker the clean import we want anyway.
     def argv_link(name):
-        return [f"{PIPE}/link/link.py", "--run", str(out / f"{name}_raw.json"),
-                "--npz", str(out / f"{name}_emb.npz"), "--thr", a.thr,
-                "--out", str(out / f"{name}_linked.json")]
+        m = meetings[name]
+        return [f"{PIPE}/link/link.py", "--run", str(m.file("raw", "json")),
+                "--npz", str(m.file("embeddings", "npz")), "--thr", a.thr,
+                "--out", str(m.file("transcript", "json")),
+                "--clusters-out", str(m.file("clusters", "npz"))]
 
     def argv_identify(name):
-        return [f"{PIPE}/identify.py", "--clusters", str(out / f"{name}_linked_clusters.npz"),
-                "--meeting", name, "--roster", a.roster,
-                "--names", str(out / f"{name}_names.json")]
+        m = meetings[name]
+        # --meeting is the ID, not the filename. That is what lets a folder be
+        # renamed, or a meeting re-run with --replace, without orphaning every
+        # decision ever recorded about it.
+        return [f"{PIPE}/identify.py",
+                "--clusters", str(m.file("clusters", "npz")),
+                "--meeting", m.id, "--roster", a.roster,
+                "--names", str(m.file("names", "json"))]
 
     def argv_render(name, f):
-        return [f"{PIPE}/mktxt.py", str(out / f"{name}_linked.json"),
-                str(out / f"{name}_raw.json"), str(out / f"{name}.txt"),
-                titles.get(name, f.stem), str(out / f"{name}_names.json")]
+        m = meetings[name]
+        return [f"{PIPE}/mktxt.py", str(m.file("transcript", "json")),
+                str(m.file("raw", "json")), str(m.file("transcript", "txt")),
+                m.title, str(m.file("names", "json"))]
 
     os.environ["MS_WORK"] = WORK
     rc_link, rc_render = {}, {}
@@ -674,7 +709,8 @@ def run_job(a, resident=None):
         if bad is None:
             # Every step claimed success; confirm it actually left the artifacts
             # behind, since a step can exit 0 and still write nothing.
-            gone = [p.name for p in (out / f"{name}_linked.json", out / f"{name}.txt")
+            gone = [p.name for p in (meetings[name].file("transcript", "json"),
+                                     meetings[name].file("transcript", "txt"))
                     if not p.exists() or p.stat().st_size == 0]
             if gone:
                 bad = f"{name} (missing {', '.join(gone)})"
@@ -682,6 +718,27 @@ def run_job(a, resident=None):
             broken.append(bad)
             broken_names.add(name)
         print(flush=True)
+
+    # The source audio belongs with everything derived from it. Moved when it
+    # came from the inbox -- a worklist empties as work completes -- and copied
+    # when it came from a path the caller nominated, because emptying someone's
+    # directory unasked is not ours to do.
+    for name, f in pending:
+        if name in broken_names:
+            continue
+        m = meetings[name]
+        if m.audio() is not None:
+            continue
+        src = origin.get(f, f)          # the original, never the decode cache
+        dest = m.path / f"{m.stem}-audio{src.suffix.lower()}"
+        try:
+            if a.move_audio:
+                shutil.move(str(src), dest)
+            else:
+                shutil.copy2(src, dest)
+        except OSError as e:
+            print(f"  !! could not put {f.name[:40]} beside its transcript "
+                  f"({type(e).__name__}) — it is still at {f}", flush=True)
 
     if scratch is not None and scratch.is_dir():
         # These are a decode cache, not an artifact -- 8x the size of the source
@@ -694,7 +751,7 @@ def run_job(a, resident=None):
     # headline still counts meetings whose transcript does not exist -- the
     # exact "122 embeddings, 121 texts" miscount this set out to remove.
     done = [n for n, _ in pending if n not in failed and n not in broken_names]
-    mins = sum(json.load(open(out / f"{n}_raw.json"))["duration_s"]
+    mins = sum(json.load(open(meetings[n].file("raw", "json")))["duration_s"]
                for n in done) / 60
     print(f"{len(done)} meetings, {mins:.0f} min of audio")
     print(f"  startup          {startup:6.1f}s  (once, not per meeting)")
