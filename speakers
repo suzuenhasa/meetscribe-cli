@@ -2,18 +2,21 @@
 # Manage the voice profile store. A voice named once is recognised in every
 # later meeting, so this is where naming happens.
 #
-#   ./speakers who <transcript.json>                  the voices, and what they said
-#   ./speakers play <transcript.json> G02 [n]         HEAR that voice
+#   ./speakers meetings                               what is in the library
+#   ./speakers who <meeting>                          the voices, and what they said
+#   ./speakers play <meeting> G02 [n]                 HEAR that voice
 #   ./speakers list                                   who is on file
 #   ./speakers name <meeting> <cluster> "Bob Smith"   remember this voice
+#
 #   ./speakers rename <id> "New Name"
 #   ./speakers forget <id>                            delete a person + voiceprints
+#
+# <meeting> is anything that identifies one: its id, its folder, a path to it,
+# or enough of the title to be unambiguous. `./speakers meetings` lists them.
 #
 # Add --host <box> to any of these to work against a remote install; who/play/
 # clips always run here, because they read the transcript and the audio.
 #
-# <meeting> is the safe name printed when you transcribed — the basename with
-# spaces turned into dashes. `./speakers meetings` lists what is available.
 set -euo pipefail
 
 # No default: a remote box only exists if you name one, via --host or MS_HOST.
@@ -73,20 +76,36 @@ if [ -n "$HOST" ] && [ -z "${MS_REMOTE:-}" ] && [ -z "${MS_WORK:-}" ]; then
   PIPE="$REMOTE/pipeline"
 fi
 
+# The interpreter that owns the dependencies, resolved once. It was local to
+# run() and the library lookups below need it as well.
+PY="$(. "$HERE/env.sh" 2>/dev/null; echo "${MS_PY:-python3}")"
+
 CMD="${1:-list}"; shift || true
 case "$CMD" in
   who|play|clips)
-    # These read the transcript and the audio, both of which live HERE, not on
-    # the box. You cannot name a voice you have not heard.
-    python3 "$HERE/preview.py" "$CMD" "$@"
+    # These read the transcript and the clips, both of which live HERE in the
+    # library, not on the box. You cannot name a voice you have not heard.
+    #
+    # Take a meeting reference as well as a path: after the restructure the
+    # transcript is at library/<slug>-<id>/<slug>-transcript.json, which is not
+    # something anyone should have to type.
+    REF="${1:-}"; shift || true
+    T="$(MS_WORK="$HERE" "$PY" "$HERE/pipeline/library.py" "$REF" transcript 2>/dev/null)" || T=""
+    [ -n "$T" ] && [ -f "$T" ] || T="$REF"
+    python3 "$HERE/preview.py" "$CMD" "$T" "$@"
     ;;
   list)
     run "$PIPE/speakers.py" list
     ;;
   meetings)
-    if [ "$LOCAL" -eq 1 ]; then ls -1 "$REMOTE"/out/*_linked_clusters.npz 2>/dev/null
-    else ssh "$HOST" "ls -1 '$REMOTE'/out/*_linked_clusters.npz 2>/dev/null"; fi \
-      | sed 's#.*/##; s/_linked_clusters\.npz$//' | sed 's/^/  /'
+    # From the library, via library.py, so this cannot drift from the naming
+    # rules the way listing files in out/ did.
+    printf "  %-46s %-7s %s\n" "FOLDER" "ID" "TITLE"
+    if [ "$LOCAL" -eq 1 ]; then
+      MS_WORK="$REMOTE" "$PY" "$PIPE/library.py"
+    else
+      ssh "$HOST" "MS_WORK='$REMOTE' \"\$(. '$REMOTE/env.sh' 2>/dev/null; echo \"\${MS_PY:-python3}\")\" '$PIPE/library.py'"
+    fi | awk -F'\t' '{printf "  %-46s %-7s %s\n", $1, $2, $3}'
     ;;
   name)
     [ $# -ge 3 ] || { echo 'usage: ./speakers name <meeting> <cluster> "Full Name"' >&2; exit 2; }

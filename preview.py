@@ -42,11 +42,22 @@ def audio_for(js: Path, doc):
     "NOT FOUND beside the transcript" is a true statement about a file sitting
     one directory away, and it takes play and clips with it.
     """
+    # The library names it <slug>-audio.<ext> beside <slug>-transcript.json, so
+    # deriving the audio from the transcript's own stem finds nothing -- it looks
+    # for <slug>-transcript.mp3. Try the library form first, then the old
+    # side-by-side one, then a directory up for a transcript kept apart from its
+    # recording.
+    stem = js.stem
+    for suffix in ("-transcript", "-linked", ""):
+        if stem.endswith(suffix) and suffix:
+            stem = stem[: -len(suffix)]
+            break
     for d in (js.parent, js.parent.parent):
-        for ext in AUDIO_EXT:
-            c = d / (js.stem + ext)
-            if c.exists():
-                return c
+        for base in (f"{stem}-audio", stem, js.stem):
+            for ext in AUDIO_EXT:
+                c = d / (base + ext)
+                if c.exists():
+                    return c
     rec = doc.get("audio")
     if rec:
         rec = Path(rec)
