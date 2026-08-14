@@ -391,8 +391,23 @@ def run_job(a, resident=None):
             pooled_samples -= len(inflight[name]["wav"])
             finish(name)
 
+    used = {}
     for f in files:
         name = safe(f.stem)
+        # Two inputs can sanitise to ONE name -- "A Guide.wav" and "A-Guide.wav"
+        # both become A-Guide -- and every artifact below is keyed by it. Left
+        # alone they share a _raw.json and a _emb.npz and overwrite each other
+        # mid-run, so link.py reads a transcript beside embeddings from a
+        # different recording and dies indexing off the end of the shorter one.
+        # It looks like a clustering bug and is a name collision.
+        if name in used:
+            used[name] += 1
+            name = f"{name}-{used[name]}"
+            print(f"  !! {f.name[:40]} collides with {used['__last__']} once "
+                  f"sanitised — writing it as {name}", flush=True)
+        else:
+            used[name] = 0
+        used['__last__'] = f.name
         try:
             wav = load_audio_item(str(f), sampling_rate=TM.SR)
             reqs, offsets, cores = TM.plan_windows(wav, ptxt, a.window, a.overlap)
