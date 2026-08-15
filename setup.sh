@@ -93,8 +93,8 @@ CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | hea
 # vLLM's wheels target sm_70 and up. A GTX 1080 is sm_6.1 and fails deep inside
 # vLLM with nothing that names the real cause, so say it plainly here instead.
 if [ -n "$CAP" ] && [ "${CAP%%.*}" -lt 7 ] 2>/dev/null; then
-  die "compute capability $CAP is too old. vLLM needs 7.0+ — Turing, GTX 16-series,
-       RTX 20-series or newer. Pascal cards such as the GTX 1080 cannot run this."
+  die "compute capability $CAP is too old. vLLM needs 7.0+ — RTX 20-series or
+       newer. Pascal cards such as the GTX 1080 cannot run this."
 fi
 # The split between vLLM and the concurrent embedder is derived from the card at
 # run time now, so there is nothing to pass by hand. Below ~7.5 GiB the embedder

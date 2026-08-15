@@ -160,7 +160,7 @@ on the result — across recordings and across months.
 
 | | |
 |:---|:---|
-| **GPU** | NVIDIA, 6 GB+ VRAM, compute capability 7.0+ (Turing / GTX 16-series / RTX 20-series and newer). Pascal will not run vLLM. |
+| **GPU** | NVIDIA, 6 GB+ VRAM, RTX 20-series or newer. Pascal will not run vLLM. The GTX 16-series meets the compute requirement but has no tensor cores and is untested. |
 | **System** | FHS-style Linux. On NixOS/non-FHS distros, bring your own Python and set library paths for NVIDIA driver, GCC runtime, zlib, plus `TRITON_LIBCUDA_PATH`. |
 | **Tools** | `ffmpeg` |
 
