@@ -24,7 +24,7 @@ Platform Review — weekly
 
 ## Contents
 
-[Quickstart](#quickstart) · [Speed](#speed) · [Remote GPU](#remote-gpu) ·
+[Quickstart](#quickstart) · [Speed](#speed) · [Remote GPU](#remote-gpu--optional) ·
 [How it works](#how-it-works) · [Requirements](#requirements) ·
 [Layout](#layout)
 
@@ -85,7 +85,10 @@ on a new machine is ~3× slower while `torch.compile` warms up.*
 
 ---
 
-## Remote GPU
+## Remote GPU — optional
+
+Everything above runs on your own card. This is for when you have not got one,
+or want a faster one for a big batch. Skip the whole section if neither applies.
 
 `--host` runs the GPU work on another machine. Your **library** is the thing
 that stays local — transcripts, clips and `speakers.db` live here and are the

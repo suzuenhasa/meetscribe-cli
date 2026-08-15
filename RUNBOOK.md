@@ -6,7 +6,7 @@ Every command, what it does, and when you would reach for it.
 - [Transcribing](#transcribing)
 - [Naming voices](#naming-voices)
 - [The resident engine](#the-resident-engine)
-- [Working on a rented GPU](#working-on-a-rented-gpu)
+- [Working on a rented GPU](#working-on-a-rented-gpu--optional)
 - [The library on disk](#the-library-on-disk)
 - [Maintenance](#maintenance)
 - [Environment](#environment)
@@ -167,7 +167,10 @@ so when the files on disk are newer.
 
 ---
 
-## Working on a rented GPU
+## Working on a rented GPU — optional
+
+Nothing needs this. It is for machines without a usable card, or for borrowing a
+faster one when a queue is worth the setup.
 
 `--host` means one thing: where the compute happens. The **library** is what
 stays yours — transcripts, clips and `speakers.db` live here and are the
