@@ -456,11 +456,25 @@ def run_job(a, resident=None):
     # most of that gap. Windows are independent, so there is nothing to preserve
     # by keeping them apart.
     #
-    # The target is max_num_seqs, which is also roughly what the KV cache holds
-    # at this request length (a 5090 reports 192,320 tokens against ~800 per
-    # window). vLLM queues internally beyond that, so overshooting is harmless;
-    # the reason to bound it at all is the second limit below.
-    target = TM._max_num_seqs()
+    # HALF max_num_seqs, and overshooting is NOT harmless. Measured on a 3090,
+    # the same 954 windows submitted in one call against several:
+    #
+    #     954 x1   95.9s  298x        250 x4   90.2s  317x
+    #     400 x3   91.3s  314x        150 x7   83.9s  341x
+    #                                 120 x8   82.4s  348x   <- best, 14% off
+    #                                  80 x12  85.6s  334x
+    #
+    # It turns back down at 80: each call ends with the GPU draining as its last
+    # few sequences finish alone, and past a point paying that more often costs
+    # more than the queueing saves. 128 is the derived form of the 120 optimum --
+    # scaling with the card rather than hardcoding a number measured on one.
+    #
+    # The old value was max_num_seqs on the reasoning that it is "roughly what
+    # the KV cache holds". It is not: the KV budget here is 131,088 tokens
+    # against ~800 per window, so about 163 sequences, and 256 overshoots by
+    # 1.6x. Raising the budget does not fix it either -- gpu-frac 0.69 -> 0.88
+    # bought 3%.
+    target = max(32, TM._max_num_seqs() // 2)
     # Audio for a file has to stay resident until every one of its windows has
     # come back, so pooling holds wavs. Flush on this as well or a long queue
     # would accumulate them without limit.
@@ -572,12 +586,26 @@ def run_job(a, resident=None):
         inflight[name] = {"f": f, "wav": wav, "dur": len(wav) / TM.SR,
                           "offsets": offsets, "cores": cores,
                           "outs": [None] * len(reqs)}
-        pool.extend((name, i, r) for i, r in enumerate(reqs))
+        # One window at a time, so the bound can fire INSIDE a file. Extending
+        # by the whole file and checking afterwards meant the check could only
+        # ever act between files: a single 954-window recording went from 0 to
+        # 954 in one step and handed vLLM the lot, which is the slowest of every
+        # submission size measured. Multi-file batches were getting this
+        # chunking by accident, which is part of why seven separate recordings
+        # beat the same audio concatenated into one.
+        #
+        # flush() only assembles files whose windows have ALL come back, so
+        # flushing mid-file is already supported -- the file simply stays in
+        # `inflight` until a later flush completes it.
+        for i, r in enumerate(reqs):
+            pool.append((name, i, r))
+            if len(pool) >= target:
+                flush()
         pooled_samples += len(wav)
         # `if`, not `while`: flush() decodes the entire pool, so one pass always
         # empties it. A loop could spin forever if pooled_samples stayed above
         # the bound with nothing left to decode.
-        if len(pool) >= target or pooled_samples >= max_pooled_samples:
+        if pooled_samples >= max_pooled_samples:
             flush()
     flush()
 
