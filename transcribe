@@ -236,6 +236,13 @@ pull_profiles() {
 # they stay with the thing they describe. --out puts them somewhere else.
 # The library: one directory per meeting, here, whatever machine did the work.
 LIBRARY="${OUTDIR:-${MS_LIBRARY:-$HERE/library}}"
+# Where the job itself writes. A REMOTE run writes into the box's own library and
+# is rsynced to $LIBRARY afterwards, so the two are different by design. A LOCAL
+# run has no trip home, so they have to be the same -- and they were not: the
+# invocation hardcoded the install's library, so --out set where the "N meetings
+# in ..." line pointed and nothing else. Meetings went to ./library regardless,
+# which is silent data landing somewhere the caller said not to put it.
+if [ "$LOCAL" -eq 1 ]; then JOBLIB="$LIBRARY"; else JOBLIB="$REMOTE/library"; fi
 # Audio MOVES out of the inbox, because a worklist should empty as work
 # completes. Anywhere else it is copied: emptying a directory the caller merely
 # pointed at is not ours to do.
@@ -306,7 +313,7 @@ if [ -d "$SRC" ]; then
            TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
     cd '$REMOTE'
     ARGS=(${REMOTE_ARGS[*]@Q} --out-dir '$REMOTE/out' \
-      --library '$REMOTE/library' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
+      --library '$JOBLIB' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
       --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC})
@@ -391,7 +398,7 @@ if [ ${#ENROLL[@]} -eq 0 ]; then
     $PYQ '$PIPE/engined.py' --submit -- '$REMOTE/inbox/$SAFE.$EXT' \
       --out-dir '$REMOTE/out' --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
-      --library '$REMOTE/library' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
+      --library '$JOBLIB' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}
   " || SINGLE_RC=$?
   # 97 is "no usable daemon" and is the one code that means fall through; any
