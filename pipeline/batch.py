@@ -14,6 +14,7 @@ Two reasons this exists rather than calling transcribe_meeting.py per file:
   was measured to cost vLLM about 2% (4.8s -> 4.9s GPU) and is very nearly free.
 """
 import argparse
+import contextlib
 import json
 import multiprocessing
 import os
@@ -49,6 +50,26 @@ def _default_work():
 WORK = _default_work()
 PIPE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
+
+# Where the wall clock actually went.
+#
+# The summary used to report transcribe and embed as ONE number, so "is the
+# transcriber the bottleneck" could not be answered from a run at all -- which
+# is the only question worth asking before swapping a model for a faster one.
+#
+# These are BUSY times, not spans: decode runs on the GPU while the embedder
+# works in another process, so the phases legitimately sum to more than the
+# elapsed time. That overlap is the point, and reporting spans would hide it.
+PHASE = {}
+
+
+@contextlib.contextmanager
+def phase(name):
+    t = time.perf_counter()
+    try:
+        yield
+    finally:
+        PHASE[name] = PHASE.get(name, 0.0) + time.perf_counter() - t
 
 
 def safe(name):
@@ -239,9 +260,10 @@ def to_16k_mono(files, scratch):
         return f, f
 
     swap = {}
-    with ThreadPoolExecutor(max_workers=min(8, len(todo))) as pool:
-        for src, dst in pool.map(one, todo):
-            swap[src] = dst
+    with phase("convert"):
+        with ThreadPoolExecutor(max_workers=min(8, len(todo))) as pool:
+            for src, dst in pool.map(one, todo):
+                swap[src] = dst
     print(f"  converted in {time.time()-t0:.1f}s", flush=True)
     out = [swap.get(f, f) for f in files]
     return out, {swap[k]: k for k in swap if swap[k] != k}
@@ -448,7 +470,8 @@ def run_job(a, resident=None):
         """Assemble one recording once all of its windows have come back."""
         st = inflight.pop(name)
         f, wav, dur = st["f"], st["wav"], st["dur"]
-        segs, cov, _ = TM.assemble(st["outs"], st["offsets"], st["cores"], wav, dur)
+        with phase("assemble"):
+            segs, cov, _ = TM.assemble(st["outs"], st["offsets"], st["cores"], wav, dur)
         raw = meetings[name].file("raw", "json")
         json.dump({"audio": str(f), "duration_s": round(dur, 2), "window_s": a.window,
                    "n_windows": len(st["outs"]), "coverage": round(cov, 4),
@@ -472,7 +495,8 @@ def run_job(a, resident=None):
             if not emb.submit(raw, f, npz):
                 print(f"\n!! embedding worker died — see {out}/_embed.log", flush=True)
             if a.no_overlap_embed:
-                emb.wait_for(npz)
+                with phase("embed"):
+                    emb.wait_for(npz)
         meetings[name].write(duration_s=round(dur, 2), n_segments=len(segs),
                              coverage=round(cov, 4), window_s=a.window,
                              overlap_s=a.overlap, transcribed_at=time.time())
@@ -485,7 +509,8 @@ def run_job(a, resident=None):
         nonlocal pooled_samples
         if not pool:
             return
-        outs = llm.generate([r for _, _, r in pool], sampling)
+        with phase("decode"):
+            outs = llm.generate([r for _, _, r in pool], sampling)
         for (name, wi, _), o in zip(pool, outs):
             inflight[name]["outs"][wi] = o
         pool.clear()
@@ -567,14 +592,19 @@ def run_job(a, resident=None):
                 print(f"!! embedding worker died — see {out}/_embed.log", flush=True)
         return worker.close()
 
-    if deferred:
-        release_engine()
-        acks = embed_all(queued, "releasing the engine before embedding")
-    elif emb is held:
-        # Wait for this run's work, and leave the worker up for the next one.
-        acks = emb.drain(meetings[n].file("embeddings", "npz") for n, _ in pending)
-    else:
-        acks = emb.close()
+    # Whatever embedding did NOT manage to hide behind decoding. When the
+    # overlap is working this is near zero and the embedder cost nothing in wall
+    # clock; when it is large, the embedder -- not the transcriber -- is what a
+    # faster run would have to attack.
+    with phase("embed"):
+        if deferred:
+            release_engine()
+            acks = embed_all(queued, "releasing the engine before embedding")
+        elif emb is held:
+            # Wait for this run's work, and leave the worker up for the next one.
+            acks = emb.drain(meetings[n].file("embeddings", "npz") for n, _ in pending)
+        else:
+            acks = emb.close()
 
     def missing(names_and_files):
         return [(n, f) for n, f in names_and_files
@@ -677,14 +707,17 @@ def run_job(a, resident=None):
                 return {k: (rc, o) for k, rc, o in
                         pool.imap_unordered(postproc.run_module, specs)}
 
-        rc_link = run_all([(n, f"{PIPE}/link/link.py", argv_link(n)) for n, _ in todo])
+        with phase("cluster"):
+            rc_link = run_all([(n, f"{PIPE}/link/link.py", argv_link(n)) for n, _ in todo])
         # identify in the parent: single sqlite writer, and cheap once imported
         rc_ident = {}
-        for name, _ in todo:
-            if rc_link.get(name, (1, ""))[0] == 0:
-                rc_ident[name] = postproc.run_module((name, f"{PIPE}/identify.py", argv_identify(name)))[1:]
+        with phase("identify"):
+            for name, _ in todo:
+                if rc_link.get(name, (1, ""))[0] == 0:
+                    rc_ident[name] = postproc.run_module((name, f"{PIPE}/identify.py", argv_identify(name)))[1:]
         ready = [(n, f) for n, f in todo if rc_link.get(n, (1, ""))[0] == 0]
-        rc_render = run_all([(n, f"{PIPE}/mktxt.py", argv_render(n, f)) for n, f in ready])
+        with phase("render"):
+            rc_render = run_all([(n, f"{PIPE}/mktxt.py", argv_render(n, f)) for n, f in ready])
     else:
         rc_ident = {}
 
@@ -749,13 +782,14 @@ def run_job(a, resident=None):
     # thing that makes "keep the transcripts, drop the audio" a real option.
     if not a.no_clips:
         n_clips = 0
-        for name, _ in pending:
-            if name in broken_names:
-                continue
-            m = meetings[name]
-            aud = m.audio()
-            if aud:
-                n_clips += CLIPS.cut(aud, m.file("transcript", "json"), m.clips_dir)
+        with phase("clips"):
+            for name, _ in pending:
+                if name in broken_names:
+                    continue
+                m = meetings[name]
+                aud = m.audio()
+                if aud:
+                    n_clips += CLIPS.cut(aud, m.file("transcript", "json"), m.clips_dir)
         if n_clips:
             print(f"cut {n_clips} clips for naming voices", flush=True)
 
@@ -784,6 +818,19 @@ def run_job(a, resident=None):
           + ("   [sequential]" if a.no_overlap_embed else "   [overlapped]"))
     print(f"  time taken       {total:6.1f}s   {mins*60/max(t_gpu,0.01):.0f}x faster than "
           f"real time, excluding startup")
+
+    # Busy time per phase. These OVERLAP -- decode runs while the embedder works
+    # in another process -- so they sum to more than the elapsed time, and the
+    # share is of the summed work, not of the clock. Printed because the one
+    # number above cannot answer the only question that matters before reaching
+    # for a different model: which phase is actually the expensive one.
+    if PHASE:
+        busy = sum(PHASE.values())
+        print("\n  where the work went")
+        for k, v in sorted(PHASE.items(), key=lambda kv: -kv[1]):
+            if v >= 0.05:
+                print(f"    {k:<10} {v:7.1f}s  {v/busy:5.1%}"
+                      + (f"   {mins*60/v:5.0f}x realtime" if k == "decode" else ""))
 
     # Exit nonzero if ANY recording did not come out whole. A batch that reports
     # success while a transcript is missing is worse than one that fails loudly:
