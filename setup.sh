@@ -338,16 +338,24 @@ fi
 
 say "Ready"
 cat <<EOF
-   Run this from the machine your AUDIO is on:
+   Drop recordings in inbox/ and run it:
 
-     ./transcribe "some meeting.mp3"
+     cp ~/recordings/*.mp3 inbox/
+     ./transcribe
 
-   It uploads, transcribes, identifies who spoke, and writes the transcript
-   into your current directory. No flags needed.
+   Each becomes a directory in library/ — the transcript, the audio, and a few
+   seconds of each voice. The inbox empties as they finish, so anything still
+   sitting there has not been done.
+
+     ./speakers meetings                       what is in the library
+     ./speakers who <meeting>                  the voices in it
+     ./speakers name <meeting> G02 "Bob"       remember one
+     ./speakers apply --apply                  name them in older meetings too
 
    For names the model has never heard, put a glossary.txt next to where you
    run it (one term per line) — see glossary.txt.example.
 
+   Every command, in full:  RUNBOOK.md
    Verify this install any time, changing nothing:
      ./setup.sh --check
 EOF
