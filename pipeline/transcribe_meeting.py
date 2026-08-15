@@ -11,12 +11,25 @@ from transformers import AutoProcessor
 from moss_transcribe_diarize import parse_transcript
 from moss_transcribe_diarize.inference_utils import DEFAULT_PROMPT, load_audio_item
 
+import functools
 import os
 
 # MS_MODEL lets a fine-tuned checkpoint be swapped in without touching the pipeline.
 MODEL = os.environ.get("MS_MODEL", "OpenMOSS-Team/MOSS-Transcribe-Diarize")
 SR = 16000
 SILENCE_GATE_DB = -70.0
+
+
+@functools.lru_cache(maxsize=1)
+def _processor():
+    """The chat-template processor, loaded once per process.
+
+    from_pretrained re-reads and re-parses it from disk every call, and nothing
+    about it varies -- same model, same template. It was being rebuilt for every
+    job: 4.2 seconds of a 17-second run on a resident engine, which is where the
+    "startup" line in the summary was actually going.
+    """
+    return AutoProcessor.from_pretrained(MODEL, trust_remote_code=True)
 
 
 def build_prompt(glossary=""):
@@ -27,7 +40,7 @@ def build_prompt(glossary=""):
     cannot fix that safely because the output is valid English, so the
     vocabulary has to reach the decoder.
     """
-    proc = AutoProcessor.from_pretrained(MODEL, trust_remote_code=True)
+    proc = _processor()
     prompt = DEFAULT_PROMPT
     terms = [t.strip() for t in (glossary or "").split(",") if t.strip()]
     if terms:
