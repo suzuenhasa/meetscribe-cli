@@ -231,6 +231,16 @@ def refine_leave_one_out(Ac, lab_core, k, iters=3, cannot=None):
             b = int(np.argmax(sims))
             if not np.isfinite(sims[b]) or b == c:
                 continue
+            # Re-check against the CURRENT labels before committing. `blocked`
+            # is built once per sweep, but moves land one at a time as the sweep
+            # runs -- that sequencing is deliberate, it is what lets a cascade
+            # converge. So a forbidden partner can leave cluster X for cluster Y
+            # mid-sweep while the table still records it in X, and the next turn
+            # is waved into Y right on top of it. Measured: 1 meeting in 200
+            # reached the postcondition this way. O(n) against a table lookup,
+            # and it reads the labels as they are rather than as they were.
+            if cannot is not None and len(cannot) and (cannot[i] & (lab == b)).any():
+                continue
             sums[c] -= Ac[i]; cnt[c] -= 1
             sums[b] += Ac[i]; cnt[b] += 1
             lab[i] = b
@@ -250,10 +260,17 @@ def cluster_cannot_link(lab_core, cannot, k):
     the bug this is here to prevent."""
     if cannot is None or not len(cannot):
         return np.zeros((k, k), dtype=bool)
-    M = np.zeros((k, len(lab_core)), dtype=bool)
+    # int32, NOT int8. This counts forbidden MEMBER PAIRS between two clusters
+    # and then asks whether the count is positive -- so the accumulator has to
+    # hold it. In int8 a pair of 16-member clusters MOSS fully separated gives
+    # 256, which wraps to exactly 0 and reports them as free to merge; 128..255
+    # wrap negative and are just as false. Entirely reachable: the 7.94h
+    # recording clusters 1,163 aggregates into 23 speakers, so a cluster pair
+    # with more than 127 forbidden member pairs is ordinary.
+    M = np.zeros((k, len(lab_core)), dtype=np.int32)
     for c in range(k):
         M[c] = (lab_core == c)
-    return (M @ cannot.astype(np.int8) @ M.T) > 0
+    return ((M @ cannot) @ M.T) > 0
 
 
 def absorb_small(lab_core, core, A, secs, min_sec=MIN_CLUSTER_SEC, cannot=None):
@@ -286,9 +303,18 @@ def absorb_small(lab_core, core, A, secs, min_sec=MIN_CLUSTER_SEC, cannot=None):
         pos = {c: i for i, c in enumerate(ids)}
         compact = np.array([pos[c] for c in lab_core])
         CC = cluster_cannot_link(compact, cannot, len(ids))
+        # "Is there anywhere legal for this one to go?" -- which is NOT
+        # `not CC[row].all()`. CC's diagonal is False for any well-formed
+        # cluster, so that row can never be all-True and the test never rejected
+        # anything: a fully blocked splinter was always chosen as victim,
+        # `others` came out empty, and the loop broke -- abandoning absorption
+        # for every remaining splinter, including ones nothing forbade. That
+        # invents speakers without violating the postcondition, so nothing
+        # downstream would ever have noticed.
         victim = None
         for cand in sorted(small, key=lambda c: tot[c]):
-            if not CC[pos[cand]].all():        # somewhere legal to be absorbed
+            p = pos[cand]
+            if any(pos[c] != p and not CC[p, pos[c]] for c in ids):
                 victim = cand
                 break
         if victim is None:
