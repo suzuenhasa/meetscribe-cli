@@ -167,7 +167,7 @@ def maxgap_threshold(heights):
             float(gs[0] / max(gs[1], 1e-9)))
 
 
-def refine_leave_one_out(Ac, lab_core, k, iters=3):
+def refine_leave_one_out(Ac, lab_core, k, iters=3, cannot=None):
     """Reassign each turn to its nearest cluster centroid, EXCLUDING itself.
 
     Plain refinement compares a turn against a centroid it is itself part of. In
@@ -197,6 +197,15 @@ def refine_leave_one_out(Ac, lab_core, k, iters=3):
         return v / nv if nv > 1e-9 else None
 
     for _ in range(max(1, iters)):
+        # Recomputed per sweep, not once: membership changes as the sweep runs,
+        # so a cached table would forbid moves that became legal and permit ones
+        # that stopped being.
+        blocked = None
+        if cannot is not None and len(cannot):
+            M = np.zeros((k, n), dtype=bool)
+            for c in range(k):
+                M[c] = (lab == c)
+            blocked = (cannot.astype(np.int8) @ M.T) > 0      # (n, k)
         moved = 0
         for i in range(n):
             c = int(lab[i])
@@ -209,6 +218,12 @@ def refine_leave_one_out(Ac, lab_core, k, iters=3):
                 continue
             sims = np.full(k, -np.inf)
             for j in range(k):
+                # MOSS said this turn and a member of cluster j are different
+                # people. Refinement used to move on cosine alone and could
+                # place them together, undoing after the cut what the linkage
+                # had honoured throughout. Unreachable, not merely unlikely.
+                if blocked is not None and j != c and blocked[i, j]:
+                    continue
                 v = sums[j] - Ac[i] if j == c else sums[j]
                 u = unit(v)
                 if u is not None:
@@ -225,7 +240,23 @@ def refine_leave_one_out(Ac, lab_core, k, iters=3):
     return lab
 
 
-def absorb_small(lab_core, core, A, secs, min_sec=MIN_CLUSTER_SEC):
+def cluster_cannot_link(lab_core, cannot, k):
+    """k x k: True where two CLUSTERS hold an aggregate pair MOSS forbade.
+
+    Lifts the per-aggregate relation onto whatever clusters currently exist, so
+    a merge or a reassignment can be tested in one lookup instead of scanning
+    members. Recomputed rather than maintained: it is a (k x n) x (n x k)
+    boolean product, microseconds at the sizes here, and a stale copy is exactly
+    the bug this is here to prevent."""
+    if cannot is None or not len(cannot):
+        return np.zeros((k, k), dtype=bool)
+    M = np.zeros((k, len(lab_core)), dtype=bool)
+    for c in range(k):
+        M[c] = (lab_core == c)
+    return (M @ cannot.astype(np.int8) @ M.T) > 0
+
+
+def absorb_small(lab_core, core, A, secs, min_sec=MIN_CLUSTER_SEC, cannot=None):
     """Fold clusters holding under `min_sec` of speech into the nearest survivor.
 
     The max-gap cut tends to shave off 3-5 second splinters — a questioner's one
@@ -233,6 +264,14 @@ def absorb_small(lab_core, core, A, secs, min_sec=MIN_CLUSTER_SEC):
     safe in a way that raising the threshold is not: it can only merge clusters
     too small to enroll a profile, and never touches a real speaker's turns.
     Always leaves at least one cluster.
+
+    `cannot` is not optional in spirit. constrained_linkage honours MOSS's "these
+    two are different people" while building the tree, and this ran afterwards
+    with no knowledge of it -- so a 5-second questioner could be folded straight
+    into the person who answered them, on cosine similarity alone, discarding the
+    categorical evidence that they are not the same speaker. Enrolment needs 10
+    seconds; EXISTING as a speaker does not, and duration was being allowed to
+    overrule MOSS. A splinter with nowhere legal to go now stays put.
     """
     lab_core = np.asarray(lab_core, dtype=int).copy()
     while True:
@@ -243,14 +282,26 @@ def absorb_small(lab_core, core, A, secs, min_sec=MIN_CLUSTER_SEC):
         small = [c for c in ids if tot[c] < min_sec]
         if not small:
             break
-        victim = min(small, key=lambda c: tot[c])
+        # Compact to 0..k-1 so the cluster-level relation lines up with `ids`.
+        pos = {c: i for i, c in enumerate(ids)}
+        compact = np.array([pos[c] for c in lab_core])
+        CC = cluster_cannot_link(compact, cannot, len(ids))
+        victim = None
+        for cand in sorted(small, key=lambda c: tot[c]):
+            if not CC[pos[cand]].all():        # somewhere legal to be absorbed
+                victim = cand
+                break
+        if victim is None:
+            break                              # every splinter is blocked; leave them
         cents = {}
         for c in ids:
             sel = core[lab_core == c]
             v = A[sel].mean(0)
             nv = np.linalg.norm(v)
             cents[c] = v / nv if nv > 0 else v
-        others = [c for c in ids if c != victim]
+        others = [c for c in ids if c != victim and not CC[pos[victim], pos[c]]]
+        if not others:
+            break
         best = max(others, key=lambda c: float(cents[victim] @ cents[c]))
         lab_core[lab_core == victim] = best
     ids = sorted(set(lab_core.tolist()))
@@ -373,7 +424,7 @@ def cluster(A, secs, keys, min_core=2.0, refine_iters=3, thr=None,
 
     _, labels_at = constrained_linkage(S, C)
     lab_core, k_raw = labels_at(thr)
-    lab_core, k = absorb_small(lab_core, core, A, secs)
+    lab_core, k = absorb_small(lab_core, core, A, secs, cannot=C)
     info["k_before_absorb"] = int(k_raw)
 
     def centroids(lab, kk):
@@ -386,10 +437,25 @@ def cluster(A, secs, keys, min_core=2.0, refine_iters=3, thr=None,
                 Cm[c] = v / nv if nv > 0 else 0.0
         return Cm
 
-    lab_core = refine_leave_one_out(Ac, lab_core, k, refine_iters)
+    lab_core = refine_leave_one_out(Ac, lab_core, k, refine_iters, cannot=C)
     ids = sorted(set(lab_core.tolist()))
     lab_core = np.array([{c: i for i, c in enumerate(ids)}[c] for c in lab_core])
     k = len(ids)
+
+    # THE POSTCONDITION. Everything above only tries to honour the constraints;
+    # this is where we find out. It was previously left to floor_ok, which
+    # compares the speaker COUNT against MOSS's floor -- a violation can keep the
+    # count intact by trading two people for two others, and floor_ok would call
+    # that clean. Count is not the invariant. This is.
+    viol = np.argwhere(np.triu(C, 1) & (lab_core[:, None] == lab_core[None, :]))
+    info["cannot_link_violations"] = int(len(viol))
+    if len(viol):
+        pairs = "; ".join(f"{keys[core[a]]} vs {keys[core[b]]} -> both G{lab_core[a]:02d}"
+                          for a, b in viol[:4])
+        raise AssertionError(
+            f"{len(viol)} cannot-link pair(s) ended up in one cluster: {pairs}"
+            + ("" if len(viol) <= 4 else f" (and {len(viol) - 4} more)"))
+
     Cm = centroids(lab_core, k)
 
     lab = np.full(len(A), -1, dtype=int)
