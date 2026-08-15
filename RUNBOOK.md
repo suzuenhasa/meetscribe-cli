@@ -1,0 +1,322 @@
+# Runbook
+
+Every command, what it does, and when you would reach for it.
+
+- [Install](#install)
+- [Transcribing](#transcribing)
+- [Naming voices](#naming-voices)
+- [The resident engine](#the-resident-engine)
+- [Working on a rented GPU](#working-on-a-rented-gpu)
+- [The library on disk](#the-library-on-disk)
+- [Maintenance](#maintenance)
+- [Environment](#environment)
+- [When something is wrong](#when-something-is-wrong)
+
+---
+
+## Install
+
+```bash
+git clone https://github.com/suzuenhasa/meetscribe-cli.git
+cd meetscribe-cli
+./setup.sh
+```
+
+| command | does |
+|---|---|
+| `./setup.sh` | installs everything: interpreter, vLLM, ~2 GB of weights, `speakers.db`, `inbox/`, `library/`. Idempotent — re-run any time |
+| `./setup.sh --check` | verifies an install without changing anything |
+| `./setup.sh --help` | what it will do before it does it |
+
+Needs an NVIDIA GPU with **6 GB VRAM or more** and compute capability 7.0+, plus
+`ffmpeg`. Everything lands inside the checkout: delete the folder, the install is
+gone.
+
+---
+
+## Transcribing
+
+```bash
+cp ~/recordings/*.mp3 inbox/
+./transcribe
+```
+
+| command | does |
+|---|---|
+| `./transcribe` | processes everything in `inbox/`, moving each file into `library/` as it completes |
+| `./transcribe ~/audio/` | that folder instead. **Copies** rather than moves — only the inbox is a worklist |
+| `./transcribe one.mp3` | a single file |
+| `./transcribe --host msbox` | the GPU work happens on that box; everything else stays here |
+
+Accepts `wav mp3 m4a flac ogg opus aac m4b aiff wma mp4 webm mkv` at any sample
+rate. Anything not already 16 kHz mono is converted first, all files at once.
+
+**Use a folder, not a loop.** The engine loads once for the whole queue, windows
+are pooled across recordings, and each meeting's embedding overlaps the next
+one's transcription. Six podcasts as one batch measured ~3 minutes against ~13
+run individually.
+
+### Flags
+
+| flag | default | |
+|---|---|---|
+| `--host <ssh>` | — | run the GPU work over there. Nothing else changes |
+| `--out <dir>` | `library/` | keep meetings somewhere else |
+| `--replace <id>` | — | redo a meeting in place, keeping its id and history |
+| `--glossary "A,B"` | — | proper nouns the model has never heard |
+| `--roster "A,B"` | — | only match against these people |
+| `--name G02="Bob"` | — | name a cluster during the run |
+| `--window <s>` | `30` | seconds of audio per decode window |
+| `--overlap <s>` | `5` | context decoded either side of each window |
+| `--thr <n\|auto>` | `auto` | speaker-clustering cut |
+| `--gpu-frac <n>` | auto | share of VRAM vLLM reserves |
+
+`glossary.txt` in the directory you run from is picked up automatically, one
+term per line, `#` for comments.
+
+**`--overlap 0`** is roughly 1.5× faster and mangles words at window seams. It is
+the only setting here that trades accuracy for speed.
+
+**`--replace`** is for redoing a meeting you already have — a better glossary, a
+different `--thr`. It keeps the id, so every decision ever recorded about it
+still applies. Without it, the same audio twice is two meetings.
+
+---
+
+## Naming voices
+
+Everyone starts as `Speaker 1`, `Speaker 2`. Those are correct within a
+recording and meaningless across recordings. Name someone once and they are
+recognised everywhere, including in meetings you already have.
+
+| command | does |
+|---|---|
+| `./speakers meetings` | everything in the library: folder, id, title |
+| `./speakers who <meeting>` | the voices in it, how long each spoke, samples |
+| `./speakers play <meeting> G02 [n]` | hear that voice — plays the clips |
+| `./speakers name <meeting> G02 "Bob Smith"` | remember this voice |
+| `./speakers apply` | which existing transcripts would change |
+| `./speakers apply --apply` | re-identify and re-render them |
+| `./speakers list` | who is on file |
+| `./speakers rename <id> "New Name"` | fix a name |
+| `./speakers forget <id>` | delete a person and their voiceprints |
+
+`<meeting>` is anything that identifies one: its id (`9ajq9`), its directory,
+a path, or enough of the title to be unambiguous.
+
+### The normal loop
+
+```bash
+./speakers who one-trust                    # which cluster is who
+./speakers play one-trust G02               # confirm by ear
+./speakers name one-trust G02 "Sreeram Kannan"
+./speakers apply --apply                    # backfill everything else
+```
+
+`apply` is the one people miss. Identification runs when a recording is
+processed, against whoever was enrolled at that moment — so naming someone
+afterwards leaves every meeting they are already in still saying Speaker 3 until
+you run it. It is cosine arithmetic over centroids already on disk: no GPU, no
+re-transcription, seconds for a whole library.
+
+### Reading the identify output
+
+```
+identify: 4 voices in this meeting, 3 enrolled candidates
+  = G00      612s  Bob Smith              0.952
+  ? G01       74s  Ravi Patel             0.478  (2nd 0.443)
+    G03       31s  -                      0.201
+```
+
+`=` recognised · `?` too close to call, left numbered · blank, nobody on file.
+
+Accepting needs **0.55 and a 0.10 margin** over the runner-up. 0.40–0.55 asks a
+person. Below that is treated as a new voice. Enrolling needs 10 s of speech.
+
+If everyone comes out `?` with identical scores, the same person is probably
+enrolled twice — see [When something is wrong](#when-something-is-wrong).
+
+---
+
+## The resident engine
+
+The engine costs ~70 s to load and that is paid **per run**. On an hour of audio
+it disappears; on a 3-minute clip it is the whole wall clock.
+
+| command | does |
+|---|---|
+| `./engine start` | load it and leave it running (~70 s, once) |
+| `./engine status` | is it up, and is it running the code on disk |
+| `./engine stop` | hand the card back |
+| `./engine restart` | stop, then start |
+| `./engine log [n]` | what it has been doing |
+
+Measured on a 3090, 3-minute clip: **145 s cold, 25 s resident.**
+
+Nothing requires it. Everything uses it when it is there and loads its own engine
+when it is not, so starting it is an optimisation and stopping it is safe at any
+time — including mid-queue, which finishes on the engine it already has.
+
+It holds VRAM while running and hands the card back after 15 minutes idle,
+keeping only the weights, waking in about a second. `MS_ENGINE_IDLE_SLEEP=0`
+keeps it resident regardless.
+
+**It caches pipeline code.** The daemon imports `batch.py` once at startup, so
+editing pipeline files changes nothing until it restarts. `./engine status` says
+so when the files on disk are newer.
+
+---
+
+## Working on a rented GPU
+
+`--host` means one thing: where the compute happens. Your audio, your library and
+your profiles stay on your machine.
+
+```bash
+cp ~/recordings/*.mp3 inbox/
+./transcribe --host msbox
+```
+
+The audio goes up, meetings come back as whole directories, and `speakers.db`
+travels **both ways** — up before the run so the box identifies against your
+people, back after with whatever it decided. Destroy the instance and you lose
+nothing.
+
+`~/.ssh/config`:
+
+```
+Host msbox
+  HostName 1.2.3.4
+  Port 44404
+  User root
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+`export MS_HOST=msbox` drops the flag entirely.
+
+| command | does |
+|---|---|
+| `./speakers list --host msbox` | the box's store rather than yours |
+| `./transcribe ... --host msbox` | the GPU work over there |
+
+`who`, `play` and `clips` always run locally — they read your transcripts and
+clips.
+
+Setting a box up from nothing: `vast/provision.sh`, see `vast/README.md`.
+
+---
+
+## The library on disk
+
+```
+inbox/                          drop recordings here; empties as they finish
+library/
+  one-trust-network-to-rule-9ajq9/
+    meeting.json                id, title, source, duration, coverage
+    …-audio.mp3                 your original — deletable
+    …-transcript.txt            what you read
+    …-transcript.json           per-segment, with speaker labels
+    …-embeddings.npz            one voiceprint per segment
+    …-clusters.npz              one centroid per speaker — naming needs this
+    …-raw.json                  pre-clustering output, kept for re-linking
+    …-names.json                cluster → name for this meeting
+    clips/G00-1.mp3 …           a few seconds of each voice
+speakers.db                     who people are
+```
+
+**The slug is for you, the id is for the software.** `speakers.db` records
+against the id, so rename the directory, rename the files, reorganise the whole
+library — nothing breaks.
+
+**`clips/` is what lets the audio go.** About a megabyte against fifty, cut from
+the original, enough to recognise a voice by ear. Delete `*-audio.mp3` when you
+are short of space and naming still works. Clips are **never** used to compute a
+voiceprint — that only ever comes from the original, and the embedder refuses a
+path under `clips/`.
+
+**`speakers.db` is the only thing here that cannot be rebuilt from the audio.**
+Back it up.
+
+---
+
+## Maintenance
+
+| command | does |
+|---|---|
+| `python3 pipeline/library.py` | list meetings: folder, id, title |
+| `python3 pipeline/library.py <ref> <field>` | resolve one — `path` `id` `title` `stem` `clusters` `transcript` `text` `audio` |
+| `python3 pipeline/relabel.py` | same as `speakers apply` |
+| `python3 pipeline/migrate_ids.py` | what a filename-keyed store would become |
+| `python3 pipeline/migrate_ids.py --apply` | re-key it, backing up first |
+
+`migrate_ids.py` is a one-off for stores written before meetings had ids. It
+copies to `speakers.db.pre-ids`, keeps every old value in a `legacy_name` column,
+and **leaves alone** any row whose meeting is not in the library rather than
+dropping it.
+
+### Running the pipeline directly
+
+Rarely needed. Use the interpreter setup chose:
+
+```bash
+source env.sh
+"$MS_PY" pipeline/batch.py audio.mp3 --library library/ --out-dir /tmp/scratch
+```
+
+`batch.py` also takes `--no-convert` (decode inside the run, one file at a time),
+`--no-clips`, `--move-audio`, and `--no-overlap-embed`.
+
+---
+
+## Environment
+
+| variable | |
+|---|---|
+| `MS_HOST` | default `--host` |
+| `MS_LIBRARY` | where meetings are kept |
+| `MS_SPEAKER_DB` | a different profile store |
+| `MS_WORK` | the install directory |
+| `MS_REMOTE` | the install directory **on the box**, if it cannot be found |
+| `MS_FORCE_REMOTE` | use the box even when a local install exists |
+| `MS_ENGINE_IDLE_SLEEP` | seconds before the engine hands the card back; `0` never |
+| `MS_POST_POOL_MIN` | recordings below which post-processing runs in-process |
+| `MS_MAX_SEQS` | concurrent sequences vLLM will run |
+| `MS_PY` | the interpreter that owns the dependencies (set by `setup.sh`) |
+
+---
+
+## When something is wrong
+
+**A voice is enrolled but old transcripts still say Speaker 3.**
+`./speakers apply --apply`.
+
+**Everyone comes out `?` with scores of 1.000.** The same person is enrolled
+twice: two identical voiceprints, so the 0.10 margin can never be met.
+`./speakers list` shows it — two entries with near-identical speech time.
+`./speakers forget <id>` on the duplicate.
+
+**Everyone is one speaker, or one person appears as several.** `k_est` on the
+`CLUSTER` line is the count found. `FLOOR-VIOLATION` means fewer speakers than
+the model heard talking simultaneously — a bug, not a tuning problem.
+`LOW-SEPARATION` means the count is weakly supported; check before naming.
+
+**A name is mangled.** Add it to `glossary.txt`. Still wrong near a window
+boundary? `--overlap 10`.
+
+**Wrong person recognised.** `--roster` narrows the gallery. False accepts grow
+with gallery size.
+
+**vLLM will not start.** Something else holds the card — one vLLM at a time.
+`nvidia-smi` will show it. If the engine died badly, an orphaned
+`VLLM::EngineCore` may still hold the memory; `./engine start` reaps those.
+
+**Edits to pipeline code do nothing.** The resident engine is running the code it
+loaded at startup. `./engine restart`.
+
+**`ModuleNotFoundError`.** Use the right interpreter:
+`source env.sh && "$MS_PY" …`.
+
+**Transcripts are not coming back from `--host`.** Check the box has an install
+where `transcribe` expects: `/etc/meetscribe-work`, or set `MS_REMOTE`.
+
+**Anything else** — `./setup.sh --check`.
