@@ -277,16 +277,30 @@ embedding overlaps transcription or waits for the engine to be released, and
 every respect as though it were on a 10 GiB card.
 
 ```bash
-MS_VRAM_GIB=10 ./engine start
-MS_VRAM_GIB=10 ./transcribe
+./engine stop
+MS_VRAM_GIB=10 ./engine start      # capped
+./engine stop
+./engine start                     # the whole card again
 ```
 
-Measured on a 24 GiB 3090:
+Nothing persists. The budget is read when the engine starts and lives only in
+that process, so switching is stop-and-start — no reinstall, no reset, no state
+to clean up.
 
-```
-no cap             gpu-frac 0.69   18,398 MiB
-MS_VRAM_GIB=10     gpu-frac 0.17    6,022 MiB
-```
+**Put it on `engine start`, not on the run.** That is what sizes the engine.
+`./transcribe` reads it too, but only when there is no daemon and it loads its
+own engine; with one up, the daemon's budget applies whatever the run says.
+
+Measured on a 24 GiB 3090, same audio both ways:
+
+| | gpu-frac | card | throughput |
+|---|---|---|---|
+| no cap | 0.69 | 18,054 MiB | 213× |
+| `MS_VRAM_GIB=10` | 0.17 | 5,678 MiB | 125× |
+
+**It costs throughput.** Less VRAM is a smaller KV cache, so fewer windows
+decode at once — roughly half the speed for a third of the card. That is the
+trade being bought: a GPU you can share.
 
 The fraction is rescaled against the real card, because that is what vLLM
 measures `gpu_memory_utilization` against — asking for 7 of a 10 GiB budget on a
