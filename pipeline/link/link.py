@@ -219,10 +219,24 @@ def main():
               f"the clustering has collapsed people together.")
 
     lab_of_key = {kk: int(lab[i]) for i, kk in enumerate(keys)}
+    # key_of has one entry per EMBEDDING META ROW and is indexed here by SEGMENT
+    # position, so the two files have to agree on how many segments there are.
+    # They always should -- embed_batched appends meta for every segment before
+    # it decides whether to embed it -- and when they do not, the old code ran
+    # off the end of a list and raised a bare "IndexError: list index out of
+    # range" from inside a formatting expression, which says nothing about the
+    # two counts that actually disagree or which file is short.
+    if len(key_of) != len(R["segments"]):
+        raise SystemExit(
+            f"segment/embedding mismatch: {args.run} has {len(R['segments'])} "
+            f"segments but {args.npz} carries metadata for {len(key_of)}. One of "
+            f"them is stale or was written incompletely; re-run this meeting with "
+            f"./transcribe --replace <id>.")
     for i, s in enumerate(R["segments"]):
         s["global"] = f"G{lab_of_key[key_of[i]]:02d}"
     if args.out:
-        json.dump(R, open(args.out, "w"))
+        with open(args.out, "w") as _fh:
+            json.dump(R, _fh)
         print(f"WROTE {args.out}")
         cs = np.array([secs[lab == c].sum() for c in range(k)])
         np.savez(args.clusters_out or args.out.replace(".json", "_clusters.npz"),

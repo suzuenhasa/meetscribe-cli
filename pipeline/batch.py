@@ -190,6 +190,18 @@ class Embedder:
 # more than its own startup, and per-file work here is milliseconds.
 POST_POOL_MIN = int(os.environ.get("MS_POST_POOL_MIN", "4"))
 
+# Splitting a long recording across cores. A codec bitstream does not thread, so
+# one file gets one core; ranges of it are independent and do. Measured on a
+# 7.94h mp3, 48 cores: whole 92.8s, 4 parts 24.5s, 8 parts 21.6s, 16 parts 23.4s,
+# 32 parts 25.5s -- the same plateau at 8 the across-files pool has, which is why
+# both stop there. Below SPLIT_MIN_S there is nothing to win and a seek to get
+# wrong, so short files take the plain path.
+SPLIT_MIN_S = float(os.environ.get("MS_SPLIT_MIN_S", "1200"))    # 20 minutes
+SPLIT_TARGET_S = float(os.environ.get("MS_SPLIT_TARGET_S", "600"))  # ~10 min a part
+SPLIT_MAX_PARTS = int(os.environ.get("MS_SPLIT_MAX_PARTS", "8"))
+RUN_UP_S = int(os.environ.get("MS_SPLIT_RUN_UP_S", "2"))
+SR_OUT = 16000
+
 
 def post_workers():
     """How many post-processing workers to run. Scales with the box.
@@ -245,16 +257,95 @@ def to_16k_mono(files, scratch):
           flush=True)
     t0 = time.time()
 
+    def duration_s(f):
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(f)],
+                capture_output=True, text=True, timeout=30).stdout.strip()
+            return float(out)
+        except Exception:
+            return 0.0
+
+    def convert_whole(f, dst):
+        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(f),
+                            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst)],
+                           capture_output=True)
+        return r.returncode == 0 and dst.exists() and dst.stat().st_size > 44
+
+    def convert_split(f, dst, dur):
+        """Decode ranges of one recording concurrently, then join them.
+
+        A codec bitstream is a dependency chain, so ONE file gets one core
+        however many are idle -- 92.8s for a 7.94h mp3 while 47 cores watched.
+        Ranges are independent, and 8 of them bring that to 21.8s.
+
+        RUN_UP is what makes it safe. Seeking drops the decoder into the middle
+        of a stream with no preceding frames and no resampler state, so the
+        first samples after a cut come out slightly wrong -- 4,040 of them
+        across 7 seams, measured. Decode from RUN_UP seconds earlier and throw
+        that away and it falls to 140 samples in 457 MILLION, all still at the
+        seams, for no extra wall clock.
+
+        Length is exact either way -- verified sample-for-sample against the
+        serial conversion, +0 drift -- which is the property that actually
+        matters here: every timestamp downstream is an offset into this array.
+        """
+        parts = min(SPLIT_MAX_PARTS, max(2, int(dur // SPLIT_TARGET_S)))
+        seg = int(dur / parts) + 1
+        raws = [scratch / f"{dst.stem}.part{k:02d}.raw" for k in range(parts)]
+
+        def rng(k):
+            lead = 0 if k == 0 else RUN_UP_S
+            cmd = ["ffmpeg", "-nostdin", "-v", "error", "-y",
+                   "-ss", str(k * seg - lead), "-t", str(seg + lead), "-i", str(f),
+                   "-ac", "1", "-ar", "16000"]
+            if lead:
+                cmd += ["-af", f"atrim=start={lead}"]
+            cmd += ["-f", "s16le", str(raws[k])]
+            return subprocess.run(cmd, capture_output=True).returncode == 0
+
+        with ThreadPoolExecutor(max_workers=min(SPLIT_MAX_PARTS, parts)) as pool:
+            if not all(pool.map(rng, range(parts))):
+                return False
+        total = sum(p.stat().st_size for p in raws if p.exists())
+        if total < 44:
+            return False
+        # A canonical 44-byte PCM header, then the ranges in order.
+        import struct
+        with open(dst, "wb") as out:
+            out.write(b"RIFF" + struct.pack("<I", 36 + total) + b"WAVEfmt "
+                      + struct.pack("<IHHIIHH", 16, 1, 1, SR_OUT, SR_OUT * 2, 2, 16)
+                      + b"data" + struct.pack("<I", total))
+            for p in raws:
+                with open(p, "rb") as src:
+                    shutil.copyfileobj(src, out, 1 << 20)
+                p.unlink(missing_ok=True)
+        return dst.stat().st_size > 44
+
     def one(f):
         dst = scratch / f"{f.stem}.wav"
         n = 1
         while dst.exists():
             dst = scratch / f"{f.stem}-{n}.wav"
             n += 1
-        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(f),
-                            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst)],
-                           capture_output=True)
-        if r.returncode == 0 and dst.exists() and dst.stat().st_size > 44:
+        dur = duration_s(f)
+        ok = False
+        if dur >= SPLIT_MIN_S:
+            try:
+                ok = convert_split(f, dst, dur)
+            except Exception as e:
+                print(f"  !! split conversion failed for {f.name[:40]} "
+                      f"({type(e).__name__}) — converting it whole", flush=True)
+                ok = False
+            if not ok:
+                # Seeking misbehaves on some containers and a truncated file has
+                # no reliable duration. Whole-file conversion always works, so
+                # fall back rather than fail: slower is not broken.
+                dst.unlink(missing_ok=True)
+        if not ok:
+            ok = convert_whole(f, dst)
+        if ok:
             return f, dst
         print(f"  !! could not convert {f.name[:50]} — using it as it is", flush=True)
         return f, f
@@ -379,12 +470,18 @@ def run_job(a, resident=None):
     # Before anything touches the GPU. Names are keyed off the stem, which the
     # conversion preserves, so nothing downstream can tell the difference except
     # by being faster.
+    # BEFORE the conversion, not after. "time taken" started here and so excluded
+    # the conversion it printed two lines above -- on one 7.94h recording that was
+    # 89.5 of 222 seconds simply missing from the total, and the number looked
+    # plausible enough that it went unnoticed while the conversion was being
+    # optimised against it.
+    t_start = time.time()
     scratch, origin = None, {}
     if not a.no_convert:
         scratch = out / "_wav"
         files, origin = to_16k_mono(files, scratch)
 
-    t_start = time.time()
+    t_queue_start = time.time()
     ptxt = TM.build_prompt(a.glossary)
     if resident is not None:
         # Already loaded, and possibly asleep from a previous job on a small card.
@@ -431,7 +528,9 @@ def run_job(a, resident=None):
               f" -> embedder --batch {embed_batch}"
               + ("" if concurrent else ", run after the engine is released"),
               flush=True)
-    startup = time.time() - t_start
+    # From t_queue_start, so this stays the ENGINE's cost. t_start now sits
+    # before the conversion so that `total` includes it.
+    startup = time.time() - t_queue_start
     print(f"engine resident after {startup:.1f}s"
           + (" (already loaded)" if resident is not None else "")
           + f" — {len(files)} meetings queued\n", flush=True)
@@ -495,9 +594,18 @@ def run_job(a, resident=None):
             segs, cov, _, speech_end = TM.assemble(
                 st["outs"], st["offsets"], st["cores"], wav, dur)
         raw = meetings[name].file("raw", "json")
-        json.dump({"audio": str(f), "duration_s": round(dur, 2), "window_s": a.window,
-                   "n_windows": len(st["outs"]), "coverage": round(cov, 4),
-                   "segments": segs}, open(raw, "w"))
+        # `with`, not a bare open() handed to json.dump. This runs in a daemon
+        # that lives for many jobs, and the embedder -- a DIFFERENT PROCESS --
+        # opens this exact path a few lines below. Relying on refcounting to
+        # close it means any delay leaves a truncated file for the reader, and a
+        # short read here surfaces much later as an unexplained IndexError in
+        # link.py rather than as "the file was incomplete".
+        with open(raw, "w") as fh:
+            json.dump({"audio": str(f), "duration_s": round(dur, 2), "window_s": a.window,
+                       "n_windows": len(st["outs"]), "coverage": round(cov, 4),
+                       "segments": segs}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         if not segs:
             # MOSS returned nothing at all for this recording. Ten of forty
             # accented-parliament clips did exactly this in one evaluation and

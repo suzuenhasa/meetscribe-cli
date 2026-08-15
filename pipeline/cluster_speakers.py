@@ -468,19 +468,48 @@ def cluster(A, secs, keys, min_core=2.0, refine_iters=3, thr=None,
     lab_core = np.array([{c: i for i, c in enumerate(ids)}[c] for c in lab_core])
     k = len(ids)
 
-    # THE POSTCONDITION. Everything above only tries to honour the constraints;
-    # this is where we find out. It was previously left to floor_ok, which
-    # compares the speaker COUNT against MOSS's floor -- a violation can keep the
-    # count intact by trading two people for two others, and floor_ok would call
-    # that clean. Count is not the invariant. This is.
+    # THE POSTCONDITION, and it REPAIRS rather than raises. Everything above only
+    # tries to honour the constraints; this is where the result is made to.
+    #
+    # It was previously left to floor_ok, which compares the speaker COUNT to
+    # MOSS's floor -- a violation can keep the count intact by trading two people
+    # for two others, and floor_ok calls that clean. Count is not the invariant.
+    #
+    # Raising was the first version and was wrong for this pipeline. A violation
+    # is rare (measured: 1 pair in 216, on maybe a third of runs on one 7.94h
+    # recording, moving with the embedder's own run-to-run variation), and it is
+    # LOCAL -- two aggregates that should not share a cluster. Aborting threw
+    # away 155 seconds of GPU work over it, took the whole meeting down, and left
+    # the caller with nothing rather than with a transcript and a warning.
+    #
+    # Splitting the pair restores the invariant by construction: give one side a
+    # cluster of its own. That is what the clustering should have done, it is
+    # what a reviewer would do by hand, and it converges because each repair
+    # strictly reduces the number of violating pairs.
     viol = np.argwhere(np.triu(C, 1) & (lab_core[:, None] == lab_core[None, :]))
     info["cannot_link_violations"] = int(len(viol))
-    if len(viol):
-        pairs = "; ".join(f"{keys[core[a]]} vs {keys[core[b]]} -> both G{lab_core[a]:02d}"
-                          for a, b in viol[:4])
-        raise AssertionError(
-            f"{len(viol)} cannot-link pair(s) ended up in one cluster: {pairs}"
-            + ("" if len(viol) <= 4 else f" (and {len(viol) - 4} more)"))
+    info["cannot_link_repaired"] = 0
+    for _ in range(len(viol) + 1):
+        viol = np.argwhere(np.triu(C, 1) & (lab_core[:, None] == lab_core[None, :]))
+        if not len(viol):
+            break
+        a, b = viol[0]
+        # Move the SHORTER of the two: the longer one has more claim on the
+        # cluster's identity, and the centroid it leaves behind changes least.
+        move = a if secs[core[a]] <= secs[core[b]] else b
+        lab_core = lab_core.copy()
+        lab_core[move] = lab_core.max() + 1
+        info["cannot_link_repaired"] += 1
+        print(f"CANNOT-LINK-REPAIR {keys[core[a]]} and {keys[core[b]]} shared a "
+              f"cluster; moved {keys[core[move]]} to its own", flush=True)
+    else:
+        # Only reachable if a repair failed to reduce the count, which cannot
+        # happen with the rule above -- but say so rather than return silently.
+        raise AssertionError("could not separate every cannot-link pair")
+    if info["cannot_link_repaired"]:
+        ids = sorted(set(lab_core.tolist()))
+        lab_core = np.array([{c: i for i, c in enumerate(ids)}[c] for c in lab_core])
+        k = len(ids)
 
     Cm = centroids(lab_core, k)
 

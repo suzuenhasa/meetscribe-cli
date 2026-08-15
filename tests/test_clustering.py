@@ -161,13 +161,18 @@ class TestPostcondition:
         constrained, _k = cs.absorb_small(lab_cut, core, A, secs, cannot=C)
         assert len(violating_pairs(constrained, C)) == 0
 
-    def test_postcondition_raises_rather_than_returning_a_bad_labelling(self, cs,
-                                                                        monkeypatch):
+    def test_postcondition_repairs_rather_than_returning_a_bad_labelling(self, cs,
+                                                                         monkeypatch):
         """The check itself is load-bearing, so break a stage and watch it fire.
 
         6506bd8's point is that a violation need not change k, so no downstream
         consumer would notice. Replacing absorb_small with one that collapses
         everything is the cheapest way to prove the guard is not vacuous.
+
+        It REPAIRS rather than raising: a violation is local -- two aggregates
+        that must not share a cluster -- while aborting costs a whole meeting's
+        GPU work and returns nothing. Splitting the pair restores the invariant
+        by construction and the run continues, with the repair reported.
         """
         A, secs, keys = blocked_splinter_meeting()
 
@@ -175,9 +180,17 @@ class TestPostcondition:
             return np.zeros(len(lab_core), dtype=int), 1
 
         monkeypatch.setattr(cs, "absorb_small", collapse)
-        with pytest.raises(AssertionError) as e:
-            cs.cluster(A, secs, keys)
-        assert "cannot-link pair(s) ended up in one cluster" in str(e.value)
+        lab, k, core, weak, S, D, Cf, info = cs.cluster(A, secs, keys)
+
+        # it noticed, and it did something about it
+        assert info["cannot_link_violations"] > 0
+        assert info["cannot_link_repaired"] > 0
+
+        # and the labelling it returned actually satisfies the invariant
+        C = cs.cannot_link_matrix([keys[i] for i in core],
+                                  np.asarray(secs)[core], 1.0, 10)
+        lab_core = np.asarray(lab)[core] if len(lab) == len(A) else np.asarray(lab)
+        assert not (np.triu(C, 1) & (lab_core[:, None] == lab_core[None, :])).any()
 
     def test_cut_and_absorb_never_violate_on_random_meetings(self, cs):
         """Everything up to and including absorb_small honours the relation.

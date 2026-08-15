@@ -438,6 +438,15 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
             m = max(m, s["end"])
             reach.append(m)                  # furthest end among segments[:i+1]
         for o in sorted(orphans, key=lambda x: x["start"]):
+            # Reinstate only WELL-FORMED spans. The midpoint rule these were
+            # dropped by had a side effect worth keeping: a segment whose
+            # timestamps the model got backwards, or that sits outside the
+            # audio, tended to fall outside every core and be discarded. Filling
+            # a hole with one puts end <= start into the transcript, and that
+            # negative duration flows into the embedder's per-aggregate seconds
+            # and into clip extraction.
+            if not (0.0 <= o["start"] < o["end"] <= dur + 0.5):
+                continue
             k = bisect.bisect_left(starts, o["end"])
             if k and reach[k - 1] > o["start"]:
                 continue                     # a kept segment already covers it
