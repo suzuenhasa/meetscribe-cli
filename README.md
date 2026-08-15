@@ -183,3 +183,14 @@ speakers.db     who people are — the one thing not rebuildable from audio
 
 **[RUNBOOK.md](RUNBOOK.md)** — full command reference, flags, and
 troubleshooting.
+
+---
+
+## Licence
+
+Apache License 2.0 — see [LICENSE](LICENSE). Use it, change it, ship it, sell
+it; keep the notices. Contributions are taken under the same terms.
+
+MOSS, WeSpeaker and vLLM are Apache-2.0 as well and are downloaded at install
+time rather than bundled — [NOTICE](NOTICE) lists them and `setup.sh` pins the
+exact revisions.

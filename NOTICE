@@ -1,0 +1,32 @@
+meetscribe
+Copyright 2026 suzuenhasa
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+--------------------------------------------------------------------------------
+
+This project does not redistribute the components below. setup.sh downloads each
+one at install time, from its own source, and they remain under their own terms.
+Listed so you know what ends up on your machine.
+
+  MOSS-Transcribe-Diarize          Apache License 2.0
+  source   https://github.com/OpenMOSS/MOSS-Transcribe-Diarize
+  weights  https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize
+
+  WeSpeaker                        Apache License 2.0
+  source   https://github.com/wenet-e2e/wespeaker
+  weights  https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet293-LM
+
+  vLLM                             Apache License 2.0
+  https://github.com/vllm-project/vllm
+
+The exact revisions this project is pinned to are in setup.sh.
