@@ -772,12 +772,18 @@ def run_job(a, resident=None):
     done = [n for n, _ in pending if n not in failed and n not in broken_names]
     mins = sum(json.load(open(meetings[n].file("raw", "json")))["duration_s"]
                for n in done) / 60
-    print(f"{len(done)} meetings, {mins:.0f} min of audio")
-    print(f"  startup          {startup:6.1f}s  (once, not per meeting)")
+    # Say which number is which. "3 meetings, 32 min of audio" followed by a
+    # figure in seconds reads as though the run took 32 minutes -- the audio's
+    # length and the time it took are the two quantities here and they were not
+    # labelled apart.
+    n = len(done)
+    print(f"{n} meeting{'' if n == 1 else 's'} transcribed")
+    print(f"  audio in         {mins:6.0f} min")
+    print(f"  startup          {startup:6.1f}s   (once, not per meeting)")
     print(f"  transcribe+embed {t_gpu:6.1f}s"
-          + ("  [sequential]" if a.no_overlap_embed else "  [overlapped]"))
-    print(f"  total            {total:6.1f}s  ->  {mins*60/max(t_gpu,0.01):.0f}x realtime "
-          f"excluding startup")
+          + ("   [sequential]" if a.no_overlap_embed else "   [overlapped]"))
+    print(f"  time taken       {total:6.1f}s   {mins*60/max(t_gpu,0.01):.0f}x faster than "
+          f"real time, excluding startup")
 
     # Exit nonzero if ANY recording did not come out whole. A batch that reports
     # success while a transcript is missing is worse than one that fails loudly:
