@@ -81,21 +81,27 @@ If the engine is running, commands use it. Otherwise they load their own.
 
 ## Speed
 
-One batch, 6 meetings, 6.27 hours of audio, default flags — measured at
-[`c1eab3f`](https://github.com/suzuenhasa/meetscribe-cli/commit/c1eab3f), when
-`--overlap` still defaulted to 5. Later work removed that padding and rewrote
-the clustering, so current main is faster than this table; it has not been
-re-run on a 5090 or a 2060.
+One batch, 6 meetings, 6.27 hours of 16 kHz mono WAV, default flags. Three
+rented boxes, each a fresh `git clone` and `./setup.sh`.
 
-| GPU | VRAM | Engine load | 16 kHz mono WAV | 44.1 kHz stereo MP3 |
+| GPU | VRAM | Engine load | 6.27 h of audio | was |
 |:---|:---|:---|:---|:---|
-| RTX 5090 | 32 GB | 73 s | **48 s — 468×** | 80 s — 282× |
-| RTX 3090 | 24 GB | 63 s | 104 s — 217× | 130 s — 174× |
-| RTX 2060 | 6 GB | 114 s | 857 s — 26× | 966 s — 23× |
+| RTX 5090 | 32 GB | 56 s | **29.5 s — 766×** | 468× |
+| RTX 3090 | 24 GB | 66 s | 70.5 s — 320× | 217× |
+| RTX 2060 | 6 GB | 127 s | 580 s — 39× | 26× |
 
-*MP3 decoding is CPU-bound, so those figures vary by host — two RTX 3090s on
-different hosts gave 174× and 142× on MP3 but 217× and 203× on WAV. First run
-on a new machine is ~3× slower while `torch.compile` warms up.*
+The `was` column is the same corpus at
+[`c1eab3f`](https://github.com/suzuenhasa/meetscribe-cli/commit/c1eab3f). The
+transcripts are the same to **98% of words** and the speaker counts are
+unchanged on five of the six recordings — this is the same work, done faster.
+
+**Decode is 85–97% of that time**, and every run prints the breakdown. Engine
+load is once, not per meeting, and the first load on a new machine is ~3× slower
+while `torch.compile` builds its cache — 219 s against 66 s on the same 3090.
+
+Feeding it MP3 or any other format adds a conversion pass first, which runs
+across files in parallel and splits a long recording across cores: 6.27 h of MP3
+converts in about 22 s on a 48-core box, once.
 
 ---
 
