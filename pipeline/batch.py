@@ -157,6 +157,27 @@ class Embedder:
     def alive(self):
         return self.proc.poll() is None
 
+    def reset(self):
+        """Forget earlier jobs' acks. MUST be called before reusing a held worker.
+
+        The daemon holds ONE embedder across many jobs and acks are keyed on the
+        OUTPUT PATH, which --replace makes identical from run to run. So the
+        second run's drain() found the first run's ack already sitting there,
+        returned instantly without waiting for the embedding it had just
+        submitted, and link.py went on to read whatever npz happened to be on
+        disk -- the previous run's, or one half-written.
+
+        That is a stale npz against a fresh raw.json, i.e. a segment/metadata
+        mismatch, which surfaced as `IndexError: list index out of range` inside
+        link.py roughly one run in three. It only bites when the same output path
+        recurs on a resident worker, so it went unnoticed until the same meeting
+        was re-run repeatedly with --replace. MOSS's run-to-run variation is what
+        makes it fatal rather than merely wrong: if the segment count happened to
+        match, the stale file would be quietly used instead of crashing.
+        """
+        with self.cond:
+            self.acks.clear()
+
     def drain(self, outs):
         """Wait for exactly these outputs. -> {out_path: ack}
 
@@ -513,6 +534,7 @@ def run_job(a, resident=None):
     # back 3.54 of 3.90 GiB there, which is the whole problem solved.
     held = resident.embedder_if_alive() if resident is not None else None
     if held is not None:
+        held.reset()          # this job's acks only; see Embedder.reset
         # Nothing to decide. The embedder is already loaded and already holding
         # its share of the card, so measuring free VRAM here would see the memory
         # it is using and conclude it does not fit -- deferring an embedder that
