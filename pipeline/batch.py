@@ -361,6 +361,12 @@ class Resident:
 
 
 def run_job(a, resident=None):
+    # Per JOB, not per process. The resident engine serves many jobs from one
+    # interpreter, so a module-level accumulator reports every phase this daemon
+    # has ever run -- a 12s job printed 173s of decode, which is every earlier
+    # job's decode as well. The wall clock below was always per-job, so the two
+    # disagreed by more than an order of magnitude and only the breakdown lied.
+    PHASE.clear()
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     files = [Path(f) for f in a.audio if Path(f).is_file()]
