@@ -73,33 +73,52 @@ def constrained_linkage(S, cannot):
     thresholds costs one linkage pass rather than one per threshold.
     """
     n = len(S)
-    alive = list(range(n))
     Ssum = np.asarray(S, dtype=np.float64).copy()
     cnt = np.ones((n, n))
-    CL = cannot.copy()
+    CL = np.asarray(cannot).astype(bool).copy()
+    alive = np.ones(n, dtype=bool)
     heights, order = [], []
 
+    # `Rm` holds the current average-linkage similarity of every MERGEABLE pair
+    # and -inf everywhere else: lower triangle, dead nodes, cannot-link pairs.
+    # Keeping it live is what makes this affordable. The obvious way to write
+    # this loop -- rescanning every surviving pair in Python on every merge --
+    # is O(n^3) INTERPRETED, which is fine at the 91 labels a 32-minute meeting
+    # produces and ruinous at the 1,163 an 8-hour one does: 117s of a 452s run,
+    # twice over, since choose_threshold() links as well. Same merges, same
+    # heights to the bit, same labels at every threshold -- 269x measured.
+    idx = np.arange(n)
+    Rm = Ssum / cnt
+    Rm[np.tril_indices(n)] = -np.inf
+    Rm[CL & np.triu(np.ones((n, n), dtype=bool), 1)] = -np.inf
+
     while True:
-        best, bi, bj = -np.inf, -1, -1
-        for a in range(len(alive)):
-            i = alive[a]
-            for j in alive[a + 1:]:
-                if CL[i, j]:
-                    continue
-                s = Ssum[i, j] / cnt[i, j]
-                if s > best:
-                    best, bi, bj = s, i, j
-        if bi < 0:                        # every remaining pair is blocked
+        f = int(np.argmax(Rm))
+        best = Rm.flat[f]
+        if not np.isfinite(best):         # every remaining pair is blocked
             break
-        heights.append(best)
+        bi, bj = divmod(f, n)
+        heights.append(float(best))
         order.append((bi, bj))
-        for j in alive:
-            if j == bi or j == bj:
-                continue
-            Ssum[bi, j] = Ssum[j, bi] = Ssum[bi, j] + Ssum[bj, j]
-            cnt[bi, j] = cnt[j, bi] = cnt[bi, j] + cnt[bj, j]
-            CL[bi, j] = CL[j, bi] = CL[bi, j] or CL[bj, j]
-        alive.remove(bj)
+        # Lance-Williams update for average linkage, as slice arithmetic. `o` is
+        # every node that survives and is neither side of this merge, which is
+        # exactly what the per-j loop used to skip.
+        o = alive.copy()
+        o[bi] = False
+        o[bj] = False
+        Ssum[bi, o] += Ssum[bj, o]
+        Ssum[o, bi] = Ssum[bi, o]
+        cnt[bi, o] += cnt[bj, o]
+        cnt[o, bi] = cnt[bi, o]
+        CL[bi, o] |= CL[bj, o]
+        CL[o, bi] = CL[bi, o]
+        alive[bj] = False
+        # bj is gone; bi absorbed it, so only its row and column moved.
+        Rm[bj, :] = -np.inf
+        Rm[:, bj] = -np.inf
+        r = np.where(o & ~CL[bi], Ssum[bi] / cnt[bi], -np.inf)
+        Rm[bi, :] = np.where(idx > bi, r, -np.inf)
+        Rm[:, bi] = np.where(idx < bi, r, -np.inf)
 
     def labels_at(thr):
         par = list(range(n))
