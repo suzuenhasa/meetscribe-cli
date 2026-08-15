@@ -87,8 +87,14 @@ on a new machine is ~3× slower while `torch.compile` warms up.*
 
 ## Remote GPU
 
-`--host` moves only the compute. Your audio, library, and voice profiles stay
-local.
+`--host` runs the GPU work on another machine. Your **library** is the thing
+that stays local — transcripts, clips and `speakers.db` live here and are the
+authoritative copy.
+
+The audio itself does go over. It is uploaded, transcribed, and sits in the
+box's own library until you destroy the instance. Nothing goes to a third-party
+service, but it is on that machine while it works, so rent from someone you are
+willing to put the recording on.
 
 **One-time setup on the remote box:**
 
@@ -103,9 +109,8 @@ ssh mybox 'git clone https://github.com/suzuenhasa/meetscribe-cli.git /opt/meets
 ./transcribe --host mybox
 ```
 
-Audio goes up, meetings come back. `speakers.db` syncs both ways so the box
-recognises your people and anything it learns comes home. Destroy the instance
-— lose nothing.
+`speakers.db` syncs both ways, so the box recognises your people and anything
+it learns comes home. Destroy the instance — lose nothing.
 
 For rented boxes, `vast/provision.sh` handles unattended install. See
 [vast/README.md](vast/README.md).

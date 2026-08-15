@@ -169,8 +169,15 @@ so when the files on disk are newer.
 
 ## Working on a rented GPU
 
-`--host` means one thing: where the compute happens. Your audio, your library and
-your profiles stay on your machine.
+`--host` means one thing: where the compute happens. The **library** is what
+stays yours — transcripts, clips and `speakers.db` live here and are the
+authoritative copy.
+
+The audio does travel. It is uploaded, transcribed on the box, and remains in
+the box's library until the instance is destroyed. Nothing is sent to a
+third-party service — it is a machine you rented — but the recording is on it
+for the duration, which is worth knowing before pointing this at anything
+sensitive.
 
 ```bash
 cp ~/recordings/*.mp3 inbox/
