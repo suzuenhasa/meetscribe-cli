@@ -81,7 +81,11 @@ If the engine is running, commands use it. Otherwise they load their own.
 
 ## Speed
 
-One batch, 6 meetings, 6.27 hours of audio, default flags.
+One batch, 6 meetings, 6.27 hours of audio, default flags — measured at
+[`c1eab3f`](https://github.com/suzuenhasa/meetscribe-cli/commit/c1eab3f), when
+`--overlap` still defaulted to 5. Later work removed that padding and rewrote
+the clustering, so current main is faster than this table; it has not been
+re-run on a 5090 or a 2060.
 
 | GPU | VRAM | Engine load | 16 kHz mono WAV | 44.1 kHz stereo MP3 |
 |:---|:---|:---|:---|:---|

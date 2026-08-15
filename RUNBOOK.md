@@ -67,7 +67,7 @@ run individually.
 | `--roster "A,B"` | — | only match against these people |
 | `--name G02="Bob"` | — | name a cluster during the run |
 | `--window <s>` | `30` | seconds of audio per decode window |
-| `--overlap <s>` | `5` | context decoded either side of each window |
+| `--overlap <s>` | `0` | context decoded either side of each window |
 | `--thr <n\|auto>` | `auto` | speaker-clustering cut |
 | `--gpu-frac <n>` | auto | share of VRAM vLLM reserves |
 
@@ -86,8 +86,11 @@ per subject — a crypto interview and an archaeology seminar share no vocabular
 A path-like name that is not a file is an error rather than a term, so a typo
 says so instead of quietly telling the model to listen for "crypto.txt".
 
-**`--overlap 0`** is roughly 1.5× faster and mangles words at window seams. It is
-the only setting here that trades accuracy for speed.
+**`--overlap <s>`** decodes extra audio either side of each window as context.
+It is off by default. Measured across 7 recordings, 7.94 hours, `5` against `0`:
+the transcripts matched to within 0.05% on words, while `5` decoded 33% more
+audio, left twice the holes, and emitted 21× as many segments overlapping each
+other in time. Raise it only if a boundary is cutting something you need.
 
 **`--replace`** is for redoing a meeting you already have — a better glossary, a
 different `--thr`. It keeps the id, so every decision ever recorded about it
