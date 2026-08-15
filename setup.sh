@@ -17,6 +17,39 @@ WORK="${MS_WORK:-$HERE}"
 PIPE="$WORK/pipeline"
 MODEL="OpenMOSS-Team/MOSS-Transcribe-Diarize"
 WSP_REPO="Wespeaker/wespeaker-voxceleb-resnet293-LM"
+
+# ---------------------------------------------------------------- pinned set
+# Everything below floats otherwise: vLLM came from "latest release", both
+# GitHub sources were shallow clones of whatever HEAD was that day, and both
+# model downloads took the current revision. A clean install six months from now
+# was therefore a materially different stack from the one every measurement in
+# the README was taken on, and nothing recorded which.
+#
+# This is the set verified end-to-end on an RTX 3090, and the one today's
+# benchmarks ran against. Captured from the working install, not guessed:
+#
+#   python 3.12.3   torch 2.13.0+cu130   torchaudio 2.11.0+cu130
+#   transformers 5.15.0   numpy 2.3.5   scipy 1.18.0
+#   huggingface-hub 1.27.0   tokenizers 0.22.2   soundfile 0.14.0
+#
+# MS_UNPINNED=1 takes current HEAD and latest instead, which is how you find out
+# whether a newer stack works -- deliberately, rather than by the calendar.
+VLLM_VER="${MS_VLLM_VER:-0.27.1}"
+MOSS_SRC_REV="0e3d1403fd8f1f1c674e883ece96b9f630794ebe"
+MOSS_MODEL_REV="e8681d68e7042738ffca8ac8212bc8fcb1131ab8"
+WSP_MODEL_REV="6e6bffe5bf3d772a1f143dc6dbfea58a0799ea83"
+WESPEAKER_SRC_REV="dfa741957e5c11f477623b6e583d67d0af25ee88"
+if [ -n "${MS_UNPINNED:-}" ]; then
+  VLLM_VER=""; MOSS_SRC_REV=""; MOSS_MODEL_REV=""; WSP_MODEL_REV=""; WESPEAKER_SRC_REV=""
+fi
+# Pin a git checkout to a commit a shallow clone did not fetch.
+at_rev() {   # at_rev <dir> <sha>
+  [ -n "$2" ] || return 0
+  git -C "$1" rev-parse HEAD 2>/dev/null | grep -q "^$2" && return 0
+  git -C "$1" fetch -q --depth 1 origin "$2" 2>/dev/null \
+    && git -C "$1" checkout -q FETCH_HEAD 2>/dev/null \
+    || warn "could not pin $(basename "$1") to ${2:0:12}; using $(git -C "$1" rev-parse --short HEAD 2>/dev/null)"
+}
 export HF_HOME="${HF_HOME:-$WORK/.hf_home}"
 
 CHECK=0; REMOTE_HOST=""
@@ -150,10 +183,12 @@ fi
 if ! "$PY" -c "import vllm" >/dev/null 2>&1; then
   [ "$CHECK" -eq 1 ] && die "vLLM not installed in $PY"
   warn "installing vLLM (~2-3 GB, several minutes — progress below)"
-  VLLM_SPEC=vllm
+  VLLM_SPEC="${VLLM_VER:+vllm==$VLLM_VER}"; VLLM_SPEC="${VLLM_SPEC:-vllm}"
   case "$DRV_CUDA" in
     12.*)
-      VER="$(curl -fsSL https://api.github.com/repos/vllm-project/vllm/releases/latest 2>/dev/null \
+      # The pinned version, not whatever is newest today.
+      VER="$VLLM_VER"
+      [ -n "$VER" ] || VER="$(curl -fsSL https://api.github.com/repos/vllm-project/vllm/releases/latest 2>/dev/null \
              | grep -m1 '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')"
       ARCH="$(uname -m)"
       if [ -n "$VER" ]; then
@@ -210,6 +245,7 @@ if ! "$PY" -c "import moss_transcribe_diarize" >/dev/null 2>&1; then
   [ "$CHECK" -eq 1 ] && die "moss_transcribe_diarize missing"
   [ -d "$WORK/MOSS-Transcribe-Diarize" ] || git clone -q --depth 1 \
       https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git "$WORK/MOSS-Transcribe-Diarize"
+  at_rev "$WORK/MOSS-Transcribe-Diarize" "$MOSS_SRC_REV"
   "${PIPI[@]}" -e "$WORK/MOSS-Transcribe-Diarize"
 fi
 ok "moss_transcribe_diarize"
@@ -238,7 +274,7 @@ mkdir -p "$HF_HOME" "$WORK/runs" "$WORK/out" "$WORK/inbox" "$WORK/library" \
          "$WORK/wsp_ckpt/resnet293"
 if [ "$CHECK" -eq 1 ]; then
   "$PY" -c "
-from huggingface_hub import snapshot_download as d; d('$MODEL', local_files_only=True)" >/dev/null 2>&1 \
+from huggingface_hub import snapshot_download as d; d('$MODEL', local_files_only=True, revision='$MOSS_MODEL_REV' or None)" >/dev/null 2>&1 \
     && ok "MOSS cached" || die "MOSS weights not downloaded"
 else
   # Show the progress bars. Sending this to /dev/null made setup sit silent for
@@ -247,7 +283,7 @@ else
   if "$PY" -c "
 import sys
 from huggingface_hub import snapshot_download
-p = snapshot_download('$MODEL')
+p = snapshot_download('$MODEL', revision='$MOSS_MODEL_REV' or None)
 print(p)
 " ; then
     ok "MOSS-Transcribe-Diarize"
@@ -257,7 +293,7 @@ print(p)
   # Prove it landed, rather than trusting the exit code.
   "$PY" -c "
 from huggingface_hub import snapshot_download
-snapshot_download('$MODEL', local_files_only=True)" >/dev/null 2>&1 \
+snapshot_download('$MODEL', local_files_only=True, revision='$MOSS_MODEL_REV' or None)" >/dev/null 2>&1 \
     || die "MOSS reported success but is not in the cache at $HF_HOME"
 fi
 
@@ -268,7 +304,8 @@ if [ ! -f "$WORK/wsp_ckpt/resnet293/avg_model.pt" ]; then
 from huggingface_hub import hf_hub_download
 import shutil
 for f in ("avg_model.pt", "config.yaml"):
-    shutil.copy(hf_hub_download("$WSP_REPO", f), "$WORK/wsp_ckpt/resnet293/" + f)
+    shutil.copy(hf_hub_download("$WSP_REPO", f, revision="$WSP_MODEL_REV" or None),
+                "$WORK/wsp_ckpt/resnet293/" + f)
 EOF
   [ -s "$WORK/wsp_ckpt/resnet293/avg_model.pt" ] || die "WeSpeaker checkpoint is empty"
 fi
@@ -277,6 +314,7 @@ ok "WeSpeaker ResNet293-LM ($(du -h "$WORK/wsp_ckpt/resnet293/avg_model.pt" | cu
 if [ ! -d "$WORK/wespeaker_src/wespeaker" ]; then
   [ "$CHECK" -eq 1 ] && die "wespeaker source missing"
   git clone -q --depth 1 https://github.com/wenet-e2e/wespeaker.git "$WORK/wespeaker_src"
+  at_rev "$WORK/wespeaker_src" "$WESPEAKER_SRC_REV"
 fi
 ok "wespeaker source"
 
