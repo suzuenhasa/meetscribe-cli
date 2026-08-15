@@ -26,7 +26,7 @@ Platform Review — weekly
 
 [Quickstart](#quickstart) · [Speed](#speed) · [Remote GPU](#remote-gpu--optional) ·
 [How it works](#how-it-works) · [Requirements](#requirements) ·
-[Layout](#layout)
+[Layout](#layout) · [Licence](#licence)
 
 ---
 
@@ -34,7 +34,7 @@ Platform Review — weekly
 
 ```bash
 git clone https://github.com/suzuenhasa/meetscribe-cli.git
-cd meetscribe-cli && ./setup.sh        # ~10 min, mostly 2 GB of weights
+cd meetscribe-cli && ./setup.sh        # 2-10 min, mostly 2 GB of weights
 
 cp ~/recordings/*.mp3 inbox/
 ./transcribe
@@ -65,11 +65,12 @@ A `glossary.txt` beside where you run is picked up automatically.
 
 ### Keep the engine warm
 
-The engine costs ~70 s to load and that is paid per run. On a 3-minute clip it
-is the whole wall clock: **145 s cold against 25 s with it already up.**
+The engine costs ~60-70 s to load and that is paid per run. On a 3-minute clip
+it is nearly the whole wall clock: **99 s cold against 6.6 s with it already
+up**, measured on a 3090.
 
 ```bash
-./engine start      # ~70 s, once
+./engine start      # once, then it stays
 ./engine stop       # hand the card back
 ```
 
@@ -84,16 +85,11 @@ If the engine is running, commands use it. Otherwise they load their own.
 One batch, 6 meetings, 6.27 hours of 16 kHz mono WAV, default flags. Three
 rented boxes, each a fresh `git clone` and `./setup.sh`.
 
-| GPU | VRAM | Engine load | 6.27 h of audio | was |
-|:---|:---|:---|:---|:---|
-| RTX 5090 | 32 GB | 56 s | **29.5 s — 766×** | 468× |
-| RTX 3090 | 24 GB | 66 s | 70.5 s — 320× | 217× |
-| RTX 2060 | 6 GB | 127 s | 580 s — 39× | 26× |
-
-The `was` column is the same corpus at
-[`c1eab3f`](https://github.com/suzuenhasa/meetscribe-cli/commit/c1eab3f). The
-transcripts are the same to **98% of words** and the speaker counts are
-unchanged on five of the six recordings — this is the same work, done faster.
+| GPU | VRAM | Engine load | 6.27 h of audio |
+|:---|:---|:---|:---|
+| RTX 5090 | 32 GB | 56 s | **29.5 s — 766×** |
+| RTX 3090 | 24 GB | 66 s | 70.5 s — 320× |
+| RTX 2060 | 6 GB | 127 s | 580 s — 39× |
 
 **Decode is 85–97% of that time**, and every run prints the breakdown. Engine
 load is once, not per meeting, and the first load on a new machine is ~3× slower
