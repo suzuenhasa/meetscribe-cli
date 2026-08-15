@@ -56,6 +56,11 @@ are pooled across recordings, and each meeting's embedding overlaps the next
 one's transcription. Six podcasts as one batch measured ~3 minutes against ~13
 run individually.
 
+Every run ends with **where the work went** — busy time per phase, largest
+first. Phases overlap (decoding runs while the embedder works in another
+process), so they sum to more than the elapsed time; the point is the ranking,
+not the total. It is how you tell a slow run from a slow machine.
+
 ### Flags
 
 | flag | default | |
@@ -279,6 +284,16 @@ copies to `speakers.db.pre-ids`, keeps every old value in a `legacy_name` column
 and **leaves alone** any row whose meeting is not in the library rather than
 dropping it.
 
+### Tests
+
+```bash
+python3 -m pytest tests/ -q
+```
+
+No GPU, no venv, ~15 seconds. Every test pins a defect this repo actually had
+and names the commit that fixed it, so a failure tells you which behaviour
+regressed rather than only that something did.
+
 ### Running the pipeline directly
 
 Rarely needed. Use the interpreter setup chose:
@@ -357,6 +372,11 @@ than failing inside the allocator.
 | `MS_VRAM_GIB` | cap the VRAM the pipeline plans for; behaves as if the card were that size |
 | `MS_MAX_SEQS` | concurrent sequences vLLM will run |
 | `MS_PY` | the interpreter that owns the dependencies (set by `setup.sh`) |
+| `MS_SPLIT_MIN_S` | recordings longer than this are decoded in parallel ranges; default `1200` |
+| `MS_SPLIT_TARGET_S` | seconds per range; default `600` |
+| `MS_SPLIT_MAX_PARTS` | ranges at once; default `8`, measured optimum |
+| `MS_SPLIT_RUN_UP_S` | discarded decoder run-up before each range; default `2` |
+| `MS_UNPINNED` | `setup.sh` takes current HEAD and latest instead of the pinned set |
 
 ---
 
@@ -377,6 +397,20 @@ the model heard talking simultaneously — a bug, not a tuning problem.
 
 **A name is mangled.** Add it to `glossary.txt`. Still wrong near a window
 boundary? `--overlap 10`.
+
+**`STOPPED EARLY`.** The transcript ends before the speech does — the model quit
+partway. The recording is listed with what it covered, and the run exits
+nonzero. The audio and embeddings are kept, so `./transcribe --replace <id>`
+redoes it without losing the meeting's history.
+
+**`recovered N segment(s) that fell through a window seam`.** Normal, and only
+appears with `--overlap` above 0. Two windows each decided the other owned a
+segment straddling their boundary; this puts it back. Zero on the default.
+
+**`CANNOT-LINK-REPAIR`.** The model heard two people in one window and the
+clustering still put them together; one has been moved to its own cluster. Rare,
+and the transcript is written normally. Frequent occurrences on the same
+recording are worth reporting.
 
 **Wrong person recognised.** `--roster` narrows the gallery. False accepts grow
 with gallery size.
