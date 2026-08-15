@@ -46,6 +46,18 @@ seconds of each voice. The inbox empties as they finish.
 `wav mp3 m4a flac ogg opus aac m4b aiff wma mp4 webm mkv`, any sample rate.
 Conversion to 16 kHz mono happens automatically.
 
+**Keep the engine loaded** if you transcribe often. It costs ~70 s to start and
+that is paid per run, so on a 3-minute clip it is the whole wall clock — 145 s
+cold against 25 s with it already up.
+
+```bash
+./engine start      # ~70 s, once
+./engine stop       # hand the card back
+```
+
+Nothing requires it. Everything uses it when it is there and loads its own
+engine when it is not.
+
 **Every command is in [RUNBOOK.md](RUNBOOK.md).**
 
 ---
@@ -66,19 +78,8 @@ Two RTX 3090s on different hosts measured 174× and 142× on MP3 but 217× and 2
 on WAV, so treat the MP3 figures as indicative rather than a property of the GPU.
 
 Engine load is ~3× higher the first time on a new machine, while `torch.compile`
-fills its cache.
-
-**That load is paid per run.** On an hour of audio it disappears; on a 3-minute
-clip it is the whole wall clock — 145 s cold against 25 s with the engine
-already up. So keep it up:
-
-```bash
-./engine start      # ~70 s, once
-./engine stop       # hand the card back
-```
-
-Nothing requires it. Everything uses it when it is there and loads its own
-engine when it is not.
+fills its cache — and it is paid per run unless you keep the engine up, which is
+what `./engine start` above is for.
 
 ---
 
