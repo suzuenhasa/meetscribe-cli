@@ -37,7 +37,16 @@ from pathlib import Path
 # is 88 characters and would be repeated on every file in the folder.
 SLUG_WORDS = 5
 SLUG_CHARS = 40
-ID_CHARS = 5
+# 8, not 5. speakers.db keys on this and find() returns the first meeting whose
+# id matches, so two meetings sharing one is not a cosmetic clash -- it is two
+# recordings sharing a history that belongs to neither, which is the exact bug
+# the ids were introduced to end.
+#
+# 31^5 is 28.6M, and the birthday bound over a library is not remote: 1.7% at
+# 1,000 meetings, 6.7% at 2,000, 35% at 5,000. 31^8 is 852 billion, which puts
+# 5,000 meetings at about 1 in 68 million. Three characters, and the name stays
+# short enough to read aloud.
+ID_CHARS = 8
 # No 0/1/l/o: these get read aloud and typed by hand.
 ID_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz"
 
@@ -154,8 +163,14 @@ def create(title, source_name, lib=None, mid=None):
     been transcribed successfully."""
     lib = Path(lib) if lib else library_dir()
     lib.mkdir(parents=True, exist_ok=True)
+    # Against every id in the library, NOT against the resulting path. The folder
+    # name carries the slug too, so `cats-abcde` and `dogs-abcde` are two distinct
+    # paths and the old check waved both through -- while speakers.db keyed on
+    # `abcde` for both and find() returned whichever it met first. The one thing
+    # the id has to be is unique, and that was the one thing not being tested.
+    taken = {m.id for m in all_meetings(lib)}
     mid = mid or new_id()
-    while (lib / folder_name(title, mid)).exists():
+    while mid in taken or (lib / folder_name(title, mid)).exists():
         mid = new_id()
     m = Meeting(lib / folder_name(title, mid))
     m.path.mkdir(parents=True)
