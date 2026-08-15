@@ -236,12 +236,21 @@ pull_profiles() {
 # they stay with the thing they describe. --out puts them somewhere else.
 # The library: one directory per meeting, here, whatever machine did the work.
 LIBRARY="${OUTDIR:-${MS_LIBRARY:-$HERE/library}}"
-# Where the job itself writes. A REMOTE run writes into the box's own library and
-# is rsynced to $LIBRARY afterwards, so the two are different by design. A LOCAL
-# run has no trip home, so they have to be the same -- and they were not: the
-# invocation hardcoded the install's library, so --out set where the "N meetings
-# in ..." line pointed and nothing else. Meetings went to ./library regardless,
-# which is silent data landing somewhere the caller said not to put it.
+# --out is a path on the machine you typed the command on, and the meetings end
+# up there either way. With --host the box works in its own library and rsyncs
+# home; without one there is no trip, so the job writes there directly. Same
+# destination, so the command does not change meaning when the GPU does.
+#
+# Unwritable is a warning, not a stop: the transcribing is the expensive part and
+# it has not happened yet, so refusing here throws away nothing -- but refusing
+# AFTER a remote run would strand finished work on a box you are about to
+# destroy. Put it in the default library and say so.
+if ! mkdir -p "$LIBRARY" 2>/dev/null; then
+  echo "!! cannot write to $LIBRARY — using $HERE/library instead" >&2
+  LIBRARY="$HERE/library"
+  mkdir -p "$LIBRARY" || { echo "cannot write to $LIBRARY either" >&2; exit 2; }
+fi
+# Where the JOB writes, which is the box's own library on a remote run.
 if [ "$LOCAL" -eq 1 ]; then JOBLIB="$LIBRARY"; else JOBLIB="$REMOTE/library"; fi
 # Audio MOVES out of the inbox, because a worklist should empty as work
 # completes. Anywhere else it is copied: emptying a directory the caller merely
@@ -250,7 +259,6 @@ MOVEAUDIO=""
 case "$(cd "$(dirname "${SRC%/}")" 2>/dev/null && pwd)/$(basename "${SRC%/}")" in
   "$HERE/inbox") MOVEAUDIO="--move-audio" ;;
 esac
-mkdir -p "$LIBRARY" || { echo "cannot write to $LIBRARY" >&2; exit 2; }
 
 # A directory means batch: the engine loads once instead of per file (~66s each),
 # and embedding overlaps the next file's transcription.
