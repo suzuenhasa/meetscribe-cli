@@ -442,7 +442,12 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
         else:
             if cur >= 3:
                 drop.update(runs)
-            cur, prev, runs = 0, t, [idx - 1]
+            # [idx], not [idx - 1]. idx is the first member of the run starting
+            # here; idx - 1 is the PRECEDING, different segment, so the guard
+            # dropped a real line before every loop and kept one loop member
+            # instead. Same count either way, so "dropped 4 looped segments"
+            # read as correct while removing the wrong four.
+            cur, prev, runs = 0, t, [idx]
     if cur >= 3:
         drop.update(runs)
     if drop:
