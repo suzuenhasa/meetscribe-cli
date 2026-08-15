@@ -147,7 +147,11 @@ case "${1:-status}" in
     # rc 2 from --status means "up, but holding code older than pipeline/ on
     # disk" -- it prints why. Not a failure: the engine works, it is just not
     # the engine you think you deployed.
-    OUT="$("$PY" "$HERE/pipeline/engined.py" --status --sock "$SOCK" 2>&1)"; RC=$?
+    # RC=0 first, then `|| RC=$?`. A bare `OUT="$(...)"; RC=$?` takes its exit
+    # status FROM the substitution, so under `set -e` the assignment itself
+    # ends the script and the case below is never reached -- including on rc 1,
+    # which is just "no engine" and the answer most of the time.
+    RC=0; OUT="$("$PY" "$HERE/pipeline/engined.py" --status --sock "$SOCK" 2>&1)" || RC=$?
     case "$RC" in
       0) echo "running — $SOCK" ;;
       2) echo "running — $SOCK"; echo "$OUT" | tail -n +2 ;;
