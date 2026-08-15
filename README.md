@@ -3,257 +3,110 @@
 Meeting audio in, speaker-attributed transcript out. Runs on your own GPU.
 
 ```
-Finance & Corporate Committee - Zoom Meeting
+Platform Review — weekly
 104.0 min · 1074 turns · 16 speakers
 ==================================================================
 
-[0:00:00] Speaker 4
+[0:00:00] Dana Whitfield
   Meeting open, welcome everybody.
-  So we'll start with the apologies and I guess we have Hazel, everyone else
+  So we'll start with the apologies and I guess we have Priya, everyone else
   seems to be here, I think. So could I have a mover please?
 
-[0:00:12] Speaker 3
-  Andrew, just before you do, I had to leave the meeting at 1.30 to attend a
-  future proof meeting. So sorry about that.
+[0:00:12] Marcus Elle
+  Dana, just before you do, I have to leave at 1.30 to attend the roadmap
+  session. So sorry about that.
 ```
 
-Name a voice once and it is recognised in every meeting after that.
+Name a voice once and it is recognised in every meeting after that — including
+the ones you already transcribed.
+
+---
+
+## Get started
+
+```bash
+git clone https://github.com/suzuenhasa/meetscribe-cli.git
+cd meetscribe-cli
+./setup.sh                        # ~10 min, mostly 2 GB of weights
+
+cp ~/recordings/*.mp3 inbox/
+./transcribe
+```
+
+Each recording becomes a directory in `library/` — transcript, audio, and a few
+seconds of each voice. The inbox empties as they finish.
+
+```bash
+./speakers who <meeting>                   # which voice is which
+./speakers play <meeting> G02              # hear one
+./speakers name <meeting> G02 "Dana Whitfield"
+./speakers apply --apply                   # name them in older meetings too
+```
+
+`wav mp3 m4a flac ogg opus aac m4b aiff wma mp4 webm mkv`, any sample rate.
+Conversion to 16 kHz mono happens automatically.
+
+**Every command is in [RUNBOOK.md](RUNBOOK.md).**
+
+---
 
 ## Speed
 
 Six meetings, 6.27 hours of audio, one batch, default flags. The engine loads
 once per batch however many files are in it, so it is listed separately:
 
-| GPU | VRAM | engine load | 16 kHz mono WAV | 44.1 kHz stereo MP3 | format gain |
-|---|---|---|---|---|---|
-| RTX 5090 | 32 GB | 73 s | **48 s — 468×** | 80 s — 282× | 1.65× |
-| RTX 3090 | 24 GB | 63 s | 104 s — 217× | 130 s — 174× | 1.25× |
-| RTX 2060 | 6 GB | 114 s | 857 s — 26× | 966 s — 23× | 1.13× |
+| GPU | VRAM | engine load | 16 kHz mono WAV | 44.1 kHz stereo MP3 |
+|---|---|---|---|---|
+| RTX 5090 | 32 GB | 73 s | **48 s — 468×** | 80 s — 282× |
+| RTX 3090 | 24 GB | 63 s | 104 s — 217× | 130 s — 174× |
+| RTX 2060 | 6 GB | 114 s | 857 s — 26× | 966 s — 23× |
 
-The MP3 column depends on the host as well as the card — decoding is CPU work
-and it lands inside the same timer. Two RTX 3090s on different hosts measured
-174× and 142× on MP3 but 217× and 203× on WAV, so treat the MP3 figures as
-indicative rather than a property of the GPU. Engine load is also ~3× higher the
-very first time on a new machine, while `torch.compile` fills its cache.
+The MP3 column depends on the host as well as the card — decoding is CPU work.
+Two RTX 3090s on different hosts measured 174× and 142× on MP3 but 217× and 203×
+on WAV, so treat the MP3 figures as indicative rather than a property of the GPU.
 
-**Feeding it 16 kHz mono is free speed, but how much depends on your GPU.**
-Decoding MP3 and resampling 44.1 kHz down to the 16 kHz the model wants is real
-work and comes out of the same wall clock — so the faster the card, the larger a
-share of the total that decode represents. It is worth 1.65× on a 5090 and only
-1.13× on a 2060, where the GPU is the bottleneck anyway. If you have a fast card
-and a library to get through, convert once:
+Engine load is ~3× higher the first time on a new machine, while `torch.compile`
+fills its cache.
+
+**That load is paid per run.** On an hour of audio it disappears; on a 3-minute
+clip it is the whole wall clock — 145 s cold against 25 s with the engine
+already up. So keep it up:
 
 ```bash
-ffmpeg -i meeting.mp3 -ac 1 -ar 16000 -c:a pcm_s16le meeting.wav
+./engine start      # ~70 s, once
+./engine stop       # hand the card back
 ```
 
-On a small card it is barely worth the disk space.
-
-`--overlap 0` is a further ~1.5× on top, but it is the one setting here that
-trades accuracy for speed — see Options.
-
-### Keeping the engine loaded
-
-That engine-load column is paid once per *run*, not once per machine. On a long
-batch it disappears into the total. On a short recording it **is** the total —
-a 3-minute clip on a 3090 spends 1.4 s transcribing and about 140 s loading the
-thing that transcribes it.
-
-So don't make it load:
-
-```bash
-./engine start          # ~70 s, once
-./transcribe memo.mp3   # 25 s, where it was 145 s
-./engine stop           # hand the card back
-```
-
-Everything uses it when it is there and loads its own engine when it is not, so
-this is only ever an optimisation: `./transcribe` behaves the same either way,
-and stopping it is safe at any time, including mid-queue — a running
-job finishes on the engine it already has.
-
-It holds VRAM while it runs. After 15 minutes idle it hands the card back and
-keeps only the weights, waking in about a second when the next job arrives; set
-`MS_ENGINE_IDLE_SLEEP=0` to keep it resident regardless. It serves one job at a
-time, and only the `--window`/`--overlap` it was started with — a run asking for
-different ones is told why and loads its own.
+Nothing requires it. Everything uses it when it is there and loads its own
+engine when it is not.
 
 ---
 
-## Install
+## Using a rented GPU
 
-Needs an NVIDIA GPU and `ffmpeg`. **6 GB VRAM or more**, and compute capability
-7.0+ (Turing, GTX 16-series and RTX 20-series onward) — Pascal and older will not
-run vLLM. A 6 GB card transcribes and embeds in two passes rather than at once,
-which is slower but complete.
+`--host` means one thing: where the compute happens. Your audio, library and
+voice profiles stay on your machine.
+
+**Install it on the box too** — `--host` needs the pipeline at the other end:
 
 ```bash
-git clone https://github.com/suzuenhasa/meetscribe-cli.git
-cd meetscribe-cli
-./setup.sh
+ssh mybox 'git clone https://github.com/suzuenhasa/meetscribe-cli.git /opt/meetscribe \
+           && cd /opt/meetscribe && ./setup.sh'
 ```
 
-Ten minutes, mostly ~2 GB of weights. Everything lands inside the checkout, so
-deleting the folder removes the install. Re-run any time; `./setup.sh --check`
-verifies without changing anything.
-
-`setup.sh` assumes an FHS-style Linux — it fetches a prebuilt Python and expects
-the usual loader paths. On NixOS and other non-FHS distributions it will not run
-as-is: use your own Python, and expect to set library paths for the NVIDIA
-driver, GCC runtime and zlib, plus a compiler and `TRITON_LIBCUDA_PATH` for
-Triton. Everything works there once those are supplied — it is a packaging
-assumption, not a limitation.
-
----
-
-## Use
-
-Drop recordings in `inbox/` and run it:
+Then from your laptop:
 
 ```bash
 cp ~/recordings/*.mp3 inbox/
-./transcribe
+./transcribe --host mybox
 ```
 
-Each one becomes a directory in `library/`:
+Audio goes up, meetings come back, and `speakers.db` travels both ways so the
+box recognises your people and anything it learns comes home. Destroy the
+instance and you lose nothing.
 
-```
-library/
-  one-trust-network-to-rule-9ajq9/
-    meeting.json                              id, title, duration
-    one-trust-network-to-rule-audio.mp3       your original
-    one-trust-network-to-rule-transcript.txt
-    one-trust-network-to-rule-transcript.json
-    one-trust-network-to-rule-embeddings.npz
-    one-trust-network-to-rule-clusters.npz
-    clips/G00-1.mp3 …                         a few seconds of each voice
-```
-
-The inbox is a worklist: files leave it as they finish, so anything still there
-has not been done.
-
-`./transcribe ~/somewhere/` uses that folder instead, and copies rather than
-moves — only the inbox empties, because only the inbox is a worklist.
-`./transcribe one.mp3` does a single file.
-
-`wav mp3 m4a flac ogg opus aac m4b aiff wma mp4 webm mkv`, any sample rate.
-Anything not already 16 kHz mono is converted first, all files at once, which is
-most of the speed above.
-
-A batch is faster than one file at a time: the engine loads once for the whole
-queue, windows are pooled across recordings, and each meeting's embedding
-overlaps the next one's transcription.
-
-### The five characters on the end
-
-`one-trust-network-to-rule-9ajq9` — the slug is for you, the id is for the
-software. `speakers.db` records decisions against the **id**, so you can rename
-the directory, tidy the files inside it, or reorganise the whole library, and
-everything ever decided about that meeting still points at it.
-
----
-
-## Names it has never heard
-
-Unfamiliar proper nouns are not misspelled, they are replaced by similar-sounding
-English: `"I'm Sreeram"` became `"I'm sure I'm a, I'm"`. Put a `glossary.txt`
-beside where you run — picked up automatically:
-
-```
-Sreeram Kannan
-EigenCloud
-```
-
-Or `./transcribe m.mp3 --glossary "Sreeram Kannan,EigenCloud"`.
-
----
-
-## Naming voices
-
-Everyone starts as `Speaker 1`, `Speaker 2` — correct within a recording, but
-Monday's "Speaker 1" is unrelated to Tuesday's. Name someone once and they are
-recognised from then on.
-
-```bash
-./speakers meetings                        # what is in the library
-./speakers who one-trust                   # the voices, and what each said
-./speakers play one-trust G02              # hear one (needs an audio device)
-./speakers name one-trust G02 "Bob Smith"  # remember that voice
-```
-
-A meeting is anything that identifies one: its id, its directory, a path, or
-enough of the title to be unambiguous.
-
-Naming someone applies to meetings you **already have**, not just future ones:
-
-```bash
-./speakers apply             # what would change
-./speakers apply --apply     # re-identify and re-render
-```
-
-One enrolment, every transcript they appear in. It costs nothing — cosine
-arithmetic over centroids already on disk, no GPU and no re-transcription.
-
-Then every later meeting reports what it found:
-
-```
-identify: 4 voices in this meeting, 3 enrolled candidates
-  = G00      612s  Bob Smith              0.952
-  ? G01       74s  Ravi Patel             0.478  (2nd 0.443)
-    G03       31s  -                      0.201
-```
-
-`=` recognised, `?` too close to call, blank is nobody on file. Matching needs
-0.55 *and* a 0.10 margin over the runner-up; 0.40–0.55 asks a person; below is
-treated as new. A voice needs 10 s of speech to enroll.
-
-If you know who is in the room, say so — false accepts grow with gallery size:
-
-```bash
-./transcribe standup.mp3 --roster "Bob Smith,Jane Doe"
-```
-
-Also: `./speakers list`, `./speakers rename <id> "New Name"`,
-`./speakers forget <id>`.
-
-`speakers.db` is the only thing here that cannot be rebuilt from the audio.
-Back it up. With `--host` it travels to the box for the run and comes back, so
-the profiles are yours and a destroyed instance costs nothing.
-
-`clips/` holds a few seconds of each speaker, cut from the original — about a
-megabyte against fifty. They are what makes naming possible after you archive or
-delete the recordings, so a library stays useful when the audio is gone. They are
-never used to compute a voiceprint; that only ever comes from the original.
-
----
-
-## Options
-
-| flag | default | |
-|---|---|---|
-| `--glossary` | — | proper nouns, comma-separated |
-| `--roster` | — | restrict matching to these people |
-| `--name` | — | `G02="Bob Smith"` |
-| `--window` | `30` | seconds per window |
-| `--overlap` | `5` | context each side |
-| `--thr` | `auto` | speaker-clustering cut |
-| `--gpu-frac` | auto | VRAM vLLM reserves |
-| `--host` | — | run the GPU work on a remote box over ssh |
-| `--out` | `library/` | where meetings are kept |
-| `--replace` | — | overwrite a meeting id in place, keeping its history |
-
-The defaults are measured, not guessed. `--window` longer is slower *and* no more
-accurate. `--thr` used to be a constant and a wrong value silently merged every
-speaker into one; it now derives itself per recording. `--gpu-frac` likewise: the
-engine's cost is a fixed ~2.6 GB regardless of card, so any single fraction is
-wrong somewhere — it reserves what the speaker embedder needs alongside and gives
-vLLM the rest. You should not need to set it.
-
-`--overlap` is the one real trade here. Each 30 s window is decoded with 5 s of
-context on both sides, so a word landing on a boundary is transcribed from a
-window that can hear the whole of it. Setting `--overlap 0` is about 1.5× faster
-and mangles words at the seams. Keep it unless throughput matters more than the
-transcript.
+For a rented box from nothing, `vast/provision.sh` does the whole install
+unattended — see [vast/README.md](vast/README.md).
 
 ---
 
@@ -266,45 +119,31 @@ audio ──► MOSS on vLLM        text + per-window speaker labels
              ▼
       constrained clustering  Speaker 1, Speaker 2, …
              ▼
-      profile store (sqlite)  Bob Smith, Jane Doe
+      profile store (sqlite)  Dana Whitfield, Marcus Elle
 ```
 
 [MOSS-Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize)
 labels speakers *within* each window, but window 4's "S01" is not necessarily
 window 5's. [WeSpeaker](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet293-LM)
-embeddings link them across the recording, and the profile store puts names on
-the result.
+embeddings link them across a recording, and the profile store puts names on the
+result — across recordings, and across months.
 
 ---
 
-## Troubleshooting
+## Requirements
 
-**Everyone is one speaker, or one person appears as several.** `k_est` on the
-`CLUSTER` line is the count found. `FLOOR-VIOLATION` means fewer speakers than
-the model heard talking at once — a bug, not a tuning issue.
+NVIDIA GPU, **6 GB VRAM or more**, compute capability 7.0+ (Turing, GTX 16-series
+and RTX 20-series onward). Pascal and older will not run vLLM. Plus `ffmpeg`.
 
-**A name is mangled.** Add it to `glossary.txt`. Still wrong near a 30 s
-boundary? `--overlap 10`.
+A 6 GB card transcribes and embeds in two passes rather than at once — slower,
+but complete.
 
-**Wrong person recognised.** Use `--roster`. Close calls are marked `?` and left
-numbered rather than guessed.
+Everything lands inside the checkout, so deleting the folder removes the install.
+`./setup.sh --check` verifies without changing anything.
 
-**vLLM won't start.** Free memory near zero means something else holds the GPU —
-one vLLM at a time. Otherwise `supervisorctl stop ray`.
-
-**`ModuleNotFoundError`** running the pipeline scripts directly — use the
-interpreter setup chose: `source env.sh && "$MS_PY" pipeline/batch.py ...`
-
-**A voice is enrolled but old transcripts still say Speaker 3.** `./speakers
-apply --apply`. Identification runs when a recording is processed, against
-whoever was enrolled then; this re-runs it over everything you already have.
-
-**One person enrolled twice.** Two voiceprints for the same voice both score
-~1.000, so the 0.10 margin can never be met and they come out `?` forever.
-`./speakers list` shows it — two entries, near-identical speech time.
-`./speakers forget <id>` on the duplicate.
-
-**Anything else** — `./setup.sh --check`.
+`setup.sh` assumes an FHS-style Linux. On NixOS and other non-FHS distributions
+use your own Python and expect to set library paths for the NVIDIA driver, GCC
+runtime and zlib, plus `TRITON_LIBCUDA_PATH`.
 
 ---
 
@@ -313,41 +152,18 @@ whoever was enrolled then; this re-runs it over everything you already have.
 ```
 inbox/                drop recordings here; empties as they finish
 library/              one directory per meeting
-speakers.db           who people are — the one thing not rebuildable
+speakers.db           who people are — the one thing not rebuildable from audio
 
 transcribe            the inbox, a folder, or one file
 speakers              meetings / who / play / name / apply / list / forget
-engine                start / stop the resident engine, so runs skip the load
+engine                start / stop the resident engine
 setup.sh              installs everything; --check verifies
-preview.py            backs speakers who / play / clips
-pipeline/             the pipeline itself, run in place
-pipeline/library.py   the naming rules: slugs, ids, where things go
-pipeline/migrate_ids.py   re-key a store written before ids existed
 ```
 
-## Running it on someone else's GPU
+`speakers.db` is the only thing here that cannot be rebuilt from the audio.
+Back it up.
 
-`--host` means one thing: where the compute happens. Everything else is
-unchanged — your audio, your library and your profiles stay on your machine.
+---
 
-```bash
-./transcribe --host msbox
-```
-
-It uploads the audio, runs, brings back whole meeting directories, and syncs
-`speakers.db` up before the run and back after, so the box identifies against
-your people and anything it learns comes home. The box holds a copy for as long
-as it is working; destroy the instance and you lose nothing.
-
-`~/.ssh/config`:
-
-```
-Host msbox
-  HostName 1.2.3.4
-  Port 22
-  User root
-  IdentityFile ~/.ssh/id_ed25519
-```
-
-`export MS_HOST=msbox` saves typing it. `vast/provision.sh` sets a rented box up
-from nothing — see `vast/README.md`.
+**[RUNBOOK.md](RUNBOOK.md)** — every command, every flag, and what to do when
+something is wrong.

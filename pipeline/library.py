@@ -5,13 +5,13 @@ Everything about a meeting lives in one folder and everything about people lives
 in one file beside them, so "where is my stuff" has a single answer.
 
     library/
-      eigencloud-founder-how-ai-agents-k49fj/
+      platform-review-weekly-q3-k49fj/
         meeting.json                                 id, title, source, dates
-        eigencloud-founder-how-ai-agents-audio.mp3
-        eigencloud-founder-how-ai-agents-transcript.txt
-        eigencloud-founder-how-ai-agents-transcript.json
-        eigencloud-founder-how-ai-agents-embeddings.npz
-        eigencloud-founder-how-ai-agents-clusters.npz
+        platform-review-weekly-q3-audio.mp3
+        platform-review-weekly-q3-transcript.txt
+        platform-review-weekly-q3-transcript.json
+        platform-review-weekly-q3-embeddings.npz
+        platform-review-weekly-q3-clusters.npz
         clips/G00-1.mp3 ...
       speakers.db
 
@@ -32,8 +32,8 @@ import string
 from pathlib import Path
 
 # 5 words or 40 characters, whichever comes first. Long enough to recognise a
-# meeting, short enough that the path is not the whole title -- "EigenCloud
-# Founder: How AI Agents Will Change Crypto, EIGEN Token and More | TG Podcast"
+# meeting, short enough that the path is not the whole title -- "Platform
+# Review: What Changes Next Quarter, Staffing and More | Weekly"
 # is 88 characters and would be repeated on every file in the folder.
 SLUG_WORDS = 5
 SLUG_CHARS = 40

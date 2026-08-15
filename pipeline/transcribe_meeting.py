@@ -23,7 +23,7 @@ def build_prompt(glossary=""):
     """The chat-template prompt, with an optional proper-noun glossary appended.
 
     Names the model has never seen come out as the nearest familiar English --
-    "I'm Sreeram" was transcribed "I'm sure I'm a, I'm". Post-hoc correction
+    "I'm Dana" was transcribed "I'm the na, I'm". Post-hoc correction
     cannot fix that safely because the output is valid English, so the
     vocabulary has to reach the decoder.
     """
@@ -497,7 +497,7 @@ def main():
                          "speaker embedder.")
     ap.add_argument("--glossary", default="",
                     help="comma-separated proper nouns to bias decoding toward, "
-                         "e.g. 'Sreeram Kannan,EigenLayer,EigenCloud'")
+                         "e.g. 'Dana Whitfield,Northwind,NorthwindDA'")
     ap.add_argument("--no-silence-gate", action="store_true",
                     help="keep segments that sit in digital silence")
     args = ap.parse_args()

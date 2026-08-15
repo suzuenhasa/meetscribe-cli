@@ -154,7 +154,7 @@ def refine_leave_one_out(Ac, lab_core, k, iters=3):
     Plain refinement compares a turn against a centroid it is itself part of. In
     a small cluster that centroid is mostly the turn, so it always wins and the
     turn can never move however well it matches the speaker it belongs to. On the
-    podcast this pinned one of Sreeram's turns into a 9-member junk cluster at
+    podcast this pinned one of the host's turns into a 9-member junk cluster at
     0.9328 while it sat at 0.9079 from his real cluster; removing it from its own
     centroid drops that to 0.9144, and once the neighbouring turns move the
     centroid shifts far enough that it rejoins him.

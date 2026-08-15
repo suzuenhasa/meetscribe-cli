@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # Transcribe a meeting on the GPU box and drop the transcript in the current directory.
 #
-#   ./transcribe "Product Marketing Meeting.mp3"
+#   ./transcribe "Platform Review.mp3"
 #   ./transcribe ~/recordings/              a whole folder — engine loads ONCE
 #   ./transcribe ~/recordings/ --out ~/done  a library somewhere else
 #   ./transcribe fixed.mp3 --replace 9ajq9   redo a meeting, keeping its id
 #   ./transcribe podcast.mp3 --overlap 0     # disable window context (default 5s)
 #   ./transcribe ~/recordings/ --gpu-frac 0.80   # override the derived VRAM split
-#   ./transcribe podcast.mp3 --glossary "Sreeram Kannan,EigenCloud,EigenDA"
+#   ./transcribe podcast.mp3 --glossary "Dana Whitfield,Northwind,NorthwindDA"
 #   ./transcribe standup.mp3 --name G01="Bob Smith"    remember this voice, by name
 #   ./transcribe standup.mp3 --roster "Bob Smith,Jane Doe"   only score these people
 #   ./transcribe meeting.m4a --thr 0.70     # pin the cut by hand (rarely needed)
 #
 # On --glossary: names the model has never heard come out as the nearest familiar
-# English -- "I'm Sreeram" was transcribed "I'm sure I'm a, I'm", and "EigenCloud"
-# as "Igen Club". Post-hoc search-and-replace cannot fix that safely because the
+# English -- "I'm Dana" was transcribed "I'm the na, I'm", and "Northwind"
+# as "north wind". Post-hoc search-and-replace cannot fix that safely because the
 # output is valid English, so the words have to reach the decoder. Measured: fixes
 # both, inserts nothing into audio that lacks the terms, and leaves the rest of the
 # transcript 98%% identical. Terms are also read from ./glossary.txt if present, one

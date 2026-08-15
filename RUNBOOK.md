@@ -107,9 +107,9 @@ a path, or enough of the title to be unambiguous.
 ### The normal loop
 
 ```bash
-./speakers who one-trust                    # which cluster is who
-./speakers play one-trust G02               # confirm by ear
-./speakers name one-trust G02 "Sreeram Kannan"
+./speakers who platform-review                    # which cluster is who
+./speakers play platform-review G02               # confirm by ear
+./speakers name platform-review G02 "Dana Whitfield"
 ./speakers apply --apply                    # backfill everything else
 ```
 
@@ -211,7 +211,7 @@ Setting a box up from nothing: `vast/provision.sh`, see `vast/README.md`.
 ```
 inbox/                          drop recordings here; empties as they finish
 library/
-  one-trust-network-to-rule-9ajq9/
+  platform-review-network-to-rule-9ajq9/
     meeting.json                id, title, source, duration, coverage
     …-audio.mp3                 your original — deletable
     …-transcript.txt            what you read
