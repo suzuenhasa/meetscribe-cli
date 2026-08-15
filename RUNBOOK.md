@@ -268,6 +268,41 @@ source env.sh
 
 ---
 
+## Using part of a card
+
+`MS_VRAM_GIB` caps what the pipeline plans for, and **everything downstream
+follows**: the fraction vLLM reserves, the embedder's batch size, whether
+embedding overlaps transcription or waits for the engine to be released, and
+`max_num_seqs`. Setting it to 10 on a 32 GiB card makes the pipeline behave in
+every respect as though it were on a 10 GiB card.
+
+```bash
+MS_VRAM_GIB=10 ./engine start
+MS_VRAM_GIB=10 ./transcribe
+```
+
+Measured on a 24 GiB 3090:
+
+```
+no cap             gpu-frac 0.69   18,398 MiB
+MS_VRAM_GIB=10     gpu-frac 0.17    6,022 MiB
+```
+
+The fraction is rescaled against the real card, because that is what vLLM
+measures `gpu_memory_utilization` against — asking for 7 of a 10 GiB budget on a
+32 GiB card means telling vLLM 0.22, not 0.7.
+
+Two reasons to want it. **Sharing a GPU**, where taking whatever is free right
+now means taking it from whatever starts next. And **reproducing what a small
+card does** without owning one — below about 8 GiB the pipeline releases the
+engine before embedding rather than running both at once, and that path is
+otherwise only testable by renting the hardware.
+
+A budget too small to run at all is refused up front, naming the numbers, rather
+than failing inside the allocator.
+
+---
+
 ## Environment
 
 | variable | |
@@ -280,6 +315,7 @@ source env.sh
 | `MS_FORCE_REMOTE` | use the box even when a local install exists |
 | `MS_ENGINE_IDLE_SLEEP` | seconds before the engine hands the card back; `0` never |
 | `MS_POST_POOL_MIN` | recordings below which post-processing runs in-process |
+| `MS_VRAM_GIB` | cap the VRAM the pipeline plans for; behaves as if the card were that size |
 | `MS_MAX_SEQS` | concurrent sequences vLLM will run |
 | `MS_PY` | the interpreter that owns the dependencies (set by `setup.sh`) |
 

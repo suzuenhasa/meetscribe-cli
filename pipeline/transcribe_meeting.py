@@ -86,6 +86,49 @@ KV_MIN_GIB = 0.9              # vLLM will not start without one max_model_len se
 # the engine overran its own budget by 2.64 GiB on a 3090 and 1.07 on a 2060,
 # and the embedder was OOM-killed in the 294 MiB that remained. The phantom had
 # been acting as an accidental runtime buffer. This is the deliberate version.
+def card_gib():
+    """How much of the card this install is allowed to plan for. -> GiB
+
+    Normally the whole thing. MS_VRAM_GIB caps it, and everything downstream
+    follows: the embedder batch size, whether embedding overlaps transcription
+    or waits, max_num_seqs, and how much headroom is kept back. Setting it to 10
+    on a 32 GiB card makes the pipeline behave in every respect as though it were
+    on a 10 GiB card.
+
+    Two reasons to want that. Sharing a GPU with something else, where taking
+    what is free right now means taking it away from whatever starts next. And
+    reproducing what a small card does without owning one -- the 6 GiB path
+    releases the engine before embedding rather than running both at once, and
+    that path is otherwise only testable by renting the hardware.
+    """
+    real = _real_card_gib()
+    want = os.environ.get("MS_VRAM_GIB")
+    if not want:
+        return real
+    try:
+        cap = float(want)
+    except ValueError:
+        return real
+    if cap <= 0:
+        return real
+    # `real` is 0 when the card cannot be read at all -- a wedged driver, CUDA
+    # not initialised yet. Returning it then reports a 0 GiB GPU and refuses to
+    # start, blaming a budget the caller set deliberately. The cap is a real
+    # number and the only one we have, so use it and let the failure come from
+    # whatever is actually broken.
+    if not real:
+        return cap
+    return min(cap, real)
+
+
+def _real_card_gib():
+    try:
+        import torch
+        return torch.cuda.get_device_properties(0).total_memory / 2**30
+    except Exception:
+        return 0.0
+
+
 def _runtime_headroom_gib(total_gib):
     """Slack for activation vLLM does not reserve. Scales with the card.
 
@@ -127,10 +170,8 @@ def _max_num_seqs(total_gib=None):
     if os.environ.get("MS_MAX_SEQS"):
         return int(os.environ["MS_MAX_SEQS"])
     if total_gib is None:
-        try:
-            import torch
-            total_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
-        except Exception:
+        total_gib = card_gib()
+        if not total_gib:
             return 64
     return 256 if total_gib >= 10.0 else 64
 
@@ -162,14 +203,18 @@ def plan_gpu_split(total_gib=None):
     which sends you tuning the one thing that cannot help.
     """
     if total_gib is None:
-        import torch
-        total_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
+        total_gib = card_gib()
+    # The fraction is of the REAL card, because that is what vLLM measures
+    # gpu_memory_utilization against -- but the PLAN is made against the budget.
+    # Ask for 7 of a 10 GiB budget on a 32 GiB card and vLLM must be told 0.22,
+    # not 0.7, or it takes 22 GiB and the cap means nothing.
+    real_gib = _real_card_gib() or total_gib
 
     for batch, concurrent in ((32, True), (8, True), (8, False)):
         reserve = EMBED_RESERVE_GIB[batch] if concurrent else EMBED_SEQUENTIAL_GIB
         reserve += _runtime_headroom_gib(total_gib)
         if total_gib - reserve - ENGINE_OVERHEAD_GIB >= KV_MIN_GIB:
-            return GpuSplit(round((total_gib - reserve) / total_gib, 3),
+            return GpuSplit(round((total_gib - reserve) / real_gib, 3),
                             batch, concurrent)
 
     floor = (ENGINE_OVERHEAD_GIB + KV_MIN_GIB + EMBED_SEQUENTIAL_GIB
@@ -185,9 +230,20 @@ def plan_gpu_split(total_gib=None):
 
 
 def free_vram_gib():
-    """What is ACTUALLY free right now, rather than what we predicted."""
+    """What is ACTUALLY free right now, rather than what we predicted.
+
+    Bounded by whatever is left of the budget when one is set. Without that, a
+    10 GiB budget on a 32 GiB card would report 20 GiB free after the engine
+    loaded, and the embedder would happily size itself for a card it was told it
+    did not have."""
     import torch
-    return torch.cuda.mem_get_info()[0] / 2**30
+    free = torch.cuda.mem_get_info()[0] / 2**30
+    budget = card_gib()
+    real = _real_card_gib()
+    if real and budget < real:
+        used = real - free                  # by us and by anything else
+        free = max(0.0, min(free, budget - max(0.0, used - (real - budget))))
+    return free
 
 
 def choose_embed_strategy(free_gib):
