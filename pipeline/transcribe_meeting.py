@@ -2,7 +2,7 @@
 
   python3 transcribe_meeting.py meeting.mp3 --out out.json
 """
-import argparse, json, time
+import argparse, bisect, json, time
 from collections import namedtuple
 
 import numpy as np
@@ -386,28 +386,64 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
         print(f"WARNING: {len(capped)} windows hit the token cap: {capped}", flush=True)
 
     segments = []
+    orphans = []          # decoded in padding, dropped as a neighbour's job
     dropped_ctx = 0
     for wi, (o, off, core) in enumerate(zip(outs, offsets, cores)):
         lo, hi = core
         for s in parse_transcript(o.outputs[0].text):
             # A segment decoded inside the context padding belongs to the neighbouring
             # window, which owns it as core. Keeping both would duplicate the speech.
-            mid = (s.start + s.end) / 2
-            if not (lo <= mid < hi):
-                dropped_ctx += 1
-                continue
-            segments.append({
+            rec = {
                 "start": round(off + s.start, 2),
                 "end": round(off + s.end, 2),
                 "window": wi,
                 "local_speaker": s.speaker,          # window-local, NOT globally meaningful
                 "speaker": f"w{wi:03d}_{s.speaker}",  # unique per window until linked
                 "text": s.text,
-            })
+            }
+            mid = (s.start + s.end) / 2
+            if not (lo <= mid < hi):
+                dropped_ctx += 1
+                orphans.append(rec)
+                continue
+            segments.append(rec)
     if dropped_ctx:
         print(f"dropped {dropped_ctx} segments decoded in context padding "
               f"(owned by a neighbouring window)", flush=True)
     segments.sort(key=lambda x: x["start"])
+
+    # ... unless the neighbour never emitted it, in which case nobody owns it and
+    # the speech is simply gone.
+    #
+    # The midpoint rule assumes both windows cut the seam the same way. They do
+    # not: they are independent generations over different context, so window k
+    # can push a segment's midpoint just past its core while window k+1 pulls its
+    # version just before ITS core, and both drop it as the other's problem.
+    # Measured on a 32-minute podcast: 66 of 112 seconds of holes sat within 3s
+    # of a window boundary, the largest 8.7s, and one of them was the guest
+    # saying who he was. --overlap 0 has no padding and so lost none of it.
+    #
+    # Reinstate an orphan only where nothing else covers its span, so a segment
+    # the neighbour DID emit still wins and nothing is duplicated.
+    recovered = []
+    if orphans:
+        starts = [s["start"] for s in segments]
+        reach, m = [], float("-inf")
+        for s in segments:
+            m = max(m, s["end"])
+            reach.append(m)                  # furthest end among segments[:i+1]
+        for o in sorted(orphans, key=lambda x: x["start"]):
+            k = bisect.bisect_left(starts, o["end"])
+            if k and reach[k - 1] > o["start"]:
+                continue                     # a kept segment already covers it
+            if any(r["end"] > o["start"] and r["start"] < o["end"] for r in recovered):
+                continue                     # an earlier orphan already filled it
+            recovered.append(o)
+    if recovered:
+        print(f"recovered {len(recovered)} segment(s) "
+              f"({sum(r['end'] - r['start'] for r in recovered):.1f}s) that fell "
+              f"through a window seam", flush=True)
+        segments = sorted(segments + recovered, key=lambda x: x["start"])
 
     # --overlap gives neighbouring windows shared audio, and a segment straddling the
     # seam can restate words the previous window already emitted. Measured 0.69% of
