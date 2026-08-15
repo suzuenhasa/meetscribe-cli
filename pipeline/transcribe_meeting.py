@@ -2,7 +2,7 @@
 
   python3 transcribe_meeting.py meeting.mp3 --out out.json
 """
-import argparse, bisect, json, time
+import argparse, bisect, json, sys, time
 from collections import namedtuple
 
 import numpy as np
@@ -18,6 +18,11 @@ import os
 MODEL = os.environ.get("MS_MODEL", "OpenMOSS-Team/MOSS-Transcribe-Diarize")
 SR = 16000
 SILENCE_GATE_DB = -70.0
+# Below this share of the audio's speech, the model stopped early rather than the
+# meeting ending. It exists because MOSS silently dropped 38% of one recording and
+# reported success. Shared, because it was enforced in the single-file path with
+# an `assert` and not at all in the batch path -- which is the path that runs.
+COVERAGE_MIN = 0.95
 
 
 @functools.lru_cache(maxsize=1)
@@ -379,7 +384,7 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
     Owns every correctness guard measured for this model: context-padding
     dedup, seam trimming, the repetition guard, coverage, and the silence
     gate. Shared by the single-file path and batch.py so the two cannot
-    drift apart.  -> (segments, coverage, capped_windows)
+    drift apart.  -> (segments, coverage, capped_windows, speech_end_s)
     """
     capped = [i for i, o in enumerate(outs) if o.outputs[0].finish_reason == "length"]
     if capped:
@@ -536,7 +541,7 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
         if dropped:
             print(f"silence gate ({SILENCE_GATE_DB} dB): dropped {dropped} segments", flush=True)
         segments = kept
-    return segments, cov, capped
+    return segments, cov, capped, speech_end
 
 
 def main():
@@ -580,12 +585,22 @@ def main():
     outs = llm.generate(reqs, SamplingParams(temperature=0.0, max_tokens=mt))
     gen = time.time() - t1
 
-    segments, cov, capped = assemble(
+    segments, cov, capped, speech_end = assemble(
         outs, offsets, cores, wav, dur, args.no_silence_gate)
 
     print(f"\ngen {gen:.1f}s | {len(segments)} segments | coverage {cov:.1%} of speech | "
           f"{dur/gen:.1f}x realtime", flush=True)
-    assert cov >= 0.95, (f"coverage {cov:.1%} of speech (ends {speech_end:.0f}s of {dur:.0f}s audio) — model stopped early")
+    # Not an assert. An assert is compiled out under -O, says nothing useful when
+    # it does fire, and this is an operational integrity check rather than a claim
+    # about the code being correct. The old one could not even print: speech_end
+    # is local to assemble(), so the moment this detected the exact failure it
+    # exists to detect, it raised NameError building its own message.
+    if cov < COVERAGE_MIN:
+        print(f"!! COVERAGE {cov:.1%} of speech — the transcript ends at "
+              f"{max((s['end'] for s in segments), default=0):.0f}s but speech runs to "
+              f"{speech_end:.0f}s of {dur:.0f}s. The model stopped early; this "
+              f"transcript is incomplete.", file=sys.stderr, flush=True)
+        raise SystemExit(3)
 
     json.dump({"audio": args.audio, "duration_s": round(dur, 2), "window_s": args.window,
                "n_windows": len(reqs), "gen_s": round(gen, 2), "coverage": round(cov, 4),

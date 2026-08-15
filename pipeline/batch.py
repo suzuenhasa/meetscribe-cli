@@ -443,6 +443,7 @@ def run_job(a, resident=None):
     emb = None if deferred else (held or Embedder(embed_batch, env, out / "_embed.log"))
 
     pending, unreadable, empty, queued = [], [], [], []
+    short = []          # transcribed, but the model stopped before the speech did
     sampling = TM.SamplingParams(temperature=0.0,
                                  max_tokens=int((a.window + 2 * a.overlap) * 20))
 
@@ -477,7 +478,8 @@ def run_job(a, resident=None):
         st = inflight.pop(name)
         f, wav, dur = st["f"], st["wav"], st["dur"]
         with phase("assemble"):
-            segs, cov, _ = TM.assemble(st["outs"], st["offsets"], st["cores"], wav, dur)
+            segs, cov, _, speech_end = TM.assemble(
+                st["outs"], st["offsets"], st["cores"], wav, dur)
         raw = meetings[name].file("raw", "json")
         json.dump({"audio": str(f), "duration_s": round(dur, 2), "window_s": a.window,
                    "n_windows": len(st["outs"]), "coverage": round(cov, 4),
@@ -506,9 +508,19 @@ def run_job(a, resident=None):
         meetings[name].write(duration_s=round(dur, 2), n_segments=len(segs),
                              coverage=round(cov, 4), window_s=a.window,
                              overlap_s=a.overlap, transcribed_at=time.time())
+        # A transcript that stops early is not a shorter transcript, it is a
+        # broken one -- and the batch path never checked. It recorded coverage
+        # into the metadata, printed it, and treated only a COMPLETELY empty
+        # result as failure, so a recording that terminated at 62% went on to be
+        # embedded, clustered and rendered like any other. This guard exists
+        # because MOSS silently dropped 38% of a meeting once; it belongs on the
+        # path that runs, not only on the single-file one.
+        if cov < TM.COVERAGE_MIN:
+            short.append((name, cov, speech_end, dur))
         pending.append((name, f))
+        flag = "" if cov >= TM.COVERAGE_MIN else "  !! STOPPED EARLY"
         print(f"  {f.name[:44]:44} {dur/60:5.1f} min  {len(st['outs']):4d} win  "
-              f"{len(segs):4d} segs  coverage {cov:.0%}", flush=True)
+              f"{len(segs):4d} segs  coverage {cov:.0%}{flag}", flush=True)
 
     def flush():
         """Decode everything pooled, then assemble whichever files are complete."""
@@ -848,7 +860,15 @@ def run_job(a, resident=None):
         print(f"\n!! NO SPEECH FOUND in {len(empty)}: {', '.join(empty)}\n"
               f"   These produced an empty transcript. Check the audio is speech "
               f"and is not silent or corrupt.", flush=True)
-    n_bad = len(broken) + len(failed) + len(unreadable) + len(empty)
+    if short:
+        print(f"\n!! STOPPED EARLY in {len(short)}: the model quit before the speech "
+              f"did, so these transcripts are incomplete.", flush=True)
+        for nm, cv, se, du in short:
+            print(f"     {nm[:44]:44} {cv:.0%} of speech ({se/60:.1f} min of "
+                  f"{du/60:.1f} min audio)", flush=True)
+        print(f"   The audio and embeddings are kept, so `./transcribe --replace "
+              f"<id>` re-runs one without losing its history.", flush=True)
+    n_bad = len(broken) + len(failed) + len(unreadable) + len(empty) + len(short)
     if n_bad:
         print(f"\n{n_bad} of {len(files)} file(s) did not complete.", flush=True)
         return 1
