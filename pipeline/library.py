@@ -195,9 +195,19 @@ def find(ref, lib=None):
     if (p / "meeting.json").exists():
         return Meeting(p)
     ms = all_meetings(lib)
+    # Ids and folder names are unique by construction, so an exact hit on either
+    # is the answer. STEMS are not: the stem is the slug, and two recordings of
+    # the same title share it -- this library holds two called
+    # one-trust-network-to-rule. Returning the first match silently picked one of
+    # them, so `--replace <stem>` could redo the wrong meeting and `speakers name`
+    # could name a voice in it. Ambiguity has to come back as None, which is what
+    # the title search below already does.
     for m in ms:
-        if ref in (m.id, m.path.name, m.stem):
+        if ref in (m.id, m.path.name):
             return m
+    stem_hits = [m for m in ms if m.stem == ref]
+    if stem_hits:
+        return stem_hits[0] if len(stem_hits) == 1 else None
     low = ref.lower()
     hits = [m for m in ms if low in m.path.name.lower() or low in m.title.lower()]
     return hits[0] if len(hits) == 1 else None

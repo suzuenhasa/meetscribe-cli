@@ -81,17 +81,16 @@ def test_the_shell_defaults_match_the_python_ones(repo):
         repo / "pipeline" / "batch.py", "--thr") == "auto"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "build_engine() in pipeline/transcribe_meeting.py still carries "
-    "`overlap=5.0` in its signature -- the pre-7b83a77 default, left behind "
-    "when the four CLI defaults moved to 0. It is not live today only because "
-    "all three callers (engined.py serve(), batch.py main(), "
-    "transcribe_meeting.py main()) pass overlap explicitly. A fourth caller "
-    "that omits it builds an engine sized for 40s of audio to keep 30, and "
-    "since engined.py refuses any job whose geometry differs from the engine "
-    "it built, every default job would then be refused by the resident engine "
-    "it was supposed to reuse. FIX: change the signature default to 0.0 so the "
-    "number is stated the same way in all five places."))
+# FIXED (was xfail):
+# build_engine() in pipeline/transcribe_meeting.py still carries `overlap=5.0` in its
+# signature -- the pre-7b83a77 default, left behind when the four CLI defaults moved
+# to 0. It is not live today only because all three callers (engined.py serve(),
+# batch.py main(), transcribe_meeting.py main()) pass overlap explicitly. A fourth
+# caller that omits it builds an engine sized for 40s of audio to keep 30, and since
+# engined.py refuses any job whose geometry differs from the engine it built, every
+# default job would then be refused by the resident engine it was supposed to reuse.
+# FIX: change the signature default to 0.0 so the number is stated the same way in all
+# five places.
 def test_build_engine_carries_the_same_overlap_default(repo):
     src = (repo / "pipeline" / "transcribe_meeting.py").read_text()
     fn = next(n for n in ast.walk(ast.parse(src))

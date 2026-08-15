@@ -459,11 +459,11 @@ def test_find_of_a_blank_ref(lib, write_meeting):
     assert LIB.find("", solo).path == only.path
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "find() resolves an exact stem hit before it checks for ambiguity, so two "
-    "meetings of the same title -- which the real library contains today, "
-    "one-trust-network-to-rule-5bvyc and -9ajq9 -- silently resolve to "
-    "whichever all_meetings() sorted first"))
+# FIXED (was xfail):
+# find() resolves an exact stem hit before it checks for ambiguity, so two meetings of
+# the same title -- which the real library contains today,
+# one-trust-network-to-rule-5bvyc and -9ajq9 -- silently resolve to whichever
+# all_meetings() sorted first
 def test_find_refuses_a_stem_two_meetings_share(lib, write_meeting):
     """The same 'whichever it met first' failure as b9e2659, one branch over.
 

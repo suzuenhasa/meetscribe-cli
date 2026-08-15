@@ -84,7 +84,7 @@ def main():
                 taken[sid] = cid
             if label:
                 names[cid] = label
-            report.append((cid, secs, nm, score, second[0], outcome))
+            report.append((cid, secs, nm, score, second[0], outcome, second[2]))
             conn.execute(
                 "INSERT INTO decisions(meeting, cluster, speaker_id, score, second,"
                 " threshold, level, roster, outcome, created_at)"
@@ -97,14 +97,35 @@ def main():
         print(f"identify: {len(cents)} voices in this meeting, "
               f"{len(G)} enrolled candidate{'s' if len(G) != 1 else ''}"
               + (f" (roster: {', '.join(roster)})" if roster else ""))
-        for cid, secs, nm, score, sec, outcome in report:
+        # NAME the runner-up, not just its score. A cluster blocked by the margin
+        # at 0.999 vs 0.998 is almost always ONE PERSON enrolled twice, and the
+        # fix is to forget the duplicate -- but the reader could not see which
+        # profile was in the way, and the note underneath explained the
+        # 0.40-0.55 review band, which is not the band this cluster was in. So a
+        # meeting could sit unnamed forever with everything on screen looking
+        # like a threshold problem.
+        blocked = []
+        for cid, secs, nm, score, sec, outcome, sec_nm in report:
             mark = {"accept": "=", "review": "?", "unknown": " "}[outcome]
             shown = nm if outcome != "unknown" else "-"
-            print(f"  {mark} {cid:5} {secs:6.0f}s  {shown:22} {score:5.3f}"
-                  + (f"  (2nd {sec:.3f})" if outcome == "review" else ""))
+            margin_blocked = (outcome == "review" and score >= S.ACCEPT
+                              and (score - sec) < S.MARGIN)
+            tail = ""
+            if outcome == "review":
+                tail = f"  (2nd {sec:.3f}"
+                tail += f" {sec_nm}" if margin_blocked and sec_nm else ""
+                tail += ")"
+            print(f"  {mark} {cid:5} {secs:6.0f}s  {shown:22} {score:5.3f}{tail}")
+            if margin_blocked:
+                blocked.append((cid, nm, sec_nm, score, sec))
         if any(r[5] != "accept" for r in report):
             print(f"  accept >= {S.ACCEPT} with a margin of {S.MARGIN} over the runner-up; "
                   f"{S.REVIEW}-{S.ACCEPT} needs a person to decide")
+        for cid, nm, sec_nm, score, sec in blocked:
+            print(f"  !! {cid} scored {score:.3f} against {nm} but {sec_nm} is at "
+                  f"{sec:.3f} — too close to separate.")
+            print(f"     If those are the same person, `./speakers list` will show "
+                  f"both; `./speakers forget <id>` on the duplicate fixes it.")
 
     if a.names:
         with open(a.names, "w") as fh:

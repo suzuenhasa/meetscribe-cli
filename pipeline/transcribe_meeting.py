@@ -294,7 +294,7 @@ def choose_embed_strategy(free_gib):
 
 
 def build_engine(gpu_frac=0.90, max_len=None, eager=None, window=30.0,
-                 overlap=5.0, releasable=False):
+                 overlap=0.0, releasable=False):
     """Load vLLM. ~66s, so a batch loads it once and keeps it resident.
 
     On a card that cannot hold ENGINE_OVERHEAD_GIB the failure is opaque: vLLM

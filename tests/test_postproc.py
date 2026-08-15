@@ -276,16 +276,14 @@ def test_running_the_migration_twice_is_safe(run_pipe, legacy_store, lib):
     assert Path(str(legacy_store) + ".pre-ids").read_bytes() == backup_first
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="A second run reports every already-migrated row under 'left alone, "
-           "no meeting in the library', which reads as data about to be lost -- "
-           "for rows pointing at meetings that ARE in the library. The rows are "
-           "in fact fine; only the report is wrong. To pass, main() in "
-           "pipeline/migrate_ids.py would have to recognise a row already keyed "
-           "on a live meeting (build {m.id for m in LIB.all_meetings(...)} "
-           "alongside `known`, and when `name` is in that set treat the row as "
-           "done rather than appending it to `unmatched`).")
+# FIXED (was xfail):
+# A second run reports every already-migrated row under 'left alone, no meeting in the
+# library', which reads as data about to be lost -- for rows pointing at meetings that
+# ARE in the library. The rows are in fact fine; only the report is wrong. To pass,
+# main() in pipeline/migrate_ids.py would have to recognise a row already keyed on a
+# live meeting (build {m.id for m in LIB.all_meetings(...)} alongside `known`, and
+# when `name` is in that set treat the row as done rather than appending it to
+# `unmatched`).
 def test_a_second_run_does_not_call_migrated_rows_orphans(run_pipe, legacy_store,
                                                           lib):
     migrate(run_pipe, legacy_store, lib, "--apply")
@@ -508,17 +506,14 @@ def test_a_roster_is_the_way_out_of_the_duplicate_profile_trap(conn, tmp_path,
     assert names == {"G00": "Sreeram Kannan"}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="When the margin is what blocked a 0.999 match, identify.py prints "
-           "the runner-up's SCORE but never its NAME, and then explains the "
-           "0.40-0.55 review band -- which is not the band this cluster was in. "
-           "The person reading has no way to see that two profiles are one human "
-           "and that forgetting one fixes it, so the meeting stays unnamed "
-           "forever. To pass, main() in pipeline/identify.py would have to carry "
-           "the runner-up's name into `report` (it keeps `second[0]` only, not "
-           "`second[2]`) and print it on a margin-blocked line.",
-)
+# FIXED (was xfail):
+# When the margin is what blocked a 0.999 match, identify.py prints the runner-up's
+# SCORE but never its NAME, and then explains the 0.40-0.55 review band -- which is
+# not the band this cluster was in. The person reading has no way to see that two
+# profiles are one human and that forgetting one fixes it, so the meeting stays
+# unnamed forever. To pass, main() in pipeline/identify.py would have to carry the
+# runner-up's name into `report` (it keeps `second[0]` only, not `second[2]`) and
+# print it on a margin-blocked line.",
 def test_a_margin_blocked_cluster_says_which_profile_blocked_it(conn, tmp_path,
                                                                 run_pipe):
     enrol(conn, *DUPES)

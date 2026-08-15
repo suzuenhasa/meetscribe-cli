@@ -486,7 +486,11 @@ mkdir -p "$LIBRARY"
 if [ "$LOCAL" -eq 0 ]; then
   rsync -a -e "ssh" "$HOST:$REMOTE/library/" "$LIBRARY/" 2>/dev/null || true
 fi
-M="$(ls -dt "$LIBRARY"/*/ 2>/dev/null | head -1)"
+# `|| M=""`: the glob matches nothing when the run produced no meeting, ls
+# exits 2, pipefail carries it through head, and set -e then kills the
+# script AT THE ASSIGNMENT -- so the "nothing arrived" message below was
+# unreachable and the run exited 2 in silence. Same shape as 7cadd9b.
+M="$(ls -dt "$LIBRARY"/*/ 2>/dev/null | head -1)" || M=""
 if [ -n "$M" ]; then
   echo "    ${M%/}"
 else

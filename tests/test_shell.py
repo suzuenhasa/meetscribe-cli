@@ -438,14 +438,14 @@ def test_an_unwritable_out_warns_and_falls_back_to_the_default_library(tree, kin
 # 5. Still open: the same set -e defect as (1), in ./transcribe
 # =====================================================================
 
-@pytest.mark.xfail(strict=True, reason=(
-    "./transcribe dies at the final `M=\"$(ls -dt \"$LIBRARY\"/*/ ... | head -1)\"` "
-    "when the run produced no meeting: the glob matches nothing, ls exits 2, "
-    "`set -o pipefail` propagates that through `| head -1`, and `set -e` kills "
-    "the script AT THE ASSIGNMENT -- so the `!! nothing arrived in $LIBRARY` "
-    "branch below it is unreachable and the run exits 2 in silence. Same shape "
-    "as the status bug fixed in 7cadd9b. FIX: make the assignment unable to "
-    "abort, e.g. `M=\"$(ls -dt \"$LIBRARY\"/*/ 2>/dev/null | head -1)\" || M=\"\"`."))
+# FIXED (was xfail):
+# ./transcribe dies at the final `M=\"$(ls -dt \"$LIBRARY\"/*/ ... | head -1)\"` when
+# the run produced no meeting: the glob matches nothing, ls exits 2, `set -o pipefail`
+# propagates that through `| head -1`, and `set -e` kills the script AT THE ASSIGNMENT
+# -- so the `!! nothing arrived in $LIBRARY` branch below it is unreachable and the
+# run exits 2 in silence. Same shape as the status bug fixed in 7cadd9b. FIX: make the
+# assignment unable to abort, e.g. `M=\"$(ls -dt \"$LIBRARY\"/*/ 2>/dev/null | head
+# -1)\" || M=\"\"`.
 def test_a_single_run_that_produces_nothing_says_so(tree):
     """The library is empty afterwards, and the user should be told which one."""
     tree.audio()

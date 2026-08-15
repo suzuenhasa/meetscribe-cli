@@ -65,13 +65,19 @@ def main():
         print(f"no store at {db} — nothing to migrate")
         return 0
     known = index_by_legacy_name(a.library)
+    # Rows already keyed on a live meeting id are DONE, not orphaned. Without
+    # this, running the tool twice reported every row it had migrated under
+    # "left alone, no meeting in the library" -- which reads as data about to be
+    # lost, about rows that are perfectly fine. The tool is meant to be safe to
+    # re-run; its own report said otherwise.
+    live_ids = {m.id for m in LIB.all_meetings(a.library)}
     if not known:
         print("no meetings in the library to match against; run transcribe first")
         return 0
 
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
-    plan, unmatched = [], []
+    plan, unmatched, done = [], [], 0
     for table, col in (("prototypes", "meeting"), ("decisions", "meeting")):
         try:
             rows = conn.execute(f"SELECT rowid AS rid, {col} FROM {table}").fetchall()
@@ -82,7 +88,9 @@ def main():
             name, _, cluster = old.partition(":")
             m = known.get(name)
             if m is None:
-                if old:
+                if name in live_ids:
+                    done += 1                 # already migrated by an earlier run
+                elif old:
                     unmatched.append((table, old))
                 continue
             new = f"{m.id}:{cluster}" if cluster else m.id
@@ -96,6 +104,8 @@ def main():
         print(f"    {t:11} {old[:44]:44} -> {new}")
     if len(plan) > 8:
         print(f"    ... and {len(plan) - 8} more")
+    if done:
+        print(f"already keyed on a meeting id: {done} (nothing to do for those)")
     if unmatched:
         print(f"left alone, no meeting in the library: {len(unmatched)}")
         for t, old in unmatched[:5]:
