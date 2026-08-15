@@ -288,7 +288,7 @@ def build_parser():
                     help="overwrite this meeting id in place rather than making "
                          "a new one, so everything decided about it survives")
     ap.add_argument("--window", type=float, default=30.0)
-    ap.add_argument("--overlap", type=float, default=5.0)
+    ap.add_argument("--overlap", type=float, default=0.0)
     ap.add_argument("--glossary", default="")
     ap.add_argument("--roster", default="")
     ap.add_argument("--titles", default="",

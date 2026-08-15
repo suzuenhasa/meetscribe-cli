@@ -432,7 +432,7 @@ def main():
     g.add_argument("--release", action="store_true")
     ap.add_argument("--sock", default=None)
     ap.add_argument("--window", type=float, default=30.0)
-    ap.add_argument("--overlap", type=float, default=5.0)
+    ap.add_argument("--overlap", type=float, default=0.0)
     ap.add_argument("--gpu-frac", type=float, default=None)
     a, rest = ap.parse_known_args()
     sock_path = a.sock or default_sock()

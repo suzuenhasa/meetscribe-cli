@@ -543,12 +543,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("audio")
     ap.add_argument("--window", type=float, default=30.0)
-    ap.add_argument("--overlap", type=float, default=5.0,
+    ap.add_argument("--overlap", type=float, default=0.0,
                     help="seconds of extra audio given to each window on BOTH sides as "
-                         "context. Segments are still only kept from the window's own "
-                         "core, so nothing is duplicated -- this only buys the decoder "
-                         "context across a boundary. A name landing right on a boundary "
-                         "is the known residual failure of --glossary.")
+                         "context. OFF by default: measured across 7 recordings (7.94h) "
+                         "it produced the same transcript as 0 -- within 0.05%% on words "
+                         "-- while decoding 33%% more audio, leaving twice the holes, and "
+                         "emitting 21x as many segments that overlap each other in time. "
+                         "Raise it if a boundary is cutting something you need.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--gpu-frac", type=float, default=0.90,
                     help="share of VRAM vLLM reserves. It claims the whole pool up "

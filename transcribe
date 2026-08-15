@@ -5,7 +5,7 @@
 #   ./transcribe ~/recordings/              a whole folder — engine loads ONCE
 #   ./transcribe ~/recordings/ --out ~/done  a library somewhere else
 #   ./transcribe fixed.mp3 --replace 9ajq9   redo a meeting, keeping its id
-#   ./transcribe podcast.mp3 --overlap 0     # disable window context (default 5s)
+#   ./transcribe podcast.mp3 --overlap 5     # give each window 5s of context (off by default)
 #   ./transcribe ~/recordings/ --gpu-frac 0.80   # override the derived VRAM split
 #   ./transcribe podcast.mp3 --glossary "Dana Whitfield,Northwind,NorthwindDA"
 #   ./transcribe interview.mp3 --glossary crypto.txt   a file of terms, one per line
@@ -77,7 +77,7 @@ ENROLL=()
 # Set MS_FORCE_REMOTE to use the box even when a local install exists.
 LOCAL=0
 WINDOW="30"
-OVERLAP="5"
+OVERLAP="0"
 GPUFRAC=""
 SRC=""
 GLOSSARY=""
