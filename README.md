@@ -53,6 +53,16 @@ few seconds of each voice. The inbox empties as they finish.
 **Supported formats:** `wav mp3 m4a flac ogg opus aac m4b aiff wma mp4 webm
 mkv` — any sample rate, auto-converted to 16 kHz mono.
 
+**Unfamiliar names?** Proper nouns the model has never heard come out as the
+nearest familiar English. Give it a vocabulary — a file per subject, or a list:
+
+```bash
+./transcribe --glossary crypto.txt
+./transcribe --glossary "Dana Whitfield,Northwind"
+```
+
+A `glossary.txt` beside where you run is picked up automatically.
+
 ### Keep the engine warm
 
 The engine costs ~70 s to load and that is paid per run. On a 3-minute clip it

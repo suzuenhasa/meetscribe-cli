@@ -74,6 +74,18 @@ run individually.
 `glossary.txt` in the directory you run from is picked up automatically, one
 term per line, `#` for comments.
 
+`--glossary` takes either terms or **a file of them**, which is how you keep one
+per subject — a crypto interview and an archaeology seminar share no vocabulary:
+
+```bash
+./transcribe --glossary crypto.txt
+./transcribe --glossary ~/glossaries/archaeology.txt
+./transcribe --glossary "Dana Whitfield,Northwind"
+```
+
+A path-like name that is not a file is an error rather than a term, so a typo
+says so instead of quietly telling the model to listen for "crypto.txt".
+
 **`--overlap 0`** is roughly 1.5× faster and mangles words at window seams. It is
 the only setting here that trades accuracy for speed.
 

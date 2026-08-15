@@ -8,6 +8,7 @@
 #   ./transcribe podcast.mp3 --overlap 0     # disable window context (default 5s)
 #   ./transcribe ~/recordings/ --gpu-frac 0.80   # override the derived VRAM split
 #   ./transcribe podcast.mp3 --glossary "Dana Whitfield,Northwind,NorthwindDA"
+#   ./transcribe interview.mp3 --glossary crypto.txt   a file of terms, one per line
 #   ./transcribe standup.mp3 --name G01="Bob Smith"    remember this voice, by name
 #   ./transcribe standup.mp3 --roster "Bob Smith,Jane Doe"   only score these people
 #   ./transcribe meeting.m4a --thr 0.70     # pin the cut by hand (rarely needed)
@@ -83,6 +84,28 @@ GLOSSARY=""
 OUTDIR=""
 REPLACE=""
 
+# --glossary takes terms OR a file of them. Different subjects need different
+# vocabularies -- a crypto interview and an archaeology seminar share nothing --
+# and keeping each in its own file is the obvious way to manage that. Without
+# this, passing a filename sent the literal string "crypto.txt" to the model as
+# a term to listen out for: wrong, and silently so.
+read_glossary() {
+  if [ -f "$1" ]; then
+    grep -vE '^[[:space:]]*(#|$)' "$1" | paste -sd, -
+    return
+  fi
+  # Looks like a path and is not one. Left alone it becomes a TERM -- the model
+  # would be told to listen for the words "crypto.txt" -- and nothing would ever
+  # say the file was missing.
+  case "$1" in
+    */*|*.txt|*.list)
+      echo "no glossary file at $1" >&2
+      echo "  (a --glossary with no commas and a path-like name is read as a file)" >&2
+      exit 2 ;;
+  esac
+  printf '%s' "$1"
+}
+
 rrun() {   # execute a shell snippet where the pipeline lives
   if [ "$LOCAL" -eq 1 ]; then bash -c "$1"
   elif [ -z "$HOST" ]; then need_host
@@ -104,7 +127,7 @@ rget() {   # pipeline machine -> here
 while [ $# -gt 0 ]; do
   case "$1" in
     --thr)      THR="$2"; shift 2 ;;
-    --glossary) GLOSSARY="$2"; shift 2 ;;
+    --glossary) GLOSSARY="$(read_glossary "$2")"; shift 2 ;;
     --roster)   ROSTER="$2"; shift 2 ;;
     --name)     ENROLL+=(--enroll "$2"); shift 2 ;;
     --window)  WINDOW="$2"; shift 2 ;;
