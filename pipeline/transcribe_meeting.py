@@ -442,12 +442,17 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
         else:
             if cur >= 3:
                 drop.update(runs)
-            # [idx], not [idx - 1]. idx is the first member of the run starting
-            # here; idx - 1 is the PRECEDING, different segment, so the guard
-            # dropped a real line before every loop and kept one loop member
-            # instead. Same count either way, so "dropped 4 looped segments"
-            # read as correct while removing the wrong four.
-            cur, prev, runs = 0, t, [idx]
+            # Empty, so idx -- the FIRST time the line was said -- is never a
+            # candidate and a run of n drops n-1. Someone did usually say it
+            # once before the decoder latched onto it, and keeping that costs
+            # one duplicate line in the rare case they did not, against
+            # deleting real speech every time they did.
+            #
+            # Not [idx - 1], which was the preceding and DIFFERENT segment: that
+            # dropped a real line ahead of every loop and kept a loop member in
+            # its place. The count came out the same, so the log line read as
+            # correct while removing the wrong ones.
+            cur, prev, runs = 0, t, []
     if cur >= 3:
         drop.update(runs)
     if drop:
