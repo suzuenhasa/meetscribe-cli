@@ -127,8 +127,13 @@ def serve(args):
     after 16, taking the inference engine with it. One resident worker bounds
     that to a single CUDA context no matter how long the queue is.
 
-      in   {"run": ..., "wav": ..., "out": ...}
+      in   {"run": ..., "wav": ..., "out": ..., "per_speaker": N,
+            "overlap_aware": bool}   -- the last two optional
       out  {"out": ..., "ok": true|false, "err": ...}
+
+    per_speaker is per JOB, not per worker: the cap is per window, so the right
+    value depends on the recording's window size, and one resident worker serves
+    recordings that need different ones.
 
     stdout carries acks and nothing else -- diagnostics go to stderr, or they
     would corrupt the channel.
@@ -143,7 +148,9 @@ def serve(args):
         ack = {"out": job["out"], "ok": True}
         try:
             msg = embed_file(model, fp16, scale_pcm, args,
-                             job["run"], job["wav"], job["out"])
+                             job["run"], job["wav"], job["out"],
+                             per_speaker=job.get("per_speaker"),
+                             overlap_aware=job.get("overlap_aware"))
             print(msg, file=sys.stderr, flush=True)
         except Exception as e:
             # One bad recording must not take the worker down: the queue behind
@@ -168,6 +175,11 @@ def main():
     ap.add_argument("--pad-ratio", type=float, default=1.15,
                     help="max length spread within a batch")
     ap.add_argument("--per-speaker", type=int, default=2)
+    ap.add_argument("--overlap-aware", action="store_true",
+                    help="embed only the part of a segment where no OTHER local "
+                         "speaker is active, and rank the --per-speaker cap by "
+                         "that clean duration rather than total. Off by default "
+                         "so the two can be measured against each other.")
     ap.add_argument("--backend", default="wespeaker",
                     choices=["wespeaker", "eres2net"],
                     help="eres2net: ERes2Net en/voxceleb, 192-d. Measured far better "
@@ -204,8 +216,20 @@ def _refuse_clips(path):
             f"Embeddings come from the original recording only.")
 
 
-def embed_file(model, fp16, scale_pcm, args, run, wav_path, out_path):
-    """Embed one recording and write its npz. -> the WROTE summary line."""
+def embed_file(model, fp16, scale_pcm, args, run, wav_path, out_path,
+               per_speaker=None, overlap_aware=None):
+    """Embed one recording and write its npz. -> the WROTE summary line.
+
+    `per_speaker` overrides args.per_speaker for THIS recording. The worker is
+    resident across a whole batch, so a process-wide value cannot vary per
+    meeting -- and it has to be able to, because the cap is per WINDOW: at 30s
+    windows it keeps ~60% of the speech and at 300s windows ~12%, silently. That
+    alone was enough to shatter one speaker into ten.
+    """
+    if per_speaker is None:
+        per_speaker = args.per_speaker
+    if overlap_aware is None:
+        overlap_aware = args.overlap_aware
     _refuse_clips(wav_path)
     audio, sr = sf.read(wav_path, dtype="float32", always_2d=False)
     if audio.ndim > 1:
@@ -222,28 +246,80 @@ def embed_file(model, fp16, scale_pcm, args, run, wav_path, out_path):
     audio = np.ascontiguousarray(audio)
     segs = json.load(open(run))["segments"]
 
+    # Where does this segment have the speaker to ITSELF? MOSS emits spans for
+    # every local speaker it heard, so a region another local label also covers
+    # had two people in it, and an embedding taken there is a blend of both --
+    # it resembles neither and lands between them, which is a way to split one
+    # person in two that has nothing to do with the room.
+    #
+    # Measured on AliMeeting far-field: reference overlap correlates with our
+    # cpCER at +0.91, and MOSS's own detected overlap tracks that reference
+    # closely, so this is knowable at inference without any extra model. In the
+    # worst session 65% of the audio being embedded had 2+ voices in it.
+    spans = sorted((s["start"], s["end"], s["local_speaker"], i)
+                   for i, s in enumerate(segs))
+    clean_runs = [None] * len(segs)
+    for pos, (a, b, who, i) in enumerate(spans):
+        cuts = []
+        for x, y, other, _ in spans[pos + 1:]:
+            if x >= b:
+                break
+            if other != who:
+                cuts.append((x, min(y, b)))
+        for x, y, other, _ in reversed(spans[:pos]):
+            if y <= a:
+                continue
+            if other != who:
+                cuts.append((max(x, a), min(y, b)))
+        cuts.sort()
+        free, cur = [], a
+        for x, y in cuts:
+            if x > cur:
+                free.append((cur, x))
+            cur = max(cur, y)
+        if cur < b:
+            free.append((cur, b))
+        clean_runs[i] = max(free, key=lambda r: r[1] - r[0]) if free else None
+
+    def _win(i):
+        """The span to embed for segment i, and how much of it is clean."""
+        s = segs[i]
+        if overlap_aware and clean_runs[i] is not None:
+            a, b = clean_runs[i]
+            return a, b, b - a
+        return s["start"], s["end"], (0.0 if clean_runs[i] is None
+                                      else clean_runs[i][1] - clean_runs[i][0])
+
     by = defaultdict(list)
     for i, s in enumerate(segs):
-        by[(s["window"], s["local_speaker"])].append((s["end"] - s["start"], i))
+        # Rank by CLEAN duration, not total. "Keep the longest" actively selects
+        # for contamination: a longer span has more chance of colliding with
+        # someone else, so in a high-overlap meeting the two longest segments
+        # are the two worst vectors to define a speaker with.
+        _, _, cl = _win(i)
+        key = cl if overlap_aware else (s["end"] - s["start"])
+        by[(s["window"], s["local_speaker"])].append((key, i))
     wanted = set()
     for items in by.values():
         items.sort(key=lambda x: -x[0])
-        wanted.update(i for _, i in (items if args.per_speaker <= 0
-                                     else items[:args.per_speaker]))
+        wanted.update(i for _, i in (items if per_speaker <= 0
+                                     else items[:per_speaker]))
 
     # meta covers EVERY segment (link.py walks it to build aggregates and to sum
     # per-aggregate seconds); only `wanted` ones get a vector.
     t0 = time.time()
     feats, ids, meta = [], [], []
     for i, s in enumerate(segs):
-        a, b = s["start"] + INSET, s["end"] - INSET
+        w0, w1, clean_dur = _win(i)
+        a, b = w0 + INSET, w1 - INSET
         if b - a > MAX_DUR:
             c = 0.5 * (a + b)
             a, b = c - MAX_DUR / 2, c + MAX_DUR / 2
         ia, ib = max(0, int(a * sr)), min(len(audio), int(b * sr))
         dur = (ib - ia) / sr
         meta.append(dict(idx=i, window=s["window"], local=s["local_speaker"],
-                         start=s["start"], end=s["end"], dur_used=round(dur, 3)))
+                         start=s["start"], end=s["end"], dur_used=round(dur, 3),
+                         clean_dur=round(clean_dur, 3)))
         if dur < MIN_DUR or i not in wanted:
             continue
         pcm = torch.from_numpy(audio[ia:ib]).unsqueeze(0)

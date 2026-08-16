@@ -135,11 +135,19 @@ class Embedder:
             self.eof = True                   # worker exited, expect no more acks
             self.cond.notify_all()
 
-    def submit(self, run, wav, out):
-        """Queue one recording. Returns False if the worker has already died."""
+    def submit(self, run, wav, out, per_speaker=None, overlap_aware=False):
+        """Queue one recording. Returns False if the worker has already died.
+
+        per_speaker rides with the job rather than the worker, so it can differ
+        per recording -- see embed_batched.serve().
+        """
+        job = {"run": str(run), "wav": str(wav), "out": str(out)}
+        if per_speaker is not None:
+            job["per_speaker"] = int(per_speaker)
+        if overlap_aware:
+            job["overlap_aware"] = True
         try:
-            self.proc.stdin.write(json.dumps(
-                {"run": str(run), "wav": str(wav), "out": str(out)}) + "\n")
+            self.proc.stdin.write(json.dumps(job) + "\n")
             self.proc.stdin.flush()
             return True
         except (BrokenPipeError, ValueError):
@@ -408,6 +416,42 @@ def build_parser():
                          "sanitised for the trip over ssh; this restores what "
                          "the human actually called the meeting.")
     ap.add_argument("--thr", default="auto")
+    # Speaker-identity knobs. These existed on link.py and embed_batched.py but
+    # were never forwarded from here, so the command people actually run had one
+    # reachable tunable (--thr) and the rest were frozen at whatever suited the
+    # data they were fitted on. Defaults are read from the modules that own them
+    # so there is a single definition of each; None means "leave it alone".
+    ap.add_argument("--per-speaker", type=int, default=None,
+                    help="segments embedded per speaker per window (default 2). "
+                         "0 embeds every segment. This is a per-WINDOW cap, so a "
+                         "longer --window silently embeds less of the recording.")
+    ap.add_argument("--min-core", type=float, default=None,
+                    help="speech a (window, local label) needs to join the "
+                         "clustering core (default 2.0)")
+    ap.add_argument("--refine", type=int, default=None,
+                    help="leave-one-out refinement passes (default 3)")
+    ap.add_argument("--durable", type=float, default=None,
+                    help="speech behind a binding 'different people' claim "
+                         "(default 6.0). Low suits close-talking audio, high "
+                         "suits a far-field mic array.")
+    ap.add_argument("--guard", type=int, default=None,
+                    help="window span a cannot-link claim is trusted across "
+                         "(default 10)")
+    ap.add_argument("--min-cluster-sec", type=float, default=None,
+                    help="below this a cluster is absorbed, not kept (default 10)")
+    ap.add_argument("--accurate", action="store_true",
+                    help="one decode pass per recording instead of 30s windows. "
+                         "MOSS's speaker labels stay consistent because the "
+                         "decoder attends across the whole meeting; measured "
+                         "cpCER 37.7%% -> 25.5%% on far-field AliMeeting, with CER "
+                         "unchanged. Costs throughput: a long sequence batches "
+                         "far worse. The window is sized from the longest "
+                         "recording present, not a fixed maximum.")
+    ap.add_argument("--overlap-aware", action="store_true",
+                    help="embed only where a speaker has the floor to itself, "
+                         "and pick the --per-speaker segments by that clean "
+                         "duration. Overlapped audio embeds as a blend of both "
+                         "voices, which resembles neither.")
     ap.add_argument("--gpu-frac", type=float, default=None,
                     help="vLLM's share of the card; the rest is headroom for the "
                          "concurrent embedder. Derived from the card's size by "
@@ -503,6 +547,26 @@ def run_job(a, resident=None):
         files, origin = to_16k_mono(files, scratch)
 
     t_queue_start = time.time()
+
+    # --accurate sizes the window from the audio, so it must be decided BEFORE
+    # build_engine: window sets max_model_len, which sets the per-sequence KV
+    # reservation and therefore how many recordings decode at once.
+    if a.accurate:
+        durs = []
+        for f in files:
+            try:
+                durs.append(TM.audio_seconds(f))
+            except Exception:
+                pass
+        a.window = TM.accurate_window(durs)
+        longest = max(durs, default=0.0)
+        note = ("" if a.window >= longest
+                else f" (longest is {longest/60:.0f} min; over the "
+                     f"{TM.ACCURATE_MAX_S/60:.0f} min single-pass ceiling, "
+                     f"so it will still be split)")
+        print(f"--accurate: one pass per recording, window {a.window/60:.1f} min"
+              + note, flush=True)
+
     ptxt = TM.build_prompt(a.glossary)
     if resident is not None:
         # Already loaded, and possibly asleep from a previous job on a small card.
@@ -566,7 +630,8 @@ def run_job(a, resident=None):
     pending, unreadable, empty, queued = [], [], [], []
     short = []          # transcribed, but the model stopped before the speech did
     sampling = TM.SamplingParams(temperature=0.0,
-                                 max_tokens=int((a.window + 2 * a.overlap) * 20))
+                                 max_tokens=int((a.window + 2 * a.overlap)
+                                                * TM.OUT_TOK_S))
 
     # Pool windows ACROSS recordings before decoding. One generate() per file
     # makes the batch as big as that file happens to be, which is fine for an
@@ -644,7 +709,8 @@ def run_job(a, resident=None):
         if deferred:
             queued.append((raw, f, npz))
         else:
-            if not emb.submit(raw, f, npz):
+            if not emb.submit(raw, f, npz, per_speaker=a.per_speaker,
+                              overlap_aware=a.overlap_aware):
                 print(f"\n!! embedding worker died — see {out}/_embed.log", flush=True)
             if a.no_overlap_embed:
                 with phase("embed"):
@@ -764,7 +830,8 @@ def run_job(a, resident=None):
         print(f"\n{why}", flush=True)
         worker = Embedder(embed_batch, env, out / "_embed.log")
         for raw, f, npz in jobs:
-            if not worker.submit(raw, f, npz):
+            if not worker.submit(raw, f, npz, per_speaker=a.per_speaker,
+                                 overlap_aware=a.overlap_aware):
                 print(f"!! embedding worker died — see {out}/_embed.log", flush=True)
         return worker.close()
 
@@ -835,10 +902,18 @@ def run_job(a, resident=None):
     # unsafe. spawn also gives each worker the clean import we want anyway.
     def argv_link(name):
         m = meetings[name]
-        return [f"{PIPE}/link/link.py", "--run", str(m.file("raw", "json")),
+        argv = [f"{PIPE}/link/link.py", "--run", str(m.file("raw", "json")),
                 "--npz", str(m.file("embeddings", "npz")), "--thr", a.thr,
                 "--out", str(m.file("transcript", "json")),
                 "--clusters-out", str(m.file("clusters", "npz"))]
+        # Only forward what was actually asked for, so link.py's own defaults
+        # stay the single source of truth for everything else.
+        for flag, val in (("--min-core", a.min_core), ("--refine", a.refine),
+                          ("--durable", a.durable), ("--guard", a.guard),
+                          ("--min-cluster-sec", a.min_cluster_sec)):
+            if val is not None:
+                argv += [flag, str(val)]
+        return argv
 
     def argv_identify(name):
         m = meetings[name]

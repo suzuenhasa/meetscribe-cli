@@ -28,6 +28,8 @@ score is z=3.11, ranking 5th of 129 in that cluster, behind four genuine turns.
 Their similarity to the cluster that swallowed them (0.891) is below the mean of
 all pairs in the recording (0.893) — an embedding-capacity limit, not a bug here.
 """
+import os
+
 import numpy as np
 from collections import Counter
 
@@ -38,6 +40,10 @@ FALLBACK_THR = 0.2656   # only reached when there are no cannot-link pairs at al
 # profile is too little to call a speaker.
 MIN_CLUSTER_SEC = 10.0
 
+# Speech MOSS must have heard before "these are two different people" is taken as
+# binding. Above min_core, or it can never fire -- see cannot_link_matrix.
+DURABLE_S = float(os.environ.get("MS_CANNOT_LINK_MIN_S", "6.0"))
+
 # Below either of these the speaker split is a guess. Reported, never acted on:
 # acting on it was tried and reverted, because the one recording that trips it is
 # a live event whose true speaker count was HIGHER than any fallback would give.
@@ -46,10 +52,23 @@ LOW_SPAN = 0.25
 LOW_DOMINANCE = 2.0
 
 
-def cannot_link_matrix(keys_core, secs_core, durable=1.0, guard=10):
+def cannot_link_matrix(keys_core, secs_core, durable=DURABLE_S, guard=10):
     """Boolean n x n over core nodes, True where a merge is forbidden.
 
     keys_core: [(window, local_label)] for the core nodes, aligned with secs_core.
+
+    `durable` is how much speech MOSS needs to have heard before its "these are
+    two different people" is trusted. The old default of 1.0 could never fire:
+    this is handed secs[core], already filtered to >= min_core (2.0), so any
+    value below that was unreachable and the parameter did nothing.
+
+    It matters because the claim is not always right. On AliMeeting far-field
+    the constraints forced a floor ABOVE the true speaker count in 6 of 8
+    sessions -- unfixable at any threshold, because a blocked pair never merges.
+    Raising this to 6s cut the mean floor from 4.5 to 3.5 against a true 3.1 and
+    took cpCER from 24.8% to 22.4%. Dropping the constraints entirely is far
+    worse (57.6%), so the answer is to trust the LONG claims, not to stop
+    trusting them.
     """
     n = len(keys_core)
     wins = [k[0] for k in keys_core]
@@ -276,6 +295,7 @@ def cluster_cannot_link(lab_core, cannot, k):
 def absorb_small(lab_core, core, A, secs, min_sec=MIN_CLUSTER_SEC, cannot=None):
     """Fold clusters holding under `min_sec` of speech into the nearest survivor.
 
+
     The max-gap cut tends to shave off 3-5 second splinters — a questioner's one
     remark, a cough — and each becomes a spurious speaker. Absorbing them is
     safe in a way that raising the threshold is not: it can only merge clusters
@@ -335,7 +355,7 @@ def absorb_small(lab_core, core, A, secs, min_sec=MIN_CLUSTER_SEC, cannot=None):
     return np.array([remap[c] for c in lab_core]), len(ids)
 
 
-def min_k_floor(keys, secs, durable=1.0, guard=10):
+def min_k_floor(keys, secs, durable=DURABLE_S, guard=10):
     """Lower bound on the speaker count, from MOSS alone — no embeddings involved.
 
     The most distinct local labels MOSS emitted inside any single window, counting
@@ -383,7 +403,7 @@ def core_set(secs, min_core):
     return np.array([int(np.argmax(secs))], dtype=int)
 
 
-def choose_threshold(A, keys, secs, min_core=2.0, durable=1.0, guard=10):
+def choose_threshold(A, keys, secs, min_core=2.0, durable=DURABLE_S, guard=10):
     """Pick this meeting's clustering cut. -> (thr, info)
 
     A: (n_keys, D) L2-normalised aggregates, aligned with `keys` and `secs`.
@@ -424,12 +444,20 @@ def choose_threshold(A, keys, secs, min_core=2.0, durable=1.0, guard=10):
 
 
 def cluster(A, secs, keys, min_core=2.0, refine_iters=3, thr=None,
-            durable=1.0, guard=10):
+            durable=DURABLE_S, guard=10, min_cluster_sec=MIN_CLUSTER_SEC):
     """Drop-in for link.py's cluster(), with the threshold chosen per meeting.
 
-    Pass `thr` to force a fixed cut (and skip the constraints entirely); leave it
-    None to self-calibrate. Returns (lab, k, core, weak, S, D, Cf, info) — the
-    same tuple link.py already unpacks, plus the info dict.
+    Pass `thr` to force a fixed cut; leave it None to self-calibrate. Returns
+    (lab, k, core, weak, S, D, Cf, info) — the same tuple link.py already
+    unpacks, plus the info dict.
+
+    Every knob is a PARAMETER here, never a module constant read from inside the
+    body. Only `thr` varies per meeting today; the rest take a module default.
+    They are in the signature because the right value is NOT the same for every
+    recording -- measured, `durable` wants a low value on AMI close-talking and
+    a high one on AliMeeting far-field, monotonically opposite, so no single
+    number serves both. Keeping them here is what lets a per-meeting rule
+    replace a default later without touching any call site.
     """
     secs = np.asarray(secs, dtype=float)
     core = core_set(secs, min_core)
@@ -438,19 +466,27 @@ def cluster(A, secs, keys, min_core=2.0, refine_iters=3, thr=None,
     D = np.clip(1.0 - S, 0, 2)
     np.fill_diagonal(D, 0.0)
 
+    # The constraints are built EITHER WAY. Pinning the cut by hand used to
+    # switch them off as a side effect, so `--thr 0.4` quietly removed the one
+    # mechanism that stops two people MOSS heard talking at once being merged.
+    # The two are independent -- one chooses where to cut the tree, the other
+    # says which merges were never allowed -- and the coupling cost real
+    # accuracy: measured on AliMeeting far-field, a 0.30 cut scores 22.4% cpCER
+    # with the constraints and 46.7% without.
+    C = cannot_link_matrix([keys[i] for i in core], secs[core], durable, guard)
     if thr is None:
         thr, info = choose_threshold(A, keys, secs, min_core, durable, guard)
-        C = cannot_link_matrix([keys[i] for i in core], secs[core], durable, guard)
     else:
-        info = {"threshold": round(float(thr), 4), "n_cannot_link": 0,
+        info = {"threshold": round(float(thr), 4),
+                "n_cannot_link": int(np.triu(C, 1).sum()),
                 "floor": int(min_k_floor(keys, secs, durable, guard)),
                 "self_calibrated": False, "mode": "fixed", "n_core": int(len(core)),
                 "low_separation": False}
-        C = np.zeros((len(core), len(core)), dtype=bool)
 
     _, labels_at = constrained_linkage(S, C)
     lab_core, k_raw = labels_at(thr)
-    lab_core, k = absorb_small(lab_core, core, A, secs, cannot=C)
+    lab_core, k = absorb_small(lab_core, core, A, secs,
+                               min_sec=min_cluster_sec, cannot=C)
     info["k_before_absorb"] = int(k_raw)
 
     def centroids(lab, kk):

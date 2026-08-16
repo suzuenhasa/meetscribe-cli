@@ -75,6 +75,12 @@ not the total. It is how you tell a slow run from a slow machine.
 | `--overlap <s>` | `0` | context decoded either side of each window |
 | `--thr <n\|auto>` | `auto` | speaker-clustering cut |
 | `--gpu-frac <n>` | auto | share of VRAM vLLM reserves |
+| `--per-speaker <n>` | `2` | segments embedded per speaker per window; `0` for all |
+| `--min-core <s>` | `2.0` | speech needed to join the clustering core |
+| `--durable <s>` | `6.0` | speech behind a binding "different people" claim |
+| `--guard <n>` | `10` | windows a "different people" claim is trusted across |
+| `--min-cluster-sec <s>` | `10` | below this a cluster is absorbed, not kept |
+| `--refine <n>` | `3` | leave-one-out refinement passes |
 
 `glossary.txt` in the directory you run from is picked up automatically, one
 term per line, `#` for comments.
@@ -96,6 +102,20 @@ It is off by default. Measured across 7 recordings, 7.94 hours, `5` against `0`:
 the transcripts matched to within 0.05% on words, while `5` decoded 33% more
 audio, left twice the holes, and emitted 21× as many segments overlapping each
 other in time. Raise it only if a boundary is cutting something you need.
+
+**`--per-speaker <n>`** caps how many segments per speaker get a voice embedding
+**in each window**, so it is coupled to `--window`: raising the window without
+raising this embeds less of the recording. Measured on one 27.6-minute meeting,
+the share of speech that reached the clusterer was 60% at `--window 30`, 23% at
+`120` and 12% at `300`, and the speaker count went 3, then 4, then 10 against a
+true 2. If you raise `--window`, scale this with it, or pass `0` to embed
+everything.
+
+**`--durable <s>`** is how much speech MOSS must have heard before "these two are
+different people" is treated as binding. There is no single right value: on
+close-talking audio a low one scores better, and on a far-field mic array a high
+one does — measured, they move in opposite directions. The default suits
+far-field; lower it toward `2` for headset or single-speaker-per-track audio.
 
 **`--replace`** is for redoing a meeting you already have — a better glossary, a
 different `--thr`. It keeps the id, so every decision ever recorded about it

@@ -166,8 +166,23 @@ def main():
     ap.add_argument("--thr", default="auto",
                     help="cosine cut, or 'auto' to self-calibrate per meeting "
                          "(constrained AHC + max merge-gap; see cluster_speakers.py)")
-    ap.add_argument("--min-core", type=float, default=2.0)
+    ap.add_argument("--min-core", type=float, default=2.0,
+                    help="speech a (window, local label) needs before it joins "
+                         "the clustering core")
     ap.add_argument("--refine", type=int, default=3)
+    # Defaults come FROM cluster_speakers, so each has one definition and the
+    # flag cannot drift away from the value the library uses when unset.
+    ap.add_argument("--durable", type=float,
+                    default=cluster_speakers.DURABLE_S,
+                    help="speech MOSS must have heard before 'these are two "
+                         "different people' is binding. A low value suits "
+                         "close-talking audio and a high one a far-field array; "
+                         "there is no single right value, hence a knob.")
+    ap.add_argument("--guard", type=int, default=10,
+                    help="window span across which a cannot-link claim is trusted")
+    ap.add_argument("--min-cluster-sec", type=float,
+                    default=cluster_speakers.MIN_CLUSTER_SEC,
+                    help="below this a cluster is absorbed rather than kept")
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
@@ -196,7 +211,8 @@ def main():
 
     lab, k, core, weak, S, D, Cf, info = cluster_speakers.cluster(
         A, secs, keys, min_core=args.min_core, refine_iters=args.refine,
-        thr=fixed_thr)
+        thr=fixed_thr, durable=args.durable, guard=args.guard,
+        min_cluster_sec=args.min_cluster_sec)
     sizes = {int(c): float(secs[lab == c].sum()) for c in sorted(set(lab))}
     tshow = "n/a" if info["threshold"] is None else f"{info['threshold']:.4f}"
     print(f"CLUSTER meeting={name} thr={tshow} mode={info['mode']} "
@@ -232,8 +248,15 @@ def main():
             f"segments but {args.npz} carries metadata for {len(key_of)}. One of "
             f"them is stale or was written incompletely; re-run this meeting with "
             f"./transcribe --replace <id>.")
+    # -1 means "not assigned to any speaker": an aggregate that was never
+    # embedded, so the clustering had nothing to place it by. f"G{-1:02d}" spells
+    # that "G-1", which reads as a speaker id and is counted as one by anything
+    # consuming this file -- a phantom speaker in every meeting. mktxt renders it
+    # as UNKNOWN correctly, so no reader ever saw it, but the JSON said otherwise
+    # and an RTTM export built from it gained a whole extra speaker.
     for i, s in enumerate(R["segments"]):
-        s["global"] = f"G{lab_of_key[key_of[i]]:02d}"
+        g = lab_of_key[key_of[i]]
+        s["global"] = f"G{g:02d}" if g >= 0 else None
     if args.out:
         with open(args.out, "w") as _fh:
             json.dump(R, _fh)

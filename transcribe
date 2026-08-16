@@ -67,6 +67,11 @@ provisioning_guard() {
 THR="auto"
 ROSTER=""
 ENROLL=()
+# Speaker-identity knobs, forwarded verbatim to batch.py. One string rather than
+# a variable each because this script has no opinion on them -- batch.py owns
+# every default, and empty means "send nothing", so those defaults stay the
+# single source of truth.
+TUNE=""
 # Running ON the machine that has the pipeline? Then there is nothing to ssh to.
 # Decided AFTER the argument loop, because --host has to be able to win: this
 # test is "does pipeline/transcribe_meeting.py exist", that file is tracked in
@@ -133,6 +138,10 @@ while [ $# -gt 0 ]; do
     --window)  WINDOW="$2"; shift 2 ;;
     --overlap) OVERLAP="$2"; shift 2 ;;
     --gpu-frac) GPUFRAC="$2"; shift 2 ;;
+    --per-speaker|--min-core|--refine|--durable|--guard|--min-cluster-sec)
+                TUNE="$TUNE $1 $2"; shift 2 ;;
+    --overlap-aware) TUNE="$TUNE --overlap-aware"; shift ;;
+    --accurate)      TUNE="$TUNE --accurate"; shift ;;
     --host)   HOST="$2"; shift 2 ;;
     --out)    OUTDIR="$2"; shift 2 ;;
     --replace) REPLACE="$2"; shift 2 ;;
@@ -324,7 +333,7 @@ if [ -d "$SRC" ]; then
       --library '$JOBLIB' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
       --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
-      --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC})
+      --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}$TUNE)
     # Hand the job to the resident engine if the box is running one, which saves
     # the ~70s load. 97 is engined.py saying it could not -- no daemon, a stale
     # socket, or an engine built for different windows -- having already printed
@@ -407,7 +416,7 @@ if [ ${#ENROLL[@]} -eq 0 ]; then
       --out-dir '$REMOTE/out' --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
       --library '$JOBLIB' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
-      --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}
+      --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}$TUNE
   " || SINGLE_RC=$?
   # 97 is "no usable daemon" and is the one code that means fall through; any
   # other failure is a real one and the steps below would only repeat it.

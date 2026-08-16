@@ -24,6 +24,56 @@ SILENCE_GATE_DB = -70.0
 # an `assert` and not at all in the batch path -- which is the path that runs.
 COVERAGE_MIN = 0.95
 
+# Tokens a second of audio costs. AUDIO_TOK_S is the encoder's rate and is fixed
+# by the model; OUT_TOK_S is a generous ceiling on transcript for a second of
+# speech, used to size max_tokens and, through it, the context a window needs.
+AUDIO_TOK_S = 12.5
+OUT_TOK_S = 20
+
+# The decoder's ceiling, from the model config. A window cannot exceed what one
+# request can hold: AUDIO_TOK_S of prompt plus OUT_TOK_S of transcript per second
+# of audio, so ~4000s of audio is the most a single pass can carry.
+MODEL_MAX_TOKENS = 131072
+ACCURATE_MAX_S = (MODEL_MAX_TOKENS - 512) / (AUDIO_TOK_S + OUT_TOK_S)
+
+
+def audio_seconds(path):
+    """Length of a 16 kHz mono wav, from its header. -> seconds (0.0 if unknown)
+
+    Header only: --accurate needs every duration before the engine is built, and
+    decoding a batch of hour-long meetings to measure them would cost more than
+    the transcription.
+    """
+    try:
+        import soundfile as sf
+        info = sf.info(str(path))
+        return float(info.frames) / float(info.samplerate or SR)
+    except Exception:
+        return 0.0
+
+
+def accurate_window(durations):
+    """Window size for --accurate over a batch. -> seconds
+
+    One pass per recording is what keeps MOSS's speaker labels consistent: the
+    Whisper encoder chunks at 30s REGARDLESS, and identity survives because the
+    decoder attends across those chunks in one context. Measured on AliMeeting
+    far-field, cpCER 37.7% at 30s windows against 25.5% in a single pass, with
+    CER unchanged -- the whole difference is attribution.
+
+    Sized from the LONGEST recording actually present, never from a fixed
+    maximum. max_len sets the engine's per-sequence KV reservation, so asking for
+    90 minutes on a batch of 15-minute meetings would reserve six times the
+    context every one of them needs and cut how many decode concurrently.
+
+    Anything past ACCURATE_MAX_S cannot be one pass at all; it gets the largest
+    window that fits, and plan_windows falls back to several.
+    """
+    longest = max([d for d in durations if d and d > 0], default=0.0)
+    if longest <= 0:
+        return 30.0
+    return float(min(longest, ACCURATE_MAX_S))
+
 
 @functools.lru_cache(maxsize=1)
 def _processor():
@@ -305,8 +355,14 @@ def build_engine(gpu_frac=0.90, max_len=None, eager=None, window=30.0,
     # These used to shrink themselves on a small card, which measured WORSE, not
     # better -- see the ENGINE_OVERHEAD_GIB comment for why a shorter context
     # made the profiler allocate more. Sizing is plan_gpu_split's job now.
+    #
+    # 8192 covers the default window several times over, but it is not a floor a
+    # longer one can rely on: a window costs AUDIO_TOK_S per second in prompt plus
+    # the max_tokens the caller allows, and past ~150s that sum overruns 8192 and
+    # vLLM rejects every request. Size from the window so --window stays usable.
     if max_len is None:
-        max_len = 8192
+        span = window + 2 * overlap
+        max_len = max(8192, int(span * (AUDIO_TOK_S + OUT_TOK_S)) + 512)
     if eager is None:
         eager = False
     max_seqs = _max_num_seqs()
@@ -589,7 +645,7 @@ def main():
 
     llm = build_engine(args.gpu_frac, window=args.window, overlap=args.overlap)
 
-    mt = int((args.window + 2 * args.overlap) * 20)
+    mt = int((args.window + 2 * args.overlap) * OUT_TOK_S)
     t1 = time.time()
     outs = llm.generate(reqs, SamplingParams(temperature=0.0, max_tokens=mt))
     gen = time.time() - t1

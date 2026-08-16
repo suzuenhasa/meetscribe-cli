@@ -822,26 +822,29 @@ class TestCannotLinkMatrix:
 
     def test_same_window_different_label_is_blocked(self, cs):
         keys = [(0, "S01"), (0, "S02"), (1, "S01")]
-        C = cs.cannot_link_matrix(keys, [5.0, 5.0, 5.0])
+        # durable stated, not inherited: the default moved to 6.0 once it was
+        # found that 1.0 could never fire against min_core=2.0, and this test
+        # is about the same-window rule, not about that number.
+        C = cs.cannot_link_matrix(keys, [5.0, 5.0, 5.0], durable=1.0)
         assert C[0, 1] and C[1, 0]
         assert not C[0, 2] and not C[1, 2]
 
     def test_same_window_same_label_is_not_blocked(self, cs):
         keys = [(0, "S01"), (0, "S01")]
-        C = cs.cannot_link_matrix(keys, [5.0, 5.0])
+        C = cs.cannot_link_matrix(keys, [5.0, 5.0], durable=1.0)
         assert not C.any()
 
     def test_a_turn_under_durable_asserts_nothing(self, cs):
         """A half-second of crosstalk is not MOSS witnessing a second person."""
         keys = [(0, "S01"), (0, "S02")]
-        assert not cs.cannot_link_matrix(keys, [5.0, 0.5]).any()
-        assert cs.cannot_link_matrix(keys, [5.0, 1.0])[0, 1]
+        assert not cs.cannot_link_matrix(keys, [5.0, 0.5], durable=1.0).any()
+        assert cs.cannot_link_matrix(keys, [5.0, 1.0], durable=1.0)[0, 1]
 
     def test_a_window_claiming_more_than_guard_speakers_is_ignored(self, cs):
         keys = [(0, "S%02d" % i) for i in range(12)]
         secs = [5.0] * 12
-        assert not cs.cannot_link_matrix(keys, secs, guard=10).any()
-        assert cs.cannot_link_matrix(keys, secs, guard=20).any()
+        assert not cs.cannot_link_matrix(keys, secs, durable=1.0, guard=10).any()
+        assert cs.cannot_link_matrix(keys, secs, durable=1.0, guard=20).any()
 
     def test_is_symmetric_and_hollow(self, cs):
         A, secs, keys = random_meeting(5)
