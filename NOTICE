@@ -24,7 +24,7 @@ Listed so you know what ends up on your machine.
 
   WeSpeaker                        Apache License 2.0
   source   https://github.com/wenet-e2e/wespeaker
-  weights  https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet293-LM
+  weights  https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM
 
   vLLM                             Apache License 2.0
   https://github.com/vllm-project/vllm

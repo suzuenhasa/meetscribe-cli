@@ -110,7 +110,8 @@ def load_model(args):
         sd = {k[7:] if k.startswith("module.") else k: v for k, v in sd.items()}
         model.load_state_dict(sd, strict=False)
         model = model.cuda().eval()
-        # ResNet293 is compute-bound (90 clips/s fp32 vs ECAPA's 907 -- it convolves
+        # The ResNets are compute-bound (ResNet293 managed 90 clips/s fp32 against
+        # ECAPA's 907 -- it convolves
         # the spectrogram in 2D). fp16 measured 1.8x with no accuracy cost here.
         if fp16:
             model = model.half()
@@ -186,8 +187,8 @@ def main():
                          "on platform-compressed audio (podcast pair-error 7.7%% -> "
                          "1.3%%) and equal on ICSI.")
     ap.add_argument("--verify", default=None, help="npz from the sequential run")
-    ap.add_argument("--config", default=os.path.join(WORK, "wsp_ckpt/resnet293/config.yaml"))
-    ap.add_argument("--ckpt", default=os.path.join(WORK, "wsp_ckpt/resnet293/avg_model.pt"))
+    ap.add_argument("--config", default=os.path.join(WORK, "wsp_ckpt/resnet34/config.yaml"))
+    ap.add_argument("--ckpt", default=os.path.join(WORK, "wsp_ckpt/resnet34/avg_model.pt"))
     args = ap.parse_args()
     # Before anything is loaded. The check also sits in embed_file, which is
     # where --serve jobs arrive, but doing it here means a one-shot refusal

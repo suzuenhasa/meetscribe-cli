@@ -101,14 +101,29 @@ class Embedder:
     in the pipe rather than spawning anything.
     """
 
-    def __init__(self, batch, env, log_path):
+    def __init__(self, batch, env, log_path, ckpt=None, config=None):
         # append, not truncate: a second worker may run after the first to
         # retry what did not fit, and the first attempt's diagnostics are
         # exactly what explains why.
         self.batch = batch
         self.log = open(log_path, "a")
+        argv = [PY, f"{PIPE}/link/embed_batched.py", "--serve",
+                "--batch", str(batch)]
+        # A different speaker checkpoint is a different EMBEDDING SPACE, not a
+        # tuning choice: vectors from two models cannot be compared, so a
+        # profile enrolled under one is meaningless under another. Exposed
+        # because no single embedder suits every condition. Measured on
+        # AliMeeting far-field: ResNet34 35.3% EER against ResNet293's 36.7% at
+        # 7.5x the speed, same training corpus -- more capacity fit VoxCeleb's
+        # clean close-talking domain more tightly and generalised worse. On
+        # English podcasts the two are indistinguishable, which is why ResNet34
+        # is now the default.
+        if ckpt:
+            argv += ["--ckpt", str(ckpt)]
+        if config:
+            argv += ["--config", str(config)]
         self.proc = subprocess.Popen(
-            [PY, f"{PIPE}/link/embed_batched.py", "--serve", "--batch", str(batch)],
+            argv,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
             env=env, text=True, bufsize=1)
         self.acks = {}
@@ -447,6 +462,13 @@ def build_parser():
                          "unchanged. Costs throughput: a long sequence batches "
                          "far worse. The window is sized from the longest "
                          "recording present, not a fixed maximum.")
+    ap.add_argument("--embed-ckpt", default=None,
+                    help="speaker embedding checkpoint (default: the bundled "
+                         "ResNet34-LM). Vectors from different models are NOT "
+                         "comparable, so changing this invalidates existing "
+                         "speaker profiles.")
+    ap.add_argument("--embed-config", default=None,
+                    help="config.yaml for --embed-ckpt")
     ap.add_argument("--overlap-aware", action="store_true",
                     help="embed only where a speaker has the floor to itself, "
                          "and pick the --per-speaker segments by that clean "
@@ -625,7 +647,9 @@ def run_job(a, resident=None):
     env.pop("CUDA_VISIBLE_DEVICES", None)     # vLLM rewrites this for its workers
     # Reuse the daemon's worker when there is one; otherwise this run owns its
     # own, exactly as it did before daemons existed.
-    emb = None if deferred else (held or Embedder(embed_batch, env, out / "_embed.log"))
+    emb = None if deferred else (held or Embedder(
+        embed_batch, env, out / "_embed.log",
+        ckpt=a.embed_ckpt, config=a.embed_config))
 
     pending, unreadable, empty, queued = [], [], [], []
     short = []          # transcribed, but the model stopped before the speech did
@@ -828,7 +852,8 @@ def run_job(a, resident=None):
     def embed_all(jobs, why):
         """Run a fresh worker over `jobs`. -> acks"""
         print(f"\n{why}", flush=True)
-        worker = Embedder(embed_batch, env, out / "_embed.log")
+        worker = Embedder(embed_batch, env, out / "_embed.log",
+                          ckpt=a.embed_ckpt, config=a.embed_config)
         for raw, f, npz in jobs:
             if not worker.submit(raw, f, npz, per_speaker=a.per_speaker,
                                  overlap_aware=a.overlap_aware):

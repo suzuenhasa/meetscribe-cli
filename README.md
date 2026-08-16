@@ -141,7 +141,7 @@ For rented boxes, `vast/provision.sh` handles unattended install. See
 ```
 audio ──► MOSS on vLLM        →  text + per-window speaker labels
              │
-      WeSpeaker ResNet293-LM  →  voice embedding per segment
+      WeSpeaker ResNet34-LM  →  voice embedding per segment
              │
       constrained clustering  →  Speaker 1, Speaker 2, …
              │
@@ -150,7 +150,7 @@ audio ──► MOSS on vLLM        →  text + per-window speaker labels
 
 [MOSS-Transcribe-Diarize](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize)
 labels speakers within each window, but window 4's "S01" is not necessarily
-window 5's. [WeSpeaker](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet293-LM)
+window 5's. [WeSpeaker](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM)
 embeddings link segments across a recording, and the profile store puts names
 on the result — across recordings and across months.
 

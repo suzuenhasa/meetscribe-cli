@@ -16,7 +16,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="${MS_WORK:-$HERE}"
 PIPE="$WORK/pipeline"
 MODEL="OpenMOSS-Team/MOSS-Transcribe-Diarize"
-WSP_REPO="Wespeaker/wespeaker-voxceleb-resnet293-LM"
+WSP_REPO="Wespeaker/wespeaker-voxceleb-resnet34-LM"
 
 # ---------------------------------------------------------------- pinned set
 # Everything below floats otherwise: vLLM came from "latest release", both
@@ -37,7 +37,7 @@ WSP_REPO="Wespeaker/wespeaker-voxceleb-resnet293-LM"
 VLLM_VER="${MS_VLLM_VER:-0.27.1}"
 MOSS_SRC_REV="0e3d1403fd8f1f1c674e883ece96b9f630794ebe"
 MOSS_MODEL_REV="e8681d68e7042738ffca8ac8212bc8fcb1131ab8"
-WSP_MODEL_REV="6e6bffe5bf3d772a1f143dc6dbfea58a0799ea83"
+WSP_MODEL_REV="f0c48c298fd835726c27956a5d617bad7115627e"
 WESPEAKER_SRC_REV="dfa741957e5c11f477623b6e583d67d0af25ee88"
 if [ -n "${MS_UNPINNED:-}" ]; then
   VLLM_VER=""; MOSS_SRC_REV=""; MOSS_MODEL_REV=""; WSP_MODEL_REV=""; WESPEAKER_SRC_REV=""
@@ -271,7 +271,7 @@ say "Models (~2 GB on a cold box — this is the slow part)"
 # first run, since ./transcribe with no argument means the inbox and the README
 # tells you to copy into it.
 mkdir -p "$HF_HOME" "$WORK/runs" "$WORK/out" "$WORK/inbox" "$WORK/library" \
-         "$WORK/wsp_ckpt/resnet293"
+         "$WORK/wsp_ckpt/resnet34"
 if [ "$CHECK" -eq 1 ]; then
   "$PY" -c "
 from huggingface_hub import snapshot_download as d; d('$MODEL', local_files_only=True, revision='$MOSS_MODEL_REV' or None)" >/dev/null 2>&1 \
@@ -297,19 +297,21 @@ snapshot_download('$MODEL', local_files_only=True, revision='$MOSS_MODEL_REV' or
     || die "MOSS reported success but is not in the cache at $HF_HOME"
 fi
 
-if [ ! -f "$WORK/wsp_ckpt/resnet293/avg_model.pt" ]; then
+if [ ! -f "$WORK/wsp_ckpt/resnet34/avg_model.pt" ]; then
   [ "$CHECK" -eq 1 ] && die "WeSpeaker checkpoint missing"
-  warn "downloading WeSpeaker ResNet293-LM (~134 MB)"
+  warn "downloading WeSpeaker ResNet34-LM (~43 MB)"
   "$PY" - <<EOF || die "WeSpeaker download failed"
 from huggingface_hub import hf_hub_download
 import shutil
-for f in ("avg_model.pt", "config.yaml"):
-    shutil.copy(hf_hub_download("$WSP_REPO", f, revision="$WSP_MODEL_REV" or None),
-                "$WORK/wsp_ckpt/resnet293/" + f)
+# this repo names the weights `avg_model`, without the extension the
+# ResNet293 one used; the local name stays avg_model.pt either way.
+for remote, local in (("avg_model", "avg_model.pt"), ("config.yaml", "config.yaml")):
+    shutil.copy(hf_hub_download("$WSP_REPO", remote, revision="$WSP_MODEL_REV" or None),
+                "$WORK/wsp_ckpt/resnet34/" + local)
 EOF
-  [ -s "$WORK/wsp_ckpt/resnet293/avg_model.pt" ] || die "WeSpeaker checkpoint is empty"
+  [ -s "$WORK/wsp_ckpt/resnet34/avg_model.pt" ] || die "WeSpeaker checkpoint is empty"
 fi
-ok "WeSpeaker ResNet293-LM ($(du -h "$WORK/wsp_ckpt/resnet293/avg_model.pt" | cut -f1))"
+ok "WeSpeaker ResNet34-LM ($(du -h "$WORK/wsp_ckpt/resnet34/avg_model.pt" | cut -f1))"
 
 if [ ! -d "$WORK/wespeaker_src/wespeaker" ]; then
   [ "$CHECK" -eq 1 ] && die "wespeaker source missing"

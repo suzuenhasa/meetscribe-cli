@@ -46,7 +46,7 @@ def _default_work():
 
 WORK = _default_work()
 DB = os.environ.get("MS_SPEAKER_DB", os.path.join(WORK, "speakers.db"))
-EMBED_MODEL = "wespeaker-resnet293-LM"
+EMBED_MODEL = "wespeaker-resnet34-LM"
 
 # centroid-vs-centroid operating point. Measured error-free band on ICSI was
 # [0.41, 0.86]; 0.55 sits mid-band. Not valid at any other aggregation level.
