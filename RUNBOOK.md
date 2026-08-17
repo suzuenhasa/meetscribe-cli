@@ -74,6 +74,10 @@ not the total. It is how you tell a slow run from a slow machine.
 | `--window <s>` | `30` | seconds of audio per decode window |
 | `--overlap <s>` | `0` | context decoded either side of each window |
 | `--thr <n\|auto>` | `auto` | speaker-clustering cut |
+| `--accurate` | off | one decode pass per recording instead of windows |
+| `--overlap-aware` | off | embed only where a speaker has the floor alone |
+| `--embed-ckpt <path>` | bundled | swap the voice-embedding model |
+| `--embed-config <path>` | bundled | `config.yaml` for `--embed-ckpt` |
 | `--gpu-frac <n>` | auto | share of VRAM vLLM reserves |
 | `--per-speaker <n>` | `2` | segments embedded per speaker per window; `0` for all |
 | `--min-core <s>` | `2.0` | speech needed to join the clustering core |
@@ -111,11 +115,84 @@ the share of speech that reached the clusterer was 60% at `--window 30`, 23% at
 true 2. If you raise `--window`, scale this with it, or pass `0` to embed
 everything.
 
+**`--accurate`** decodes each recording in **one pass** instead of 30-second
+windows. MOSS labels speakers within a window and window 4's "S01" need not be
+window 5's, so the labels normally have to be rebuilt from voice embeddings. In
+one pass the decoder attends across the whole recording and its own labels stay
+consistent end to end.
+
+It is worth reaching for on **far-field or otherwise hard audio**, where the
+embedding step has least to work with. Measured on far-field AliMeeting, the two
+worst sessions went **cpCER 37.7% → 25.5% with CER unchanged** — the entire gain
+is attribution, not words. On all eight sessions plain windowing already matches
+the published figure (22.1 against 22.17), so this fixes the hard tail rather
+than the average. Try it when a recording comes back with more speakers than
+were in the room.
+
+It costs throughput, and not slightly: roughly **330× realtime down to ~9×**,
+because one long sequence batches far worse than many short ones. That is still
+an hour-long meeting in about seven minutes. The window is sized from the
+longest recording in the batch, capped near **67 minutes**, past which the audio
+plus its transcript no longer fits in one context.
+
+**`--overlap-aware`** embeds only the part of a segment where no *other* local
+speaker is active, and ranks the `--per-speaker` cap by that clean duration.
+Audio with two people talking at once embeds as a blend that resembles neither,
+so a contaminated segment should not be what defines a voice. Segments with no
+clean moment still get labelled — they are compared against the clean anchors
+instead of helping build them.
+
+It is free: no extra decode, no extra model. It is off by default only so the
+A/B stays measurable. Note that cpCER barely moves when you switch it on, which
+is easy to misread as "it does nothing" — on overlapped audio the transcription
+error dominates and hides an attribution fix underneath it.
+
+**`--embed-ckpt` / `--embed-config`** swap the voice-embedding model for another
+WeSpeaker checkpoint.
+
+> **This invalidates every profile you have.** Vectors from two different models
+> are not comparable, so names already attached to voices in `speakers.db` will
+> not match anything the new model produces. Use it for evaluation, or start a
+> fresh store — do not point it at a library you have been naming for months.
+
 **`--durable <s>`** is how much speech MOSS must have heard before "these two are
-different people" is treated as binding. There is no single right value: on
-close-talking audio a low one scores better, and on a far-field mic array a high
-one does — measured, they move in opposite directions. The default suits
-far-field; lower it toward `2` for headset or single-speaker-per-track audio.
+different people" is treated as binding. Below the bar the claim is ignored;
+above it, the pair can *never* merge, at any `--thr`.
+
+What it really controls is how much **variation within one speaker** the run will
+tolerate before calling it a second person — a sponsor read, a music bed, a mic
+change, someone leaning back from the array. It is not a close-vs-far-field
+switch, and treating it as one gets it backwards on studio audio.
+
+Measured on AliMeeting far-field, 8 sessions, same embeddings, clustering only:
+
+| `--durable` | cpCER |
+|---|---|
+| `1.0` | 37.3% |
+| `2.0` | 37.3% |
+| `6.0` | 22.1% |
+
+`1.0` and `2.0` scoring identically is not noise: `cannot_link_matrix` is handed
+`secs[core]`, already filtered to `>= --min-core` (2.0), so any value below that
+was unreachable and the parameter did nothing at all until `6.0`.
+
+Those 15 points are dominated by one session that produced 91 speakers for a
+3-speaker meeting — and the same session did not blow up on another box. Treat
+it as a robustness fix, not an average-case one; seven of eight improve or hold.
+
+Removing the claims altogether is far worse than any setting of this flag. They
+are load-bearing.
+
+On close-talking podcasts — studio audio with sponsor reads and music beds —
+that shows up directly. Speaker counts against five recordings confirmed by ear:
+
+| `--durable` | `3` | `6` | `7` | `8` | `9` | `10` | `12` |
+|---|---|---|---|---|---|---|---|
+| total error | 2 | 1 | **0** | **0** | **0** | **0** | 1 |
+
+Raise it when a recording has ads, music, or a speaker who changes register or
+microphone. Lower it toward `2` only for genuinely uniform audio — one clean
+track per speaker, no inserts.
 
 **`--replace`** is for redoing a meeting you already have — a better glossary, a
 different `--thr`. It keeps the id, so every decision ever recorded about it
