@@ -263,9 +263,15 @@ def cmd_identify(a):
 def index_clusters(conn, run_dir=None):
     """Record every meeting's cluster centroids in `clusters`. -> n_indexed
 
-    Idempotent: re-running after a re-decode replaces a meeting's rows rather
-    than duplicating them, because a re-decode can change both the centroid and
-    the cluster ids.
+    Idempotent, and it must PRESERVE group_id on a cluster that still exists.
+    Wiping and reinserting looks equivalent and is not: link_groups reads
+    group_id to find which clusters a human has already named, so clearing it
+    here silently empties the must-link set and every naming decision is lost on
+    the next relink. That is a real defect this function shipped with, caught by
+    naming a group and relinking at a stricter threshold.
+
+    A cluster that no longer exists after a re-decode is dropped, since its id
+    may now mean a different voice.
     """
     import glob
     run_dir = run_dir or os.path.join(WORK, "out")
@@ -276,12 +282,17 @@ def index_clusters(conn, run_dir=None):
             cents = cluster_centroids(meeting, run_dir)
         except (OSError, KeyError, ValueError):
             continue
-        conn.execute("DELETE FROM clusters WHERE meeting=? AND embed_model=?",
-                     (meeting, EMBED_MODEL))
+        if cents:
+            conn.execute(
+                "DELETE FROM clusters WHERE meeting=? AND embed_model=? AND"
+                " cluster NOT IN (%s)" % ",".join("?" * len(cents)),
+                [meeting, EMBED_MODEL] + sorted(cents))
         for g, (v, secs) in cents.items():
             conn.execute(
                 "INSERT INTO clusters(meeting, cluster, emb, dim, embed_model,"
-                " seconds, group_id, created_at) VALUES(?,?,?,?,?,?,NULL,?)",
+                " seconds, group_id, created_at) VALUES(?,?,?,?,?,?,NULL,?)"
+                " ON CONFLICT(meeting, cluster, embed_model) DO UPDATE SET"
+                " emb=excluded.emb, dim=excluded.dim, seconds=excluded.seconds",
                 (meeting, g, v.astype(np.float32).tobytes(), len(v),
                  EMBED_MODEL, secs, time.time()))
             n += 1
