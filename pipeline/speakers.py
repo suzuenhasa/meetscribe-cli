@@ -55,6 +55,30 @@ MARGIN = 0.10          # best must beat second best by this much
 REVIEW = 0.40          # below ACCEPT but above this -> tentative, needs a human
 MIN_ENROLL_SEC = 10.0
 
+# Corpus-wide linking is a DIFFERENT level from identify and gets its own
+# numbers, for the reason in this module's header: a threshold fitted at one
+# level misfires at another. Two things make linking the harsher case. It scores
+# every cluster against every other, so acceptance is a max over the whole
+# corpus rather than over a roster -- the widest gallery there is. And a wrong
+# link is not one bad row, it is one name spread across every meeting it joins.
+#
+# Measured on the podcast corpus, cross-meeting centroid pairs, truth by ear:
+#
+#   same person   (across 5 recordings)   0.754 - 0.889
+#   IMPOSTOR      (a 24s cluster)         0.708 - 0.741   <- ACCEPT is 0.55
+#
+# ACCEPT would take that impostor without pausing. Duration is what made it
+# dangerous: a 53-second cluster of a different audience member scored
+# 0.521-0.547 against the same person, and every true pair came from clusters of
+# 1395s or more. Short clusters give unstable centroids that drift toward
+# whoever dominates the recording.
+#
+# Requiring 60s to be eligible drops the worst impostor from 0.741 to 0.458 and
+# widens the gap to the nearest true pair from 0.013 to 0.296. The gate does far
+# more work here than the threshold does, which is why it is not optional.
+LINK_ACCEPT = 0.75
+MIN_LINK_SEC = 60.0    # too short to enrol is too short to match
+
 
 def db(path=None):
     """Open the profile store and make sure its schema exists.
@@ -77,6 +101,24 @@ def db(path=None):
       id INTEGER PRIMARY KEY, meeting TEXT, cluster TEXT, speaker_id INTEGER,
       score REAL, second REAL, threshold REAL, level TEXT, roster TEXT,
       outcome TEXT, created_at REAL);
+
+    -- Every cluster the pipeline has ever produced, named or not. `prototypes`
+    -- cannot hold these: it requires a speaker_id, and the whole point of
+    -- linking is that a voice belongs to a group BEFORE anyone names it.
+    CREATE TABLE IF NOT EXISTS clusters(
+      id INTEGER PRIMARY KEY, meeting TEXT, cluster TEXT,
+      emb BLOB, dim INTEGER, embed_model TEXT, seconds REAL,
+      group_id INTEGER, created_at REAL,
+      UNIQUE(meeting, cluster, embed_model));
+    CREATE INDEX IF NOT EXISTS clusters_group ON clusters(group_id);
+
+    -- An identity discovered from audio. speaker_id stays NULL until a human
+    -- names it, and naming is then one UPDATE here rather than a rescan: every
+    -- meeting in the group inherits the name through the join.
+    CREATE TABLE IF NOT EXISTS groups(
+      id INTEGER PRIMARY KEY, speaker_id INTEGER, embed_model TEXT,
+      linked_at REAL,
+      FOREIGN KEY(speaker_id) REFERENCES speakers(id));
     """)
     return c
 
@@ -218,6 +260,199 @@ def cmd_identify(a):
           f"{REVIEW}-{ACCEPT} needs review; below {REVIEW} is UNKNOWN")
 
 
+def index_clusters(conn, run_dir=None):
+    """Record every meeting's cluster centroids in `clusters`. -> n_indexed
+
+    Idempotent: re-running after a re-decode replaces a meeting's rows rather
+    than duplicating them, because a re-decode can change both the centroid and
+    the cluster ids.
+    """
+    import glob
+    run_dir = run_dir or os.path.join(WORK, "out")
+    n = 0
+    for p in sorted(glob.glob(os.path.join(run_dir, "*_linked.json"))):
+        meeting = os.path.basename(p)[:-len("_linked.json")]
+        try:
+            cents = cluster_centroids(meeting, run_dir)
+        except (OSError, KeyError, ValueError):
+            continue
+        conn.execute("DELETE FROM clusters WHERE meeting=? AND embed_model=?",
+                     (meeting, EMBED_MODEL))
+        for g, (v, secs) in cents.items():
+            conn.execute(
+                "INSERT INTO clusters(meeting, cluster, emb, dim, embed_model,"
+                " seconds, group_id, created_at) VALUES(?,?,?,?,?,?,NULL,?)",
+                (meeting, g, v.astype(np.float32).tobytes(), len(v),
+                 EMBED_MODEL, secs, time.time()))
+            n += 1
+    conn.commit()
+    return n
+
+
+def _similar_pairs(A, thr, block=4096):
+    """Above-threshold pairs of a normalised matrix, without materialising NxN.
+
+    The full matrix is never wanted -- only pairs over the threshold, which are
+    a vanishing fraction. Blocking holds peak memory at block x N: measured on
+    50k centroids that is 0.38 GB against 9.31 GB, and 13s against 180s, on CPU
+    alone. Nothing here needs a GPU until roughly 4,000 meetings.
+    """
+    n = len(A)
+    out = []
+    for i in range(0, n, block):
+        S = A[i:i + block] @ A.T
+        for r, c in zip(*np.where(S >= thr)):
+            if i + r < c:                       # upper triangle only
+                out.append((float(S[r, c]), i + int(r), int(c)))
+    return out
+
+
+def link_groups(conn, thr=LINK_ACCEPT, min_sec=MIN_LINK_SEC):
+    """Group eligible clusters into identities. -> (labels, rows, pairs)
+
+    Constraints, both of which the linkage honours rather than repairs after:
+
+      cannot-link  two clusters in the SAME meeting are already known to be
+                   different people, so they must never land in one group.
+      must-link    clusters a human has already named together stay together,
+                   so relinking can never quietly undo a naming decision.
+    """
+    import cluster_speakers as cs
+
+    rows = conn.execute(
+        "SELECT id, meeting, cluster, emb, dim, seconds, group_id FROM clusters"
+        " WHERE embed_model=? AND seconds >= ? ORDER BY id",
+        (EMBED_MODEL, min_sec)).fetchall()
+    if len(rows) < 2:
+        return np.zeros(len(rows), dtype=int), rows, []
+
+    A = np.array([np.frombuffer(r[3], dtype=np.float32, count=r[4]) for r in rows])
+    A = A / np.clip(np.linalg.norm(A, axis=1, keepdims=True), 1e-9, None)
+    n = len(rows)
+
+    cannot = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if rows[i][1] == rows[j][1]:
+                cannot[i, j] = cannot[j, i] = True
+
+    pairs = _similar_pairs(A.astype(np.float32), thr)
+    _, labels_at = cs.constrained_linkage(A @ A.T, cannot)
+    lab, _ = labels_at(thr)
+
+    # must-link: re-unite anything a human already named into one group
+    named = {}
+    for i, r in enumerate(rows):
+        if r[6] is None:
+            continue
+        sid = conn.execute("SELECT speaker_id FROM groups WHERE id=?",
+                           (r[6],)).fetchone()
+        if sid and sid[0] is not None:
+            named.setdefault(sid[0], []).append(i)
+    for members in named.values():
+        keep = lab[members[0]]
+        for i in members:
+            lab[lab == lab[i]] = keep
+    return lab, rows, pairs
+
+
+def cmd_link(a):
+    conn = db()
+    n = index_clusters(conn, a.run_dir)
+    lab, rows, pairs = link_groups(conn, a.threshold, a.min_sec)
+    total = conn.execute("SELECT COUNT(*) FROM clusters WHERE embed_model=?",
+                         (EMBED_MODEL,)).fetchone()[0]
+    print(f"indexed {n} clusters ({total} on file); {len(rows)} eligible at "
+          f">={a.min_sec:.0f}s, {total - len(rows)} too short to match")
+    if not len(rows):
+        return
+
+    by = {}
+    for i, r in enumerate(rows):
+        by.setdefault(int(lab[i]), []).append(r)
+    spanning = {g: m for g, m in by.items() if len({x[1] for x in m}) > 1}
+    print(f"{len(by)} groups, {len(spanning)} spanning more than one meeting\n")
+    for g, m in sorted(spanning.items(), key=lambda kv: -len(kv[1])):
+        print(f"  group of {len(m)} across {len({x[1] for x in m})} meetings:")
+        for r in sorted(m, key=lambda r: -r[5]):
+            print(f"      {r[5]:6.0f}s  {r[1][:44]:<44} {r[2]}")
+    if pairs:
+        print(f"\nweakest accepted link {min(p[0] for p in pairs):.3f} "
+              f"(threshold {a.threshold})")
+
+    if not a.apply:
+        print("\ndry run -- nothing written. re-run with --apply")
+        return
+
+    stamp = time.time()
+    conn.execute("DELETE FROM groups WHERE embed_model=? AND speaker_id IS NULL",
+                 (EMBED_MODEL,))
+    for g, m in by.items():
+        keep = None
+        for r in m:                              # inherit an existing name
+            if r[6]:
+                row = conn.execute("SELECT speaker_id FROM groups WHERE id=?",
+                                   (r[6],)).fetchone()
+                if row and row[0] is not None:
+                    keep = r[6]
+                    break
+        if keep is None:
+            cur = conn.execute("INSERT INTO groups(speaker_id, embed_model,"
+                               " linked_at) VALUES(NULL,?,?)", (EMBED_MODEL, stamp))
+            keep = cur.lastrowid
+        for r in m:
+            conn.execute("UPDATE clusters SET group_id=? WHERE id=?", (keep, r[0]))
+    conn.commit()
+    print(f"\nwrote {len(by)} groups")
+
+
+def cmd_name(a):
+    """Name a group -- and with it every meeting the group already spans."""
+    conn = db()
+    conn.execute("INSERT OR IGNORE INTO speakers(name, created_at) VALUES(?,?)",
+                 (a.name, time.time()))
+    sid = conn.execute("SELECT id FROM speakers WHERE name=?", (a.name,)).fetchone()[0]
+    conn.execute("UPDATE groups SET speaker_id=? WHERE id=?", (sid, a.group_id))
+    members = conn.execute(
+        "SELECT meeting, cluster, seconds FROM clusters WHERE group_id=?"
+        " ORDER BY seconds DESC", (a.group_id,)).fetchall()
+    if not members:
+        raise SystemExit(f"group {a.group_id} has no members")
+    # a named group is also an enrolment: give identify the voiceprints too
+    for meeting, cluster, secs in members:
+        row = conn.execute("SELECT emb, dim FROM clusters WHERE meeting=? AND"
+                           " cluster=? AND embed_model=?",
+                           (meeting, cluster, EMBED_MODEL)).fetchone()
+        conn.execute("INSERT INTO prototypes(speaker_id, emb, dim, embed_model,"
+                     " level, meeting, seconds, created_at)"
+                     " VALUES(?,?,?,?,?,?,?,?)",
+                     (sid, row[0], row[1], EMBED_MODEL, "centroid",
+                      f"{meeting}:{cluster}", secs, time.time()))
+    conn.commit()
+    print(f"group {a.group_id} is {a.name} -- {len(members)} clusters across "
+          f"{len({m[0] for m in members})} meetings:")
+    for meeting, cluster, secs in members:
+        print(f"   {secs:6.0f}s  {meeting[:48]:<48} {cluster}")
+
+
+def cmd_groups(a):
+    conn = db()
+    rows = conn.execute(
+        "SELECT g.id, s.name, COUNT(c.id), COUNT(DISTINCT c.meeting),"
+        " SUM(c.seconds) FROM groups g"
+        " LEFT JOIN clusters c ON c.group_id = g.id"
+        " LEFT JOIN speakers s ON s.id = g.speaker_id"
+        " WHERE g.embed_model=? GROUP BY g.id ORDER BY 4 DESC, 3 DESC",
+        (EMBED_MODEL,)).fetchall()
+    if not rows:
+        print("no groups yet -- run: speakers.py link --apply")
+        return
+    print(f"{'group':>6}  {'name':24}{'clusters':>9}{'meetings':>9}{'speech':>9}")
+    for gid, name, nc, nm, secs in rows:
+        print(f"{gid:>6}  {(name or '-- unnamed --'):24}{nc:>9}{nm:>9}"
+              f"{(secs or 0):>8.0f}s")
+
+
 def cmd_list(a):
     conn = db()
     rows = conn.execute(
@@ -260,6 +495,19 @@ def main():
     i.add_argument("--roster", default=None,
                    help="comma-separated names known to be in this meeting")
     i.set_defaults(fn=cmd_identify)
+
+    lk = sub.add_parser("link", help="group voices across every meeting on file")
+    lk.add_argument("--threshold", type=float, default=LINK_ACCEPT)
+    lk.add_argument("--min-sec", type=float, default=MIN_LINK_SEC, dest="min_sec")
+    lk.add_argument("--apply", action="store_true",
+                    help="write the groups; without it this is a dry run")
+    lk.set_defaults(fn=cmd_link)
+
+    nm = sub.add_parser("name", help="name a group, and every meeting it spans")
+    nm.add_argument("group_id", type=int); nm.add_argument("name")
+    nm.set_defaults(fn=cmd_name)
+
+    sub.add_parser("groups").set_defaults(fn=cmd_groups)
 
     sub.add_parser("list").set_defaults(fn=cmd_list)
 
