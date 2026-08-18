@@ -696,6 +696,88 @@ def cmd_name(a):
         print(f"   {secs:6.0f}s  {meeting[:48]:<48} {cluster}")
 
 
+
+def cmd_review(a):
+    """The naming queue: who is worth identifying next, and the evidence to do it.
+
+    An unnamed voice is not a failure, it is a person nobody has introduced yet.
+    What matters is the ORDER: a provisional identity spanning twelve meetings is
+    one naming decision that fixes twelve transcripts, and a one-off is one that
+    fixes one. Sorting by meetings covered puts the leverage first.
+
+    Prints, per group, enough to name it without opening anything: how far it
+    reaches, a sample of what they said -- usually enough on its own -- and the
+    clips to listen to when it is not, since clips.py already cut those so a
+    voice could be judged after the source audio is gone.
+    """
+    import glob
+    import os
+
+    conn = db()
+    rows = conn.execute(
+        "SELECT g.id, COUNT(c.id), COUNT(DISTINCT c.meeting), SUM(c.seconds)"
+        " FROM groups g JOIN clusters c ON c.group_id = g.id"
+        " WHERE g.embed_model=? AND g.speaker_id IS NULL"
+        " GROUP BY g.id HAVING SUM(c.seconds) >= ?"
+        " ORDER BY COUNT(DISTINCT c.meeting) DESC, SUM(c.seconds) DESC",
+        (EMBED_MODEL, a.min_sec)).fetchall()
+    if not rows:
+        print("nothing waiting to be named.")
+        return
+
+    named = conn.execute("SELECT COUNT(*) FROM groups WHERE speaker_id IS NOT NULL"
+                         " AND embed_model=?", (EMBED_MODEL,)).fetchone()[0]
+    tot = sum(r[3] or 0 for r in rows)
+    print(f"{len(rows)} voices waiting to be named, {tot/3600:.1f} h of speech "
+          f"({named} people already named)\n")
+
+    lib = os.environ.get("MS_LIBRARY", os.path.join(WORK, "library"))
+    by_id = {os.path.basename(d).rsplit("-", 1)[-1]: d
+             for d in glob.glob(os.path.join(lib, "*")) if os.path.isdir(d)}
+
+    for gid, nclus, nmeet, secs in rows[: a.limit]:
+        members = conn.execute(
+            "SELECT meeting, cluster, seconds FROM clusters WHERE group_id=?"
+            " ORDER BY seconds DESC", (gid,)).fetchall()
+        print(f"  group {gid}: {secs/60:.0f} min across {nmeet} "
+              f"meeting{'s' if nmeet != 1 else ''}")
+        # what they said -- reading one line names most people outright
+        said = ""
+        for meeting, cluster, _ in members[:3]:
+            d = by_id.get(meeting)
+            if not d:
+                continue
+            tj = glob.glob(os.path.join(d, "*-transcript.json"))
+            if not tj:
+                continue
+            try:
+                segs = json.load(open(tj[0]))["segments"]
+            except Exception:
+                continue
+            txt = " ".join(x["text"] for x in segs
+                           if x.get("global") == cluster)[:200]
+            if len(txt) > 60:
+                said = txt
+                break
+        if said:
+            print(f'      "{said.strip()}..."')
+        top = members[0]
+        d = by_id.get(top[0])
+        clip = None
+        if d:
+            hit = sorted(glob.glob(os.path.join(d, "clips", f"{top[1]}-*.mp3")))
+            clip = hit[0] if hit else None
+        if clip:
+            print(f"      listen: {clip}")
+        print(f"      name it: speakers.py name {gid} \"Their Name\"")
+        print()
+
+    if len(rows) > a.limit:
+        rest = sum(r[3] or 0 for r in rows[a.limit:]) / 3600
+        print(f"  ... and {len(rows) - a.limit} more, {rest:.1f} h. "
+              f"--limit to see them.")
+
+
 def cmd_groups(a):
     conn = db()
     rows = conn.execute(
@@ -776,6 +858,11 @@ def main():
     nm.set_defaults(fn=cmd_name)
 
     sub.add_parser("groups").set_defaults(fn=cmd_groups)
+    rv = sub.add_parser("review", help="who is worth naming next, and why")
+    rv.add_argument("--limit", type=int, default=15)
+    rv.add_argument("--min-sec", type=float, default=MIN_LINK_SEC,
+                    dest="min_sec")
+    rv.set_defaults(fn=cmd_review)
 
     sub.add_parser("list").set_defaults(fn=cmd_list)
 

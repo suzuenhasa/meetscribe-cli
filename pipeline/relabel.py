@@ -243,6 +243,18 @@ def main():
         ]))[1:]
         if rc != 0:
             print(f"  !! could not re-render {m.path.name}: {out.strip()[:120]}")
+    # Matching renumbered `global`, and the clusters table was indexed when
+    # link ran. Leaving them disagreeing is how a name lands on the wrong person:
+    # it once filed a justice's fifteen hours under a colleague, and it silently
+    # blanks the samples `review` shows you. Re-index what we just rewrote so the
+    # store is consistent when this returns, rather than until someone
+    # remembers to re-link.
+    try:
+        n = SPK.index_clusters(conn)
+        print(f"re-indexed {n} clusters so the store matches the transcripts.")
+    except Exception as e:
+        print(f"  !! could not re-index the store: {e}")
+        print("     run `speakers.py link --apply` before naming anyone.")
     print(f"\nre-rendered {len(changed)} transcript(s).")
     return 0
 
