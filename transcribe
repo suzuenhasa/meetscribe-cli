@@ -12,6 +12,7 @@
 #   ./transcribe standup.mp3 --name G01="Bob Smith"    remember this voice, by name
 #   ./transcribe standup.mp3 --roster "Bob Smith,Jane Doe"   only score these people
 #   ./transcribe *.m4a --manifest week.json   a glossary AND roster per recording
+#   ./transcribe *.m4a --no-clips             skip the per-voice sample clips
 #   ./transcribe meeting.m4a --thr 0.70     # pin the cut by hand (rarely needed)
 #
 # On --glossary: names the model has never heard come out as the nearest familiar
@@ -88,6 +89,7 @@ GPUFRAC=""
 SRC=""
 GLOSSARY=""
 MANIFEST=""
+NOCLIPS=""
 OUTDIR=""
 REPLACE=""
 
@@ -135,6 +137,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --thr)      THR="$2"; shift 2 ;;
     --glossary) GLOSSARY="$(read_glossary "$2")"; shift 2 ;;
+    --no-clips) NOCLIPS="--no-clips"; shift ;;
     --manifest)
       [ -f "$2" ] || { echo "no manifest at $2" >&2; exit 2; }
       MANIFEST="$2"; shift 2 ;;
@@ -339,7 +342,7 @@ if [ -d "$SRC" ]; then
       --library '$JOBLIB' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
       --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
-      ${MANIFEST:+--manifest '$REMOTE/inbox/_manifest.json'} \
+      ${MANIFEST:+--manifest '$REMOTE/inbox/_manifest.json'} $NOCLIPS \
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}$TUNE)
     # Hand the job to the resident engine if the box is running one, which saves
     # the ~70s load. 97 is engined.py saying it could not -- no daemon, a stale
@@ -423,7 +426,7 @@ if [ ${#ENROLL[@]} -eq 0 ]; then
     $PYQ '$PIPE/engined.py' --submit -- '$REMOTE/inbox/$SAFE.$EXT' \
       --out-dir '$REMOTE/out' --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
-      ${MANIFEST:+--manifest '$REMOTE/inbox/_manifest.json'} \
+      ${MANIFEST:+--manifest '$REMOTE/inbox/_manifest.json'} $NOCLIPS \
       --library '$JOBLIB' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}$TUNE
   " || SINGLE_RC=$?

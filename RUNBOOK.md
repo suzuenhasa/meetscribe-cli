@@ -254,6 +254,25 @@ Retyping a name that is one character off creates a SECOND person and splits
 their voice between the two spellings, which nothing downstream can detect — so
 a near miss is refused and told to use the id.
 
+### Skipping the sample clips
+
+```bash
+./transcribe inbox/*.m4a --no-clips
+```
+
+Clips are a few seconds of each voice, cut so a person can still be named after
+the source audio is archived or deleted — about a megabyte for a five-speaker
+meeting against 54 MB for the mp3.
+
+They are also the last phase of a run and nothing overlaps them: measured on 300
+recordings, 145s of a 3,600s job, with the GPU idle throughout. Skipping them is
+~4% off the wallclock, and the cost is that naming a voice later needs the
+original audio still on disk.
+
+Worth knowing before reaching for it: the run is 89% GPU decode. 145s is the
+largest non-GPU cost and it is still small, so this is a real saving and not a
+large one.
+
 ### A batch where every recording is different
 
 ```bash
