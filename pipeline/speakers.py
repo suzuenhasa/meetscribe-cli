@@ -77,6 +77,10 @@ MIN_ENROLL_SEC = 10.0
 # widens the gap to the nearest true pair from 0.013 to 0.296. The gate does far
 # more work here than the threshold does, which is why it is not optional.
 LINK_ACCEPT = 0.75
+
+# How well a recording must match what we already store before it may become a
+# sub-profile itself. Above ACCEPT, because this feeds back: see refresh_exemplars.
+KEEP_EXEMPLAR = float(os.environ.get("MS_KEEP_EXEMPLAR", "0.72"))
 MIN_LINK_SEC = 60.0    # too short to enrol is too short to match
 
 
@@ -352,6 +356,75 @@ def _similar_pairs(A, thr, block=4096):
     return out
 
 
+
+def refresh_exemplars(conn, speaker_id, keep_named=True):
+    """Rebuild a person's sub-profiles to COVER everything known about them.
+
+    Averaging every recording of someone into one vector produces a point that
+    describes no actual circumstance -- measured, naming that way ran at 2.63%
+    wrong against 0.18% for per-circumstance exemplars. So cover instead of
+    average: keep taking the recording least well represented by what is already
+    stored, until every one is within ACCEPT of something.
+
+    This has to run after LINKING as well as after naming, and that is the whole
+    trick. A group is formed at 0.75, so its members are already alike and
+    naming it can only ever learn the circumstance it was formed in -- the
+    recordings that would teach the others are precisely the ones that failed to
+    join. Matching at ACCEPT reaches them, and rebuilding here turns each into a
+    sub-profile, which lets the next pass reach further still.
+
+    Sub-profiles a human named are never touched; auto- ones are ours to redraw.
+    """
+    import numpy as np
+
+    import match_speakers as MS
+    rows = conn.execute(
+        "SELECT c.emb, c.dim, c.seconds FROM clusters c JOIN groups g"
+        " ON g.id = c.group_id WHERE g.speaker_id = ? AND c.embed_model = ?"
+        " AND c.seconds > 0", (speaker_id, EMBED_MODEL)).fetchall()
+    if not rows:
+        return 0
+    E = np.stack([MS.unit(np.frombuffer(r[0], dtype=np.float32, count=r[1]))
+                  for r in rows])
+    w = np.array([r[2] for r in rows], dtype=float)
+
+    # Only CONFIDENT members may become a sub-profile. This is a self-training
+    # loop -- what it learns it then matches against -- so a marginal cluster
+    # promoted to a prototype starts attracting things like itself, and the
+    # error compounds instead of staying put. Measured: rebuilding from every
+    # attached cluster took naming from 2.63% wrong to 3.31% while adding two
+    # meetings of coverage, which is a bad trade in the direction that matters.
+    #
+    # Members at or above KEEP of an already-stored profile are the person as we
+    # already know them; the rest are still NAMED, they just do not get a vote on
+    # what she sounds like.
+    have = conn.execute("SELECT emb, dim FROM exemplars WHERE speaker_id=?"
+                        " AND embed_model=?", (speaker_id, EMBED_MODEL)).fetchall()
+    if have:
+        H = np.stack([MS.unit(np.frombuffer(h[0], dtype=np.float32, count=h[1]))
+                      for h in have])
+        ok = np.where((E @ H.T).max(axis=1) >= KEEP_EXEMPLAR)[0]
+        if len(ok):
+            E, w = E[ok], w[ok]
+    picked = [int(np.argmax(w))]
+    while len(picked) < 24:
+        cov = (E @ E[picked].T).max(axis=1)
+        if cov.min() >= MS.ACCEPT:
+            break
+        picked.append(int(np.argmin(cov)))
+    owner = (E @ E[picked].T).argmax(axis=1)
+    conn.execute("DELETE FROM exemplars WHERE speaker_id=? AND embed_model=?"
+                 " AND condition LIKE 'auto-%'", (speaker_id, EMBED_MODEL))
+    for k in range(len(picked)):
+        mine = np.where(owner == k)[0]
+        if not len(mine):
+            continue
+        v = MS.unit((E[mine] * w[mine][:, None]).sum(axis=0))
+        MS.save_exemplar(conn, speaker_id, "auto-%d" % (k + 1), v, EMBED_MODEL,
+                         float(w[mine].sum()))
+    return len(picked)
+
+
 def link_groups(conn, thr=LINK_ACCEPT, min_sec=MIN_LINK_SEC):
     """Group eligible clusters into identities. -> (labels, rows, pairs)
 
@@ -385,6 +458,51 @@ def link_groups(conn, thr=LINK_ACCEPT, min_sec=MIN_LINK_SEC):
     _, labels_at = cs.constrained_linkage(A @ A.T, cannot)
     lab, _ = labels_at(thr)
 
+    # Match against the sub-profiles BEFORE trusting the linkage. Agglomerative
+    # linkage compares one averaged centroid per cluster at a single threshold,
+    # so a recording that drifts past it forms its own singleton group and stays
+    # unnamed however many times that person has been named elsewhere. Measured
+    # over 300 SCOTUS arguments, that left Sotomayor missing from 30 of them
+    # while she was already named and present in 270.
+    #
+    # A person stored under several circumstances is as close as their CLOSEST
+    # one, so a phone recording is reached by the phone exemplar without the
+    # courtroom exemplar having to compromise toward it. Claims are settled
+    # strongest first, and one person may take at most one cluster per meeting --
+    # two clusters in a meeting are different people by MOSS's own judgment.
+    import match_speakers as MS
+    bank = MS.load_bank(conn, EMBED_MODEL)
+    speaker_of, pre = {}, [None] * n
+    if len(bank):
+        sids = {nm: conn.execute("SELECT id FROM speakers WHERE name=?",
+                                 (nm,)).fetchone() for nm in bank.names}
+        # MS.ACCEPT, not `thr`. 0.75 is the bar for agglomerative merging, where
+        # a wrong merge drags a whole subtree and every later merge inherits it.
+        # This is neither: a cluster is compared only to references, at most one
+        # cluster per meeting may take a person, and a mistake costs that one
+        # cluster. Measured over 293 arguments that runs at 0.18% wrong names --
+        # holding it to 0.75 instead just leaves people unnamed who were named.
+        P = bank.score(A.astype(np.float32))                 # (clusters, people)
+        cand = np.argwhere(P >= MS.ACCEPT)
+        order = np.argsort(-P[cand[:, 0], cand[:, 1]]) if len(cand) else []
+        taken = set()
+        for k in order:
+            i, pi = int(cand[k, 0]), int(cand[k, 1])
+            if pre[i] is not None or (rows[i][1], pi) in taken:
+                continue
+            pre[i] = pi
+            taken.add((rows[i][1], pi))
+        # everything matched to one person becomes one group, and that group
+        # carries the person, so --apply attaches it instead of inventing a name
+        for pi in {x for x in pre if x is not None}:
+            members = [i for i in range(n) if pre[i] == pi]
+            keep = lab[members[0]]
+            for i in members:
+                lab[lab == lab[i]] = keep
+            row = sids.get(bank.names[pi])
+            if row:
+                speaker_of[int(keep)] = row[0]
+
     # must-link: re-unite anything a human already named into one group
     named = {}
     for i, r in enumerate(rows):
@@ -398,13 +516,13 @@ def link_groups(conn, thr=LINK_ACCEPT, min_sec=MIN_LINK_SEC):
         keep = lab[members[0]]
         for i in members:
             lab[lab == lab[i]] = keep
-    return lab, rows, pairs
+    return lab, rows, pairs, speaker_of
 
 
 def cmd_link(a):
     conn = db()
     n = index_clusters(conn, a.run_dir)
-    lab, rows, pairs = link_groups(conn, a.threshold, a.min_sec)
+    lab, rows, pairs, speaker_of = link_groups(conn, a.threshold, a.min_sec)
     total = conn.execute("SELECT COUNT(*) FROM clusters WHERE embed_model=?",
                          (EMBED_MODEL,)).fetchone()[0]
     print(f"indexed {n} clusters ({total} on file); {len(rows)} eligible at "
@@ -432,9 +550,26 @@ def cmd_link(a):
     stamp = time.time()
     conn.execute("DELETE FROM groups WHERE embed_model=? AND speaker_id IS NULL",
                  (EMBED_MODEL,))
+    matched = 0
     for g, m in by.items():
         keep = None
+        sid = speaker_of.get(int(g))
+        if sid is not None:
+            # this group matched a person's sub-profiles: reuse their group so
+            # the name they already have covers these meetings too
+            row = conn.execute("SELECT id FROM groups WHERE speaker_id=?"
+                               " AND embed_model=?", (sid, EMBED_MODEL)).fetchone()
+            if row:
+                keep = row[0]
+            else:
+                cur = conn.execute("INSERT INTO groups(speaker_id, embed_model,"
+                                   " linked_at) VALUES(?,?,?)",
+                                   (sid, EMBED_MODEL, stamp))
+                keep = cur.lastrowid
+            matched += len(m)
         for r in m:                              # inherit an existing name
+            if keep is not None:
+                break
             if r[6]:
                 row = conn.execute("SELECT speaker_id FROM groups WHERE id=?",
                                    (r[6],)).fetchone()
@@ -448,7 +583,22 @@ def cmd_link(a):
         for r in m:
             conn.execute("UPDATE clusters SET group_id=? WHERE id=?", (keep, r[0]))
     conn.commit()
+    # Matching just attached recordings nobody had heard this person in. Fold
+    # them back into the sub-profiles so the next pass can reach further -- this
+    # is what breaks the bootstrap, where a group formed at 0.75 can only ever
+    # teach the circumstance it was already formed in.
+    grew = 0
+    for (sid,) in conn.execute(
+            "SELECT DISTINCT speaker_id FROM groups WHERE speaker_id IS NOT NULL"
+            " AND embed_model=?", (EMBED_MODEL,)).fetchall():
+        grew += refresh_exemplars(conn, sid)
+    conn.commit()
     print(f"\nwrote {len(by)} groups")
+    if grew:
+        print(f"{grew} sub-profiles now describe the named voices")
+    if speaker_of:
+        print(f"{matched} clusters attached to someone already named, by matching "
+              f"their sub-profiles")
 
 
 def cmd_name(a):
@@ -465,6 +615,7 @@ def cmd_name(a):
         raise SystemExit(f"group {a.group_id} has no members")
     # a named group is also an enrolment: give identify the voiceprints too
     import numpy as np
+
     import match_speakers as MS
     pool = []
     for meeting, cluster, secs in members:
@@ -483,9 +634,14 @@ def cmd_name(a):
     # becomes storable, and it is the difference between 22% wrong names on the
     # telephone arguments and 0.0-0.4%.
     if pool:
-        v = MS.unit(sum(e * w for e, w in pool))
-        MS.save_exemplar(conn, sid, a.condition, v, EMBED_MODEL,
-                         float(sum(w for _, w in pool)))
+        if a.condition is not None:
+            # a human said what these recordings have in common, so believe them
+            v = MS.unit(sum(e * w for e, w in pool))
+            MS.save_exemplar(conn, sid, a.condition, v, EMBED_MODEL,
+                             float(sum(w for _, w in pool)))
+        else:
+            conn.commit()
+            refresh_exemplars(conn, sid)
     conn.commit()
     cond = f" [{a.condition}]" if a.condition else ""
     print(f"group {a.group_id} is {a.name}{cond} -- {len(members)} clusters "
