@@ -222,6 +222,7 @@ def assign(atoms, bank, accept=ACCEPT):
     # descending speech, so a representative is a real turn and not a sliver --
     # and representatives never chain, which is the failure being replaced.
     left = [i for i in range(len(atoms)) if names[i] is None]
+    i_of = {i: i for i in range(len(atoms))}      # atom index == row of A and P
     prov = [None] * len(atoms)
     if left:
         idx = np.array(left)
@@ -243,23 +244,44 @@ def assign(atoms, bank, accept=ACCEPT):
                 reps.append(i); owner[i] = i
             else:
                 # Too little speech to FOUND an identity, which is a different
-                # question from whether it can join one. A two-second fragment
-                # has a vector too noisy to be anybody's reference, and letting
-                # it start its own speaker is what turns one argument's eleven
-                # people into twenty: measured, nine surplus identities held
-                # sixteen seconds of a fifty-nine minute recording, every one of
-                # them a splinter of somebody already present.
+                # question from whether it can join one: a two-second vector is
+                # too noisy to be anybody's reference. But WHICH identity it
+                # joins has to be decided by resemblance, not by whichever
+                # anonymous cluster happens to be nearest.
                 #
-                # So it joins the nearest identity it does not co-occur with,
-                # however weakly -- being a short piece of a speaker already in
-                # the room is far likelier than being the only trace of someone
-                # who never speaks again.
+                # The first version of this offered such a fragment only the
+                # provisional representatives -- never the enrolled people --
+                # and took the best of them unconditionally. Every one-word
+                # interjection by an enrolled justice was therefore filed under
+                # whichever unnamed advocate was closest, and the count looked
+                # right while the contents got worse. Named candidates are tried
+                # first, and nothing joins anything below SUBPROFILE.
+                w = atoms[left[i]]["key"][0]
+                if P.size:
+                    room = [p for p in range(P.shape[1]) if taken[w].get(p) is None]
+                    if room:
+                        best_p = max(room, key=lambda p: P[i_of[left[i]], p])
+                        if float(P[i_of[left[i]], best_p]) >= SUBPROFILE:
+                            names[left[i]] = bank.names[best_p]
+                            sim[left[i]] = float(P[i_of[left[i]], best_p])
+                            taken[w][best_p] = left[i]
+                            owner[i] = None
+                            continue
                 ok = [r for r in reps
-                      if atoms[left[r]]["key"][0] != atoms[left[i]]["key"][0]]
-                owner[i] = max(ok, key=lambda r: S[i, r]) if ok else i
-                if owner[i] == i:
-                    reps.append(i)
+                      if atoms[left[r]]["key"][0] != w
+                      and S[i, r] >= SUBPROFILE]
+                if ok:
+                    owner[i] = max(ok, key=lambda r: S[i, r])
+                else:
+                    # Nothing resembles it enough to say. Unresolved is the
+                    # honest answer and costs a reader one UNKNOWN; guessing
+                    # costs a wrong name inside somebody else's turn, and the
+                    # renderer then joins the two into one speech that never
+                    # happened.
+                    owner[i] = None
         for j, i in enumerate(left):
+            if names[i] is not None or owner.get(j) is None:
+                continue                      # named above, or left unresolved
             prov[i] = "P%02d" % reps.index(owner[j])
 
         # A provisional identity pools every atom that joined it, so it is a far
@@ -268,10 +290,16 @@ def assign(atoms, bank, accept=ACCEPT):
         # identities because two of her windows scored 0.56 and the rest 0.54
         # against the same reference. Matched as a whole she is unambiguous.
         # Same matmul, once more, against the pooled vectors.
+        # Only still-provisional atoms. `left` was taken before the fallback
+        # above, which names some of them and leaves others deliberately
+        # unresolved -- both have prov[i] None, and neither is a group.
         groups = collections.defaultdict(list)
         for i in left:
-            groups[prov[i]].append(i)
+            if prov[i] is not None:
+                groups[prov[i]].append(i)
         keys = sorted(groups)
+        if not keys:
+            return names, prov, sim
         C = np.stack([unit(sum(A[i] * atoms[i]["sec"] for i in groups[k]))
                       for k in keys])
         PC = bank.score(C)
