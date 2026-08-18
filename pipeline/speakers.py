@@ -912,6 +912,52 @@ def _profile_members(conn, sid):
     return out, ex
 
 
+
+def _measure_profiles(members, sample):
+    """Ask the AUDIO what each sub-profile is, since geometry cannot say.
+
+    Vector geometry decided the grouping and that is the right basis for it --
+    matching is done on vectors. But `auto-7` names nothing. Opening a few of
+    its recordings and measuring the channel is what turns it into something a
+    person can read, and unlike the geometry it does not depend on what else
+    happens to be in the library: a brick wall at 3.5 kHz is a phone call in any
+    corpus.
+
+    Only a few members per profile: this reads wavs, and a verdict that needs
+    more than a handful to agree is not a verdict worth printing.
+    """
+    import glob
+    import os
+
+    import conditions as CO
+    lib = os.environ.get("MS_LIBRARY", os.path.join(WORK, "library"))
+    by_id = {os.path.basename(d).rsplit("-", 1)[-1]: d
+             for d in glob.glob(os.path.join(lib, "*")) if os.path.isdir(d)}
+    out = {}
+    for cond, rows in members.items():
+        descs = []
+        for meeting, cluster, secs, _ in rows[:sample]:
+            d = by_id.get(meeting)
+            if not d:
+                continue
+            wav = glob.glob(os.path.join(d, "*-audio.wav"))
+            tj = glob.glob(os.path.join(d, "*-transcript.json"))
+            if not wav or not tj:
+                continue
+            try:
+                segs = json.load(open(tj[0]))["segments"]
+            except Exception:
+                continue
+            spans = [(float(x["start"]), float(x["end"])) for x in segs
+                     if x.get("global") == cluster]
+            if spans:
+                descs.append(CO.describe(wav[0], spans))
+        v = CO.agree(descs)
+        if v:
+            out[cond] = v
+    return out
+
+
 def cmd_profiles(a):
     """Show a person's sub-profiles, and what each one is actually made of.
 
@@ -928,10 +974,15 @@ def cmd_profiles(a):
         return
     print(f"{name}  (#{sid}) -- {len(ex)} sub-profile"
           f"{'s' if len(ex) != 1 else ''}\n")
+    measured = _measure_profiles(members, a.measure) if a.measure else {}
     suspects = []
     for cond, _, _, secs in ex:
         rows = members.get(cond, [])
         tag = "" if str(cond).startswith("auto-") else "   [named by you]"
+        m = measured.get(cond)
+        if m:
+            lab, edge, share = m
+            tag += ("   [%s, %.0f Hz, %.0f%% agree]" % (lab, edge, 100 * share))
         print(f"  {cond:<22} {secs/60:6.0f} min   {len(rows):>3} recording"
               f"{'s' if len(rows) != 1 else ''}{tag}")
         for meeting, cluster, sec, sim in rows[: a.show]:
@@ -960,6 +1011,12 @@ def cmd_profiles(a):
             print(f"       {meeting:<12} {cluster:<5} {sec:6.0f}s   fit {sim:.2f}"
                   f"   (filed under {cond})")
         print()
+    for cond, m in measured.items():
+        lab, edge, share = m
+        if str(cond).startswith("auto-") and share >= 0.8 and lab == "narrowband":
+            print(f"  {cond} is {share:.0%} narrowband at {edge:.0f} Hz -- a "
+                  f"phone or a headset.\n"
+                  f"      speakers.py profile-rename {sid} {cond} narrowband\n")
     print("  rename one:  speakers.py profile-rename %s <condition> <new name>"
           % sid)
 
@@ -1110,6 +1167,11 @@ def main():
                     help="recordings to list per sub-profile")
     pr.add_argument("--suspect", type=float, default=0.5,
                     help="below this fit, a member probably is not this person")
+    pr.add_argument("--measure", type=int, nargs="?", const=6, default=0,
+                    metavar="N",
+                    help="open N recordings per sub-profile and measure the "
+                         "channel, so a discovered profile gets a label that "
+                         "means something instead of a counter")
     pr.add_argument("--min-sec", type=float, default=MIN_LINK_SEC, dest="min_sec",
                     help="ignore members shorter than this when flagging: a "
                          "short clip has an unreliable vector by itself")
