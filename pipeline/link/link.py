@@ -41,7 +41,9 @@ import numpy as np
 _here = os.path.dirname(os.path.abspath(__file__))
 for _p in (_here, os.path.dirname(_here), os.path.dirname(os.path.dirname(_here))):
     sys.path.insert(0, _p)
+import os
 import cluster_speakers
+import match_speakers
 
 
 def load(run_path, npz_path):
@@ -183,6 +185,20 @@ def main():
     ap.add_argument("--min-cluster-sec", type=float,
                     default=cluster_speakers.MIN_CLUSTER_SEC,
                     help="below this a cluster is absorbed rather than kept")
+    ap.add_argument("--speaker-db", default=None,
+                    help="speakers.db to match against. Every named voice in it "
+                         "is a reference, so identity carries across recordings "
+                         "without a separate linking pass. Absent, this meeting "
+                         "is a cold start and its identities are provisional.")
+    ap.add_argument("--era", default=None,
+                    help="which era this recording belongs to, e.g. a year. A "
+                         "person is stored once per era: one averaged vector "
+                         "cannot span a change of microphone or a decade of "
+                         "voice, and pretending otherwise names the wrong human.")
+    ap.add_argument("--legacy-cluster", action="store_true",
+                    help="use the agglomerative path instead of matching. Kept "
+                         "for comparison: measured over 238 arguments it put "
+                         "13.8%% of speech on the wrong person against 0.18%%.")
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
@@ -209,16 +225,46 @@ def main():
             lab, k, *_ = cluster(A, secs, t, args.min_core, args.refine)
             print(f"SWEEP meeting={name} thr={t:.4f} k={k}")
 
-    lab, k, core, weak, S, D, Cf, info = cluster_speakers.cluster(
-        A, secs, keys, min_core=args.min_core, refine_iters=args.refine,
-        thr=fixed_thr, durable=args.durable, guard=args.guard,
-        min_cluster_sec=args.min_cluster_sec)
+    name_of = {}
+    if args.legacy_cluster:
+        lab, k, core, weak, S, D, Cf, info = cluster_speakers.cluster(
+            A, secs, keys, min_core=args.min_core, refine_iters=args.refine,
+            thr=fixed_thr, durable=args.durable, guard=args.guard,
+            min_cluster_sec=args.min_cluster_sec)
+    else:
+        # Match aggregates against known voices instead of clustering them into
+        # each other. Agglomerative merges are transitive -- A joins B, B joins
+        # C, and A and C are one speaker having never been compared -- which
+        # over 238 SCOTUS arguments collapsed 11.3 speakers into 9.0 and put
+        # 13.8% of all speech under the wrong name. Nothing here merges.
+        bank = match_speakers.Bank()
+        if args.speaker_db and os.path.exists(args.speaker_db):
+            import sqlite3
+            import speakers as spk
+            with sqlite3.connect(args.speaker_db) as _c:
+                bank = match_speakers.load_bank(_c, spk.EMBED_MODEL)
+        lab, name_of, info = match_speakers.label_meeting(keys, A, secs, bank)
+        k = info["k"]
+        # centroids for the sidecar, weighted by speech so a long turn counts
+        # for more than a short one
+        An = match_speakers.unit_rows(np.asarray(A, dtype=np.float32))
+        Cf = np.stack([match_speakers.unit(
+            (An[lab == c] * np.asarray(secs)[lab == c][:, None]).sum(axis=0))
+            if int((lab == c).sum()) else np.zeros(An.shape[1], np.float32)
+            for c in range(k)]) if k else np.zeros((0, An.shape[1]), np.float32)
+        info.setdefault("floor_ok", True)
     sizes = {int(c): float(secs[lab == c].sum()) for c in sorted(set(lab))}
     tshow = "n/a" if info["threshold"] is None else f"{info['threshold']:.4f}"
     print(f"CLUSTER meeting={name} thr={tshow} mode={info['mode']} "
           f"min_core={args.min_core} refine={args.refine} k_est={k} "
-          f"cannot_link={info['n_cannot_link']} min_k_floor={info['floor']} "
+          f"cannot_link={info.get('n_cannot_link', 'n/a')} "
+          f"min_k_floor={info.get('floor', 'n/a')} "
           f"cluster_secs={ {c: round(v) for c, v in sorted(sizes.items(), key=lambda x:-x[1])} }")
+    if name_of:
+        print(f"NAMED meeting={name} bank={info['bank']} "
+              f"named={info['named']}/{k} "
+              f"share_of_speech={info['named_share']:.1%} "
+              f"who={ {f'G{c:02d}': n for c, n in sorted(name_of.items())} }")
     if info.get("low_separation"):
         # The tree had no clear gap to cut at, so the speaker count is a guess.
         # Worth saying out loud rather than presenting it with the same
@@ -257,6 +303,10 @@ def main():
     for i, s in enumerate(R["segments"]):
         g = lab_of_key[key_of[i]]
         s["global"] = f"G{g:02d}" if g >= 0 else None
+        # The name belongs on the segment, not only in a lookup elsewhere: a
+        # consumer reading this file should not have to re-derive who someone is.
+        if g >= 0 and g in name_of:
+            s["speaker_name"] = name_of[g]
     if args.out:
         with open(args.out, "w") as _fh:
             json.dump(R, _fh)

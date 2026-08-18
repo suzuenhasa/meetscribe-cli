@@ -115,6 +115,19 @@ def db(path=None):
     -- An identity discovered from audio. speaker_id stays NULL until a human
     -- names it, and naming is then one UPDATE here rather than a rescan: every
     -- meeting in the group inherits the name through the join.
+    -- A person's voice as it actually sounds, once per era. One averaged vector
+    -- cannot stand for someone across a change of recording medium: measured on
+    -- the Court's 2020-21 telephone arguments, a courtroom-era reference put
+    -- 22-28% of speech under the WRONG name, against 0.0-0.4% once each era had
+    -- its own exemplar. Pooling within an era keeps this bounded by people x
+    -- eras rather than by recordings.
+    CREATE TABLE IF NOT EXISTS exemplars(
+      id INTEGER PRIMARY KEY, speaker_id INTEGER, era TEXT, emb BLOB,
+      dim INTEGER, embed_model TEXT, seconds REAL, created_at REAL,
+      UNIQUE(speaker_id, era, embed_model),
+      FOREIGN KEY(speaker_id) REFERENCES speakers(id));
+    CREATE INDEX IF NOT EXISTS exemplars_speaker ON exemplars(speaker_id);
+
     CREATE TABLE IF NOT EXISTS groups(
       id INTEGER PRIMARY KEY, speaker_id INTEGER, embed_model TEXT,
       linked_at REAL,
