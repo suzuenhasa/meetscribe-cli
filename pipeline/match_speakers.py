@@ -68,6 +68,12 @@ ACCEPT = float(os.environ.get("MS_MATCH_ACCEPT", "0.62"))
 # is kept as a candidate rather than named or discarded.
 SUBPROFILE = float(os.environ.get("MS_SUBPROFILE", "0.42"))
 
+# Speech an unmatched atom needs before it may FOUND its own identity rather
+# than join one. Not a matching threshold: an atom shorter than this is still
+# assigned, it just does not get to be the reference everything else is measured
+# against. Below a couple of seconds a vector is too noisy to represent anyone.
+FOUND_SEC = float(os.environ.get("MS_FOUND_SEC", "4.0"))
+
 
 def unit(v):
     n = float(np.linalg.norm(v))
@@ -233,8 +239,26 @@ def assign(atoms, bank, accept=ACCEPT):
                     and atoms[left[r]]["key"][0] != atoms[left[i]]["key"][0]]
             if cand:
                 owner[i] = max(cand, key=lambda r: S[i, r])
-            else:
+            elif secs[i] >= FOUND_SEC or not reps:
                 reps.append(i); owner[i] = i
+            else:
+                # Too little speech to FOUND an identity, which is a different
+                # question from whether it can join one. A two-second fragment
+                # has a vector too noisy to be anybody's reference, and letting
+                # it start its own speaker is what turns one argument's eleven
+                # people into twenty: measured, nine surplus identities held
+                # sixteen seconds of a fifty-nine minute recording, every one of
+                # them a splinter of somebody already present.
+                #
+                # So it joins the nearest identity it does not co-occur with,
+                # however weakly -- being a short piece of a speaker already in
+                # the room is far likelier than being the only trace of someone
+                # who never speaks again.
+                ok = [r for r in reps
+                      if atoms[left[r]]["key"][0] != atoms[left[i]]["key"][0]]
+                owner[i] = max(ok, key=lambda r: S[i, r]) if ok else i
+                if owner[i] == i:
+                    reps.append(i)
         for j, i in enumerate(left):
             prov[i] = "P%02d" % reps.index(owner[j])
 
