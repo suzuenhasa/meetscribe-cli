@@ -254,6 +254,35 @@ Retyping a name that is one character off creates a SECOND person and splits
 their voice between the two spellings, which nothing downstream can detect — so
 a near miss is refused and told to use the id.
 
+### A batch where every recording is different
+
+```bash
+./transcribe inbox/*.m4a --manifest week.json
+```
+
+```json
+{
+  "board-sync.m4a":  {"roster": ["Dana Whitfield", "Sam Okafor"],
+                      "glossary": "Northwind, NorthwindDA, Kubernetes"},
+  "eng-standup":     {"roster": ["Sam Okafor", "Priya Raman"],
+                      "glossary": "glossary/eng.txt"},
+  "client-call.wav": {"glossary": "Contoso, Fabrikam"}
+}
+```
+
+A queue is usually a week of different meetings with different people and
+different jargon. One `--glossary` across all of them helps the meeting it was
+written for and adds noise to the rest.
+
+Keyed by filename, extension optional — `"eng-standup"` matches
+`eng-standup.wav`. `glossary` takes terms or a path to a file of them, one per
+line. `roster` is who could be in *that* recording. Anything you leave out falls
+back to `--glossary` and `--roster`, and a recording absent from the manifest
+entirely is fine, so a manifest can cover the two meetings that need one and stay
+silent about the rest.
+
+One prompt is built per distinct glossary rather than per recording.
+
 ### Who could be in this recording
 
 ```bash

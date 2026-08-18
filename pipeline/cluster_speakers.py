@@ -117,12 +117,25 @@ def constrained_linkage(S, cannot):
     Rm[np.tril_indices(n)] = -np.inf
     Rm[CL & np.triu(np.ones((n, n), dtype=bool), 1)] = -np.inf
 
+    # One more level of the same argument. The loop body below is already slice
+    # arithmetic, but `np.argmax(Rm)` reads the whole matrix to find the next
+    # pair, every merge: n^2 elements x n merges, which is 30 billion reads at
+    # the 3,133 clusters a 300-recording library produces and invisible at the 91
+    # a single meeting does. A merge only invalidates rows whose best column was
+    # one of the two involved, so cache the per-row maximum and repair those.
+    #
+    # Tie-breaking is preserved exactly: argmax over the row maxima takes the
+    # first row holding the maximum, and rowarg holds the first column within
+    # it, which is what flat argmax on a row-major array picks.
+    rowmax = Rm.max(axis=1)
+    rowarg = Rm.argmax(axis=1)
+
     while True:
-        f = int(np.argmax(Rm))
-        best = Rm.flat[f]
+        bi = int(np.argmax(rowmax))
+        best = rowmax[bi]
         if not np.isfinite(best):         # every remaining pair is blocked
             break
-        bi, bj = divmod(f, n)
+        bj = int(rowarg[bi])
         heights.append(float(best))
         order.append((bi, bj))
         # Lance-Williams update for average linkage, as slice arithmetic. `o` is
@@ -144,6 +157,17 @@ def constrained_linkage(S, cannot):
         r = np.where(o & ~CL[bi], Ssum[bi] / cnt[bi], -np.inf)
         Rm[bi, :] = np.where(idx > bi, r, -np.inf)
         Rm[:, bi] = np.where(idx < bi, r, -np.inf)
+
+        # Repair the cache. Columns bi and bj changed, so any row whose best was
+        # one of those no longer knows its own maximum; every other row is
+        # untouched and keeps what it had.
+        stale = np.flatnonzero((rowarg == bi) | (rowarg == bj))
+        if len(stale):
+            sub = Rm[stale]
+            rowmax[stale] = sub.max(axis=1)
+            rowarg[stale] = sub.argmax(axis=1)
+        rowmax[bi] = Rm[bi].max(); rowarg[bi] = Rm[bi].argmax()
+        rowmax[bj] = -np.inf; rowarg[bj] = 0
 
     def labels_at(thr):
         par = list(range(n))
