@@ -964,6 +964,8 @@ def run_job(a, resident=None):
             argv += ["--speaker-db", db]
         if a.condition:
             argv += ["--condition", a.condition]
+        if a.roster:
+            argv += ["--roster", a.roster]
         return argv
 
     def argv_identify(name):

@@ -128,6 +128,13 @@ def main():
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--library", default=None)
     ap.add_argument("--roster", default="")
+    ap.add_argument("--roster-file", default=None, dest="roster_file",
+                    help="JSON mapping each meeting to who could be in it: "
+                         '{\"<meeting id or title>\": [\"Ada\", \"Bo\"]}. '
+                         "One global --roster cannot describe a library where "
+                         "every recording has different people in it, which is "
+                         "every real library. A calendar integration produces "
+                         "exactly this shape.")
     ap.add_argument("--condition", default=None,
                     help="circumstance to record for anyone recognised here")
     ap.add_argument("--from-groups", action="store_true",
@@ -150,7 +157,29 @@ def main():
     conn = SPK.db()
     # The store's named voices, as sub-profiles. Empty, or --from-groups, and
     # this falls back to renaming clusters from the linked groups.
-    bank = None if a.from_groups else MS.load_bank(conn, SPK.EMBED_MODEL)
+    # --roster was declared here and never used. Restricting the gallery to who
+    # could actually be in the recording is the cheapest accuracy there is: it
+    # removes impostor trials that were never going to be right.
+    _names = [x.strip() for x in a.roster.split(",") if x.strip()]
+    _per_meeting = {}
+    if a.roster_file:
+        _per_meeting = json.loads(Path(a.roster_file).read_text())
+    # One bank per DISTINCT roster, not per meeting: loading it is a query and
+    # a library of 300 recordings sharing a dozen rosters should pay for a dozen.
+    _banks = {}
+
+    def bank_for(m):
+        if a.from_groups:
+            return None
+        who = _per_meeting.get(m.id) or _per_meeting.get(m.title) or _names
+        key = tuple(sorted(who)) if who else None
+        if key not in _banks:
+            _banks[key] = MS.load_bank(conn, SPK.EMBED_MODEL,
+                                       names=list(key) if key else None)
+        return _banks[key]
+
+    bank = None if a.from_groups else MS.load_bank(conn, SPK.EMBED_MODEL,
+                                                   names=_names or None)
     n_groups = conn.execute(
         "SELECT COUNT(*) FROM groups WHERE speaker_id IS NOT NULL").fetchone()[0]
     if not n_groups:
@@ -179,8 +208,9 @@ def main():
         #
         # Naming is a decision made once, in one place. Here we only write it out.
         scratch = Path(tmpdir) / f"{m.id}.json"
-        if bank is not None and len(bank) and m.file("embeddings", "npz").exists():
-            after = relabel_by_matching(m, bank, a.condition)
+        _b = bank_for(m)
+        if _b is not None and len(_b) and m.file("embeddings", "npz").exists():
+            after = relabel_by_matching(m, _b, a.condition)
         else:
             after = names_from_groups(conn, m)
         scratch.write_text(json.dumps(after, indent=1))
