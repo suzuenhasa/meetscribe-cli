@@ -352,7 +352,15 @@ def index_clusters(conn, run_dir=None):
                 "INSERT INTO clusters(meeting, cluster, emb, dim, embed_model,"
                 " seconds, group_id, created_at) VALUES(?,?,?,?,?,?,NULL,?)"
                 " ON CONFLICT(meeting, cluster, embed_model) DO UPDATE SET"
-                " emb=excluded.emb, dim=excluded.dim, seconds=excluded.seconds",
+                " emb=excluded.emb, dim=excluded.dim, seconds=excluded.seconds,"
+                # group_id follows the VOICE, not the label. Matching renumbers
+                # `global`, so (meeting, G05) can be a different person after a
+                # relabel while keeping G05's old row -- and with it the name
+                # attached to it. That is how one-second fragments ended up
+                # filed under a justice. If the vector changed, whatever
+                # identity was attached to the old one is no longer justified.
+                " group_id=CASE WHEN clusters.emb IS excluded.emb"
+                " THEN clusters.group_id ELSE NULL END",
                 (meeting, g, v.astype(np.float32).tobytes(), len(v),
                  EMBED_MODEL, secs, time.time()))
             n += 1
@@ -869,6 +877,135 @@ def cmd_review(a):
               f"--limit to see them.")
 
 
+
+def _profile_members(conn, sid):
+    """Which recordings each sub-profile actually stands for. -> {cond: [rows]}
+
+    The exemplars table stores the vectors, not the membership: a covering set
+    is chosen and every cluster is pooled into its nearest pick, and only the
+    result is written. So membership is recomputed here the same way it was
+    decided, rather than adding a column that could disagree with the vectors it
+    claims to describe.
+    """
+    import numpy as np
+
+    import match_speakers as MS
+    ex = conn.execute(
+        "SELECT condition, emb, dim, seconds FROM exemplars WHERE speaker_id=?"
+        " AND embed_model=? ORDER BY seconds DESC",
+        (sid, EMBED_MODEL)).fetchall()
+    if not ex:
+        return {}, []
+    E = np.stack([MS.unit(np.frombuffer(r[1], dtype=np.float32, count=r[2]))
+                  for r in ex])
+    rows = conn.execute(
+        "SELECT c.meeting, c.cluster, c.seconds, c.emb, c.dim FROM clusters c"
+        " JOIN groups g ON g.id = c.group_id WHERE g.speaker_id=? AND"
+        " c.embed_model=? AND c.seconds > 0 ORDER BY c.seconds DESC",
+        (sid, EMBED_MODEL)).fetchall()
+    out = {r[0]: [] for r in ex}
+    for meeting, cluster, secs, blob, dim in rows:
+        v = MS.unit(np.frombuffer(blob, dtype=np.float32, count=dim))
+        sims = E @ v
+        j = int(np.argmax(sims))
+        out[ex[j][0]].append((meeting, cluster, secs, float(sims[j])))
+    return out, ex
+
+
+def cmd_profiles(a):
+    """Show a person's sub-profiles, and what each one is actually made of.
+
+    `auto-2` is a counter, not a description -- it says a second way of sounding
+    was found and nothing about what it is. Listing the recordings behind it is
+    what lets a human look and say "those are all the phone calls", and then
+    rename it to say so.
+    """
+    conn = db()
+    sid, name = _resolve_speaker(conn, a.who)
+    members, ex = _profile_members(conn, sid)
+    if not ex:
+        print(f"{name} (#{sid}) has no sub-profiles yet.")
+        return
+    print(f"{name}  (#{sid}) -- {len(ex)} sub-profile"
+          f"{'s' if len(ex) != 1 else ''}\n")
+    suspects = []
+    for cond, _, _, secs in ex:
+        rows = members.get(cond, [])
+        tag = "" if str(cond).startswith("auto-") else "   [named by you]"
+        print(f"  {cond:<22} {secs/60:6.0f} min   {len(rows):>3} recording"
+              f"{'s' if len(rows) != 1 else ''}{tag}")
+        for meeting, cluster, sec, sim in rows[: a.show]:
+            print(f"       {meeting:<12} {cluster:<5} {sec:6.0f}s   fit {sim:.2f}")
+        if len(rows) > a.show:
+            print(f"       ... and {len(rows) - a.show} more")
+        # Duration matters more than fit here. A one-second fragment has an
+        # unreliable vector and fitting badly says nothing; a two-minute cluster
+        # at 0.05 is someone else. Flagging both buried the second in the first
+        # -- 86 rows, almost all of them a second long.
+        suspects += [(sim, meeting, cluster, sec, cond)
+                     for meeting, cluster, sec, sim in rows
+                     if sim < a.suspect and sec >= a.min_sec]
+        print()
+
+    # A member that fits none of this person's profiles is the interesting row,
+    # and sorting by speech buries it. Either the linking put someone else in
+    # here -- which nothing else surfaces -- or it is a circumstance so unlike
+    # the others that it deserves its own profile. Both need a human.
+    if suspects:
+        suspects.sort()
+        print(f"  {len(suspects)} recording"
+              f"{'s' if len(suspects) != 1 else ''} fit no profile of theirs "
+              f"(below {a.suspect:.2f}) -- likely someone else:")
+        for sim, meeting, cluster, sec, cond in suspects[:10]:
+            print(f"       {meeting:<12} {cluster:<5} {sec:6.0f}s   fit {sim:.2f}"
+                  f"   (filed under {cond})")
+        print()
+    print("  rename one:  speakers.py profile-rename %s <condition> <new name>"
+          % sid)
+
+
+def cmd_profile_rename(a):
+    """Give a discovered sub-profile a name that means something.
+
+    A renamed profile stops being ours to redraw -- refresh_exemplars only
+    deletes `auto-*` -- so this is also how you pin one against being recomputed.
+    """
+    conn = db()
+    sid, name = _resolve_speaker(conn, a.who)
+    row = conn.execute("SELECT id FROM exemplars WHERE speaker_id=? AND"
+                       " condition=? AND embed_model=?",
+                       (sid, a.old, EMBED_MODEL)).fetchone()
+    if not row:
+        have = [r[0] for r in conn.execute(
+            "SELECT condition FROM exemplars WHERE speaker_id=? AND embed_model=?",
+            (sid, EMBED_MODEL))]
+        raise SystemExit(f"{name} has no sub-profile {a.old!r}. "
+                         f"It has: {', '.join(map(str, have)) or '(none)'}")
+    clash = conn.execute("SELECT 1 FROM exemplars WHERE speaker_id=? AND"
+                         " condition=? AND embed_model=?",
+                         (sid, a.new, EMBED_MODEL)).fetchone()
+    if clash:
+        raise SystemExit(f"{name} already has a sub-profile called {a.new!r}. "
+                         f"Pick another name, or they should be merged.")
+    conn.execute("UPDATE exemplars SET condition=? WHERE id=?", (a.new, row[0]))
+    conn.commit()
+    print(f"{name}: {a.old} is now {a.new!r}, and is no longer redrawn "
+          f"automatically.")
+
+
+def _resolve_speaker(conn, who):
+    """-> (id, name). Accepts an id or a name, because both get typed."""
+    if str(who).isdigit():
+        row = conn.execute("SELECT id, name FROM speakers WHERE id=?",
+                           (int(who),)).fetchone()
+    else:
+        row = conn.execute("SELECT id, name FROM speakers WHERE name=?",
+                           (who,)).fetchone()
+    if not row:
+        raise SystemExit(f"no speaker {who!r} -- see `list`")
+    return row[0], row[1]
+
+
 def cmd_groups(a):
     conn = db()
     rows = conn.execute(
@@ -965,6 +1102,23 @@ def main():
     rv.add_argument("--min-sec", type=float, default=MIN_LINK_SEC,
                     dest="min_sec")
     rv.set_defaults(fn=cmd_review)
+
+    pr = sub.add_parser("profiles",
+                        help="a person's sub-profiles, and what each is made of")
+    pr.add_argument("who", help="speaker id or name")
+    pr.add_argument("--show", type=int, default=5,
+                    help="recordings to list per sub-profile")
+    pr.add_argument("--suspect", type=float, default=0.5,
+                    help="below this fit, a member probably is not this person")
+    pr.add_argument("--min-sec", type=float, default=MIN_LINK_SEC, dest="min_sec",
+                    help="ignore members shorter than this when flagging: a "
+                         "short clip has an unreliable vector by itself")
+    pr.set_defaults(fn=cmd_profiles)
+
+    pn = sub.add_parser("profile-rename",
+                        help="name a discovered sub-profile, and pin it")
+    pn.add_argument("who"); pn.add_argument("old"); pn.add_argument("new")
+    pn.set_defaults(fn=cmd_profile_rename)
 
     sub.add_parser("list").set_defaults(fn=cmd_list)
 
