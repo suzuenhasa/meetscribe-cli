@@ -78,6 +78,9 @@ If the engine is running, commands use it. Otherwise they load their own.
 
 > Every command and flag is in **[RUNBOOK.md](RUNBOOK.md)**.
 
+Day to day, the loop is in [WORKFLOW.md](WORKFLOW.md):
+transcribe, group the voices, name whoever is new, backfill.
+
 ---
 
 ## Speed

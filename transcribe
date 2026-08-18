@@ -11,6 +11,7 @@
 #   ./transcribe interview.mp3 --glossary crypto.txt   a file of terms, one per line
 #   ./transcribe standup.mp3 --name G01="Bob Smith"    remember this voice, by name
 #   ./transcribe standup.mp3 --roster "Bob Smith,Jane Doe"   only score these people
+#   ./transcribe *.m4a --manifest week.json   a glossary AND roster per recording
 #   ./transcribe meeting.m4a --thr 0.70     # pin the cut by hand (rarely needed)
 #
 # On --glossary: names the model has never heard come out as the nearest familiar
@@ -86,6 +87,7 @@ OVERLAP="0"
 GPUFRAC=""
 SRC=""
 GLOSSARY=""
+MANIFEST=""
 OUTDIR=""
 REPLACE=""
 
@@ -133,6 +135,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --thr)      THR="$2"; shift 2 ;;
     --glossary) GLOSSARY="$(read_glossary "$2")"; shift 2 ;;
+    --manifest)
+      [ -f "$2" ] || { echo "no manifest at $2" >&2; exit 2; }
+      MANIFEST="$2"; shift 2 ;;
     --roster)   ROSTER="$2"; shift 2 ;;
     --name)     ENROLL+=(--enroll "$2"); shift 2 ;;
     --window)  WINDOW="$2"; shift 2 ;;
@@ -317,6 +322,7 @@ if [ -d "$SRC" ]; then
   done
   printf '}' >> "$TITLES"
   rput "$TITLES" "$REMOTE/out/_titles.json"; rm -f "$TITLES"
+  [ -n "$MANIFEST" ] && rput "$MANIFEST" "$REMOTE/inbox/_manifest.json"
   push_profiles
   # Do NOT let set -e abort here. batch.py now exits nonzero when any single
   # recording fails, and the rest of the batch has still succeeded -- aborting
@@ -333,6 +339,7 @@ if [ -d "$SRC" ]; then
       --library '$JOBLIB' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
       --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
+      ${MANIFEST:+--manifest '$REMOTE/inbox/_manifest.json'} \
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}$TUNE)
     # Hand the job to the resident engine if the box is running one, which saves
     # the ~70s load. 97 is engined.py saying it could not -- no daemon, a stale
@@ -406,6 +413,7 @@ if [ ${#ENROLL[@]} -eq 0 ]; then
   # gives the header back the title the human actually used.
   printf '{%s}' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1])+":"+json.dumps(sys.argv[2]), end="")' "$SAFE" "$BASE")" > "$T1"
   rput "$T1" "$REMOTE/out/_titles.json"; rm -f "$T1"
+  [ -n "$MANIFEST" ] && rput "$MANIFEST" "$REMOTE/inbox/_manifest.json"
   SINGLE_RC=0
   rrun "
     set -uo pipefail
@@ -415,6 +423,7 @@ if [ ${#ENROLL[@]} -eq 0 ]; then
     $PYQ '$PIPE/engined.py' --submit -- '$REMOTE/inbox/$SAFE.$EXT' \
       --out-dir '$REMOTE/out' --window $WINDOW --overlap $OVERLAP --thr $THR \
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
+      ${MANIFEST:+--manifest '$REMOTE/inbox/_manifest.json'} \
       --library '$JOBLIB' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}$TUNE
   " || SINGLE_RC=$?

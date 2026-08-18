@@ -436,6 +436,17 @@ def build_parser():
                          "in native-sized requests rather than 1.33x in oversized "
                          "ones, which batch worse")
     ap.add_argument("--glossary", default="")
+    ap.add_argument("--manifest", default=None,
+                    help="JSON giving each recording its OWN glossary and "
+                         "roster, keyed by filename: "
+                         '{"board-sync.m4a": {"roster": ["Ada","Bo"], '
+                         '"glossary": "acme,Kubernetes"}}. A queue is usually a '
+                         "week of different meetings with different people and "
+                         "different jargon, and one --glossary for all of them "
+                         "helps the one it was written for and adds noise to the "
+                         "rest. glossary takes terms or a path to a file of "
+                         "them; anything absent falls back to --glossary and "
+                         "--roster.")
     ap.add_argument("--roster", default="")
     ap.add_argument("--titles", default="",
                     help="JSON {safe_name: original title}. Filenames are "
@@ -611,6 +622,18 @@ def run_job(a, resident=None):
                      f"so it will still be split)")
         print(f"--accurate: one pass per recording, window {a.window/60:.1f} min"
               + note, flush=True)
+
+    # One prompt per DISTINCT glossary, not per recording: building it is cheap
+    # but not free, and a queue usually holds a handful of glossaries across
+    # dozens of files.
+    entry_for = load_manifest(a.manifest, a.glossary, a.roster)
+    _prompts = {}
+
+    def prompt_for(f):
+        gl, _ = entry_for(f)
+        if gl not in _prompts:
+            _prompts[gl] = TM.build_prompt(gl)
+        return _prompts[gl]
 
     ptxt = TM.build_prompt(a.glossary)
     if resident is not None:
@@ -814,8 +837,8 @@ def run_job(a, resident=None):
         meetings[name] = m
         try:
             wav = load_audio_item(str(f), sampling_rate=TM.SR)
-            reqs, offsets, cores = TM.plan_windows(wav, ptxt, a.window, a.overlap,
-                                                   a.slide, a.snap)
+            reqs, offsets, cores = TM.plan_windows(wav, prompt_for(f), a.window,
+                                                   a.overlap, a.slide, a.snap)
         except Exception as e:
             # One unreadable recording must not cost the whole queue. A truncated
             # mp3 used to raise straight out of the loop, taking the engine with
@@ -972,8 +995,11 @@ def run_job(a, resident=None):
             argv += ["--speaker-db", db]
         if a.condition:
             argv += ["--condition", a.condition]
-        if a.roster:
-            argv += ["--roster", a.roster]
+        # this recording's roster, not the queue's
+        src = getattr(m, "source", None) or name
+        _, r = entry_for(src)
+        if r:
+            argv += ["--roster", r]
         return argv
 
     def argv_identify(name):
@@ -1178,6 +1204,42 @@ def run_job(a, resident=None):
         print(f"\n{n_bad} of {len(files)} file(s) did not complete.", flush=True)
         return 1
     return 0
+
+
+def load_manifest(path, fallback_gloss, fallback_roster):
+    """-> fn(path) giving that recording its own glossary and roster.
+
+    A queue is usually a week of different meetings with different people and
+    different jargon. One --glossary across all of them helps the meeting it was
+    written for and adds noise to the rest, and one --roster is either too narrow
+    to cover the week or too wide to be worth having.
+
+    Keyed on the filename, matched on the full name first and then the stem, so
+    both "board-sync.m4a" and "board-sync" work and nobody has to remember which
+    extension a recording arrived with. Anything absent falls back to the
+    command line, so a manifest can cover the two meetings that need it and stay
+    silent about the rest.
+    """
+    table = {}
+    if path:
+        raw = json.loads(Path(path).read_text())
+        for k, v in raw.items():
+            if isinstance(v, str):            # a bare string means glossary
+                v = {"glossary": v}
+            table[k] = v
+            table.setdefault(Path(k).stem, v)
+
+    def entry(f):
+        e = table.get(Path(f).name) or table.get(Path(f).stem) or {}
+        gl = e.get("glossary", fallback_gloss)
+        if gl and "," not in gl and Path(gl).suffix and Path(gl).exists():
+            gl = ", ".join(x.strip() for x in
+                           Path(gl).read_text().splitlines() if x.strip())
+        r = e.get("roster", fallback_roster)
+        if isinstance(r, (list, tuple)):
+            r = ",".join(r)
+        return gl or "", r or ""
+    return entry
 
 
 def main(argv=None):
