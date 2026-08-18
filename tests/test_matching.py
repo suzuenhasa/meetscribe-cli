@@ -91,13 +91,41 @@ class TestSubProfiles:
             names, _, _ = ms.assign([atom(v)], b, accept=0.55)
             assert names[0] == "ada"
 
-    def test_an_era_pools_rather_than_appends(self):
+    def test_one_circumstance_pools_rather_than_appends(self):
         b = ms.Bank()
-        b.add("ada", basis(0), era="2015")
-        b.add("ada", at_cosine(0.95, 1), era="2015")
+        b.add("ada", basis(0), condition="courtroom")
+        b.add("ada", at_cosine(0.95, 1), condition="courtroom")
         assert sum(len(e) for e in b._ex) == 1
-        b.add("ada", at_cosine(0.2, 1), era="2020")
+        b.add("ada", at_cosine(0.2, 1), condition="telephone")
         assert sum(len(e) for e in b._ex) == 2
+
+    def test_a_condition_is_an_opaque_key_not_a_date(self):
+        """Nothing reads meaning into the value, which is the point.
+
+        It exists so someone can say "that is also her, through a potato" and
+        have that be storable. "telephone", "2015" and "the bad conference room"
+        are the same kind of thing to this code.
+        """
+        b = ms.Bank()
+        for c in ("2015", "telephone", "through a potato", "far-field"):
+            b.add("ada", at_cosine(0.15, hash(c) % 8 + 1), condition=c)
+        assert len(b) == 1
+        assert sum(len(e) for e in b._ex) == 4
+
+    def test_naming_someone_again_adds_a_profile_rather_than_replacing(self):
+        """The recovery path for a voice that stopped being recognised.
+
+        Someone appears over a new microphone, is not matched, and a human says
+        "that is also her". That must not overwrite how she sounded before, or
+        the fix for today's recording breaks every recording before it.
+        """
+        b = ms.Bank()
+        near, far = basis(0), at_cosine(0.1, 1)
+        b.add("ada", near, condition="room")
+        assert ms.assign([atom(far)], b, accept=0.55)[0] == [None]
+        b.add("ada", far, condition="potato")
+        assert ms.assign([atom(far)], b, accept=0.55)[0] == ["ada"]
+        assert ms.assign([atom(near)], b, accept=0.55)[0] == ["ada"]
 
     def test_score_takes_the_nearest_exemplar_not_their_mean(self):
         b = ms.Bank(); b.add("ada", basis(0)); b.add("ada", at_cosine(0.0, 1))

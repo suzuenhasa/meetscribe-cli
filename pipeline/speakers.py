@@ -115,16 +115,21 @@ def db(path=None):
     -- An identity discovered from audio. speaker_id stays NULL until a human
     -- names it, and naming is then one UPDATE here rather than a rescan: every
     -- meeting in the group inherits the name through the join.
-    -- A person's voice as it actually sounds, once per era. One averaged vector
-    -- cannot stand for someone across a change of recording medium: measured on
-    -- the Court's 2020-21 telephone arguments, a courtroom-era reference put
-    -- 22-28% of speech under the WRONG name, against 0.0-0.4% once each era had
-    -- its own exemplar. Pooling within an era keeps this bounded by people x
-    -- eras rather than by recordings.
+    -- A person's voice as it actually sounds, once per CIRCUMSTANCE. One
+    -- averaged vector cannot stand for someone across a change of recording
+    -- condition: measured on the Court's 2020-21 telephone arguments, a
+    -- courtroom reference put 22-28% of speech under the WRONG name, against
+    -- 0.0-0.4% once each condition had its own exemplar.
+    --
+    -- `condition` is a free string and nothing reads meaning into it:
+    -- "telephone", "far-field", "2015", "headset", "the bad conference room".
+    -- It exists so that "this is also her, through a potato" is a thing someone
+    -- can say and have stored. Pooling within one keeps this bounded by people
+    -- x conditions rather than by recordings.
     CREATE TABLE IF NOT EXISTS exemplars(
-      id INTEGER PRIMARY KEY, speaker_id INTEGER, era TEXT, emb BLOB,
+      id INTEGER PRIMARY KEY, speaker_id INTEGER, condition TEXT, emb BLOB,
       dim INTEGER, embed_model TEXT, seconds REAL, created_at REAL,
-      UNIQUE(speaker_id, era, embed_model),
+      UNIQUE(speaker_id, condition, embed_model),
       FOREIGN KEY(speaker_id) REFERENCES speakers(id));
     CREATE INDEX IF NOT EXISTS exemplars_speaker ON exemplars(speaker_id);
 
@@ -133,6 +138,13 @@ def db(path=None):
       linked_at REAL,
       FOREIGN KEY(speaker_id) REFERENCES speakers(id));
     """)
+    # The column was called `era` for part of one afternoon, which read as a
+    # date and it is not one. Rename in place rather than asking anyone to
+    # rebuild a store whose whole purpose is being the file you cannot rebuild.
+    cols = [r[1] for r in c.execute("PRAGMA table_info(exemplars)")]
+    if "era" in cols and "condition" not in cols:
+        c.execute("ALTER TABLE exemplars RENAME COLUMN era TO condition")
+        c.commit()
     return c
 
 
@@ -452,6 +464,9 @@ def cmd_name(a):
     if not members:
         raise SystemExit(f"group {a.group_id} has no members")
     # a named group is also an enrolment: give identify the voiceprints too
+    import numpy as np
+    import match_speakers as MS
+    pool = []
     for meeting, cluster, secs in members:
         row = conn.execute("SELECT emb, dim FROM clusters WHERE meeting=? AND"
                            " cluster=? AND embed_model=?",
@@ -461,9 +476,26 @@ def cmd_name(a):
                      " VALUES(?,?,?,?,?,?,?,?)",
                      (sid, row[0], row[1], EMBED_MODEL, "centroid",
                       f"{meeting}:{cluster}", secs, time.time()))
+        pool.append((np.frombuffer(row[0], dtype=np.float32, count=row[1]), secs))
+    # and an exemplar for the circumstance, which is what matching reads. Naming
+    # the same person again under a different --condition adds a sub-profile
+    # rather than overwriting: that is how "this is also her, on the phone"
+    # becomes storable, and it is the difference between 22% wrong names on the
+    # telephone arguments and 0.0-0.4%.
+    if pool:
+        v = MS.unit(sum(e * w for e, w in pool))
+        MS.save_exemplar(conn, sid, a.condition, v, EMBED_MODEL,
+                         float(sum(w for _, w in pool)))
     conn.commit()
-    print(f"group {a.group_id} is {a.name} -- {len(members)} clusters across "
-          f"{len({m[0] for m in members})} meetings:")
+    cond = f" [{a.condition}]" if a.condition else ""
+    print(f"group {a.group_id} is {a.name}{cond} -- {len(members)} clusters "
+          f"across {len({m[0] for m in members})} meetings:")
+    have = conn.execute(
+        "SELECT condition, seconds FROM exemplars WHERE speaker_id=? AND"
+        " embed_model=? ORDER BY seconds DESC", (sid, EMBED_MODEL)).fetchall()
+    if len(have) > 1:
+        print(f"   {a.name} is now stored under {len(have)} circumstances: "
+              + ", ".join(f"{c or 'default'} ({s:.0f}s)" for c, s in have))
     for meeting, cluster, secs in members:
         print(f"   {secs:6.0f}s  {meeting[:48]:<48} {cluster}")
 
@@ -537,6 +569,13 @@ def main():
     lk.set_defaults(fn=cmd_link)
 
     nm = sub.add_parser("name", help="name a group, and every meeting it spans")
+    nm.add_argument("--condition", default=None,
+                    help="what made this recording sound the way it does -- "
+                         "'telephone', 'far-field', '2015', 'headset', anything. "
+                         "Naming the same person again under a different one "
+                         "ADDS a sub-profile instead of replacing: one averaged "
+                         "voiceprint cannot span a change of microphone, and "
+                         "pretending it can names the wrong human.")
     nm.add_argument("group_id", type=int); nm.add_argument("name")
     nm.set_defaults(fn=cmd_name)
 

@@ -18,7 +18,13 @@ between. Measured on the Court's 2020-21 telephone arguments, a single averaged
 reference put 22-28% of speech under the WRONG name -- not unnamed, wrong --
 while the same reference was 92-96% correct on courtroom audio near enrolment.
 So each person owns exemplars, an atom matches the nearest ONE, and a new
-medium becomes another exemplar rather than a correction to the old one.
+circumstance becomes another exemplar rather than a correction to the old one.
+
+A `condition` is whatever circumstance made someone sound different, as a free
+string: "telephone", "far-field", "2015", "headset", "the bad conference room".
+Nothing here parses it or gives any value special meaning -- it is a key, and it
+exists so a person can say "that is also her, through a potato" and have that be
+storable. Automatic values are only a default; a human naming one is the point.
 
 Scoring is a single matmul of every atom against every exemplar at once. The
 per-person maximum is a reduceat over exemplars sorted by owner. Nothing walks
@@ -89,31 +95,35 @@ class Bank:
     def __init__(self):
         self.names = []                       # person index -> name
         self._ex = []                         # person index -> [vector]
-        self._era = []                        # person index -> [era or None]
+        self._cond = []                       # person index -> [condition or None]
 
     def __len__(self):
         return len(self.names)
 
-    def add(self, name, v, era=None, sec=1.0):
+    def add(self, name, v, condition=None, sec=1.0):
         """Enrol a person, or give an existing one another exemplar.
 
-        With `era`, a person keeps ONE exemplar per era and later speech from
-        that era pools into it rather than appending. A voice heard a hundred
-        times in one year is not a hundred facts about it; the era is the thing
-        that actually varies -- measured, a 2015 reference scores 0.56 on the
+        With `condition`, a person keeps ONE exemplar per condition and later
+        speech under it pools in rather than appending. A voice heard a hundred
+        times in one room is not a hundred facts about it; the circumstance is
+        what actually varies -- measured, a 2015 reference scores 0.56 on the
         same justice in 2019, against a 0.55 floor. Unbounded appending reaches
         the same accuracy by brute force and 1635 exemplars, which stores every
         redundancy and cannot say which one is relevant to a new recording.
+
+        The value is opaque. "telephone" and "2021" and "lapel mic" are all just
+        keys; what matters is that speech recorded under different circumstances
+        lands under different ones.
         """
         v = unit(np.asarray(v, dtype=np.float32))
         if name not in self.names:
-            self.names.append(name); self._ex.append([]); self._era.append([])
+            self.names.append(name); self._ex.append([]); self._cond.append([])
         i = self.names.index(name)
-        if era is not None and era in self._era[i]:
-            j = self._era[i].index(era)
+        if condition is not None and condition in self._cond[i]:
+            j = self._cond[i].index(condition)
             self._ex[i][j] = unit(self._ex[i][j] + v * sec)
             return
-        self._ex[i].append(v); self._era[i].append(era)
+        self._ex[i].append(v); self._cond[i].append(condition)
 
     def stacked(self):
         """-> (E, owner_offsets). E is exemplars sorted by owner."""
@@ -350,21 +360,22 @@ def load_bank(conn, embed_model, names=None):
     made about a stranger; letting those accumulate into the reference set is how
     a guess becomes a fact nobody ever asserted.
     """
-    q = ("SELECT s.name, e.era, e.emb, e.dim FROM exemplars e"
+    q = ("SELECT s.name, e.condition, e.emb, e.dim FROM exemplars e"
          " JOIN speakers s ON s.id = e.speaker_id"
          " WHERE e.embed_model = ? AND s.name IS NOT NULL")
     b = Bank()
-    for name, era, blob, dim in conn.execute(q, (embed_model,)):
+    for name, cond, blob, dim in conn.execute(q, (embed_model,)):
         if names and name not in names:
             continue
-        b.add(name, np.frombuffer(blob, dtype=np.float32, count=dim), era=era)
+        b.add(name, np.frombuffer(blob, dtype=np.float32, count=dim),
+              condition=cond)
     return b
 
 
-def save_exemplar(conn, speaker_id, era, v, embed_model, seconds):
-    """Store or pool one era's exemplar for a person.
+def save_exemplar(conn, speaker_id, condition, v, embed_model, seconds):
+    """Store or pool one circumstance's exemplar for a person.
 
-    Pooling on conflict is what keeps the store bounded by people x eras instead
+    Pooling on conflict keeps the store bounded by people x conditions instead
     of by recordings: measured over 293 arguments, 16 people needed 128 exemplars
     this way against 1635 when every confident match was appended, at a LOWER
     wrong-name rate.
@@ -373,7 +384,8 @@ def save_exemplar(conn, speaker_id, era, v, embed_model, seconds):
     v = unit(np.asarray(v, dtype=np.float32))
     row = conn.execute(
         "SELECT id, emb, dim, seconds FROM exemplars WHERE speaker_id=? AND"
-        " era IS ? AND embed_model=?", (speaker_id, era, embed_model)).fetchone()
+        " condition IS ? AND embed_model=?",
+        (speaker_id, condition, embed_model)).fetchone()
     if row:
         old = np.frombuffer(row[1], dtype=np.float32, count=row[2])
         merged = unit(old * float(row[3] or 1.0) + v * seconds)
@@ -382,8 +394,8 @@ def save_exemplar(conn, speaker_id, era, v, embed_model, seconds):
                       float(row[3] or 0.0) + seconds, row[0]))
     else:
         conn.execute(
-            "INSERT INTO exemplars(speaker_id, era, emb, dim, embed_model,"
+            "INSERT INTO exemplars(speaker_id, condition, emb, dim, embed_model,"
             " seconds, created_at) VALUES(?,?,?,?,?,?,?)",
-            (speaker_id, era, v.astype(np.float32).tobytes(), len(v),
+            (speaker_id, condition, v.astype(np.float32).tobytes(), len(v),
              embed_model, seconds, time.time()))
     conn.commit()
