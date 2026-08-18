@@ -257,6 +257,10 @@ pull_profiles() {
 # they stay with the thing they describe. --out puts them somewhere else.
 # The library: one directory per meeting, here, whatever machine did the work.
 LIBRARY="${OUTDIR:-${MS_LIBRARY:-$HERE/library}}"
+# Hand the resolved path to everything downstream. Without this the wrapper knows
+# where the run went and library.py does not, which is how --out produced
+# meetings that `./speakers link` could never find.
+export MS_LIBRARY="$LIBRARY"
 # --out is a path on the machine you typed the command on, and the meetings end
 # up there either way. With --host the box works in its own library and rsyncs
 # home; without one there is no trip, so the job writes there directly. Same

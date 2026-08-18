@@ -151,7 +151,28 @@ def glob_escape(s):
 
 
 def library_dir(work=None):
-    return Path(work or os.environ.get("MS_WORK") or
+    """Where meetings live. -> Path
+
+    Precedence, matching what ./transcribe already computes at its :259 --
+    `--out` if the run was sent somewhere, else MS_LIBRARY, else the working
+    directory's library/:
+
+        --out <dir>   this run goes there instead
+        MS_LIBRARY    a library that is not under MS_WORK
+        MS_WORK       the usual case
+
+    This used to read MS_WORK/library and nothing else, so a run sent elsewhere
+    with --out was WRITTEN correctly and then invisible to everything that reads:
+    `link --apply` indexed nothing, `review` and `meetings` showed an empty
+    library, and the meeting existed on disk the whole time. The wrapper knew the
+    rule and the library did not.
+    """
+    if work:
+        return Path(work) / "library"
+    lib = os.environ.get("MS_LIBRARY")
+    if lib:
+        return Path(lib)
+    return Path(os.environ.get("MS_WORK") or
                 Path(__file__).resolve().parent.parent) / "library"
 
 
