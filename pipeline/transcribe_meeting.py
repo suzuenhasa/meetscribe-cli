@@ -2,7 +2,7 @@
 
   python3 transcribe_meeting.py meeting.mp3 --out out.json
 """
-import argparse, bisect, json, sys, time
+import argparse, bisect, json, re, sys, time
 from collections import namedtuple
 
 import numpy as np
@@ -406,12 +406,134 @@ def build_engine(gpu_frac=0.90, max_len=None, eager=None, window=30.0,
     return llm
 
 
-def plan_windows(wav, ptxt, window, overlap):
+_TOK_RE = re.compile(r"\[([^\]]*)\]")
+_TS_RE = re.compile(r"\d+(?:\.\d+)?")
+_SPK_RE = re.compile(r"S\d+")
+
+
+def repair_speaker_tags(text):
+    """Give a segment whose speaker tag the model omitted the previous speaker.
+
+    MOSS emits `[start][S01] words[end]`, but it sometimes drops the `[S01]` on a
+    continuation of the same speaker. The vendored parser treats a segment with
+    no speaker as unparseable, and _emit_segment then calls reset() -- so the
+    untagged segment is discarded AND the parser's state goes with it, taking
+    every following segment in that window.
+
+    Measured on one SCOTUS window: the model emitted six segments covering
+    0.72-29.98s and the parser returned two, stopping at 12.34s exactly where
+    the tag was missing. 17.7 seconds of speech present in the model's own
+    output never reached the transcript, and no amount of re-decoding recovers
+    it because the loss is deterministic and downstream of generation.
+
+    A dropped tag means the speaker did not change -- that is why the model
+    omitted it -- so the previous one is the right answer, not a guess.
+    """
+    out, last, i, n = [], None, 0, 0
+    for m in _TOK_RE.finditer(text):
+        tok = m.group(1)
+        out.append(text[i:m.start()])
+        out.append(m.group(0))
+        i = m.end()
+        if _SPK_RE.fullmatch(tok):
+            last = tok
+        elif _TS_RE.fullmatch(tok) and last:
+            # a timestamp followed by TEXT rather than by a tag is a segment
+            # start; followed by "[" it is a segment end and correct as is
+            rest = text[m.end():].lstrip()
+            if rest and not rest.startswith("["):
+                out.append("[%s]" % last)
+                n += 1
+    out.append(text[i:])
+    return "".join(out), n
+
+
+def plan_windows(wav, ptxt, window, overlap, slide=0.0, snap=0.0):
     """-> reqs, offsets, cores. Each window is decoded with `overlap` seconds of
     context on both sides but only owns the segments whose midpoint lands in its
-    own core, so nothing is duplicated."""
+    own core, so nothing is duplicated.
+
+    `slide` is a different way to get the same shared audio, and a cheaper one.
+    Instead of growing each window to window+2*overlap, it keeps every window
+    exactly `window` long -- the encoder's native chunk -- and advances by
+    `window - slide`, so each boundary is decoded twice: once near the tail of
+    one window, once near the head of the next. Growing the window costs more
+    than the extra audio implies, because the encoder splits anything over its
+    chunk size and long sequences batch worse: measured +61% decode for 33% more
+    audio at overlap 5, against 1.2x the audio for slide 5.
+    """
     w = int(window * SR)
     ctx = int(overlap * SR)
+    if snap > 0:
+        # OVER-DECODE, UNDER-OWN. Every window is a full `window` seconds of REAL
+        # audio, but it only owns up to a cut point chosen in the last `snap`
+        # seconds where nobody is speaking. The remainder is decoded and thrown
+        # away; the next window starts at the cut and decodes it again with a
+        # whole window of context behind it.
+        #
+        # Two measured facts drive this. The decoder ends on a COMPLETE SENTENCE
+        # and declines the fragment it can only half-hear -- a mean 0.23s short
+        # at each tail, 0.18s late at each head, which over 3,521 seams is 24 of
+        # the 50 minutes lost. Under-owning puts that early stop INSIDE the
+        # discarded region, where it costs nothing, and puts every window's start
+        # in silence, where there is no fragment to decline.
+        #
+        # And do not zero-pad to make a short window. An earlier version cut at
+        # the silence and padded back to 30s: it measured WORSE than plain fixed
+        # windows, 59 minutes against 50. Whisper-encoder-plus-LLM models are
+        # reported to learn that the end of the sequence is always padding and to
+        # stop attending to it (arXiv 2309.13963 measured deletions 1.38% ->
+        # 0.30% purely from training on concatenated audio rather than
+        # speech-then-zeros). Taking real audio forward instead costs nothing --
+        # the window was going to be `window` seconds either way.
+        hop = int(0.02 * SR)
+        nf = max(1, len(wav) // hop)
+        rms = np.sqrt((wav[: nf * hop].reshape(nf, hop) ** 2).mean(1) + 1e-12)
+        back = int(snap * SR)
+        reqs, offsets, cores = [], [], []
+        i = 0
+        while i < len(wav):
+            end = min(len(wav), i + w)
+            c = wav[i:end]                     # always a FULL window of real audio
+            if len(c) < SR:
+                break
+            nxt = end
+            if end < len(wav):
+                f0 = max(i // hop + 1, (end - back) // hop)
+                f1 = end // hop
+                if f1 > f0:
+                    j = int(np.argmin(rms[f0:f1])) + f0
+                    cut = j * hop + hop // 2
+                    if cut > i:
+                        nxt = cut          # own to here; the rest is re-decoded
+            offsets.append(i / SR)
+            cores.append((0.0, (nxt - i) / SR))
+            if len(c) < w:                     # only ever the final window
+                c = np.pad(c, (0, w - len(c)))
+            reqs.append({"prompt": ptxt, "multi_modal_data": {"audio": (c, SR)}})
+            i = nxt
+        return reqs, offsets, cores
+    if slide > 0:
+        step = max(1, int((window - slide) * SR))
+        reqs, offsets, cores = [], [], []
+        for i in range(0, len(wav), step):
+            c = wav[i:i + w]
+            if len(c) < SR:
+                break
+            offsets.append(i / SR)
+            # The shared seconds belong to the EARLIER window. Both windows
+            # decode them, but the earlier one sees them at its tail with the
+            # whole window as left context, while the later one sees them at its
+            # head with nothing in front. Giving them to the later window
+            # measured WORSE than no sliding at all -- 73 min of missing speech
+            # against 50 -- because every boundary was then transcribed cold.
+            # So window 0 owns its full span and each later window owns
+            # everything after the part its predecessor already covered.
+            cores.append((0.0 if i == 0 else slide, len(c) / SR))
+            if len(c) < w:
+                c = np.pad(c, (0, w - len(c)))
+            reqs.append({"prompt": ptxt, "multi_modal_data": {"audio": (c, SR)}})
+        return reqs, offsets, cores
     reqs, offsets, cores = [], [], []
     for i in range(0, len(wav), w):
         if len(wav[i:i + w]) < SR:
@@ -447,11 +569,14 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
         print(f"WARNING: {len(capped)} windows hit the token cap: {capped}", flush=True)
 
     segments = []
+    retagged = 0          # segments whose omitted speaker tag we restored
     orphans = []          # decoded in padding, dropped as a neighbour's job
     dropped_ctx = 0
     for wi, (o, off, core) in enumerate(zip(outs, offsets, cores)):
         lo, hi = core
-        for s in parse_transcript(o.outputs[0].text):
+        _fixed, _added = repair_speaker_tags(o.outputs[0].text)
+        retagged += _added
+        for s in parse_transcript(_fixed):
             # A segment decoded inside the context padding belongs to the neighbouring
             # window, which owns it as core. Keeping both would duplicate the speech.
             rec = {
@@ -468,6 +593,10 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
                 orphans.append(rec)
                 continue
             segments.append(rec)
+    if retagged:
+        print(f"restored {retagged} omitted speaker tag(s); without them the "
+              f"parser discards that segment and everything after it in its "
+              f"window", flush=True)
     if dropped_ctx:
         print(f"dropped {dropped_ctx} segments decoded in context padding "
               f"(owned by a neighbouring window)", flush=True)
@@ -484,15 +613,43 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
     # of a window boundary, the largest 8.7s, and one of them was the guest
     # saying who he was. --overlap 0 has no padding and so lost none of it.
     #
-    # Reinstate an orphan only where nothing else covers its span, so a segment
-    # the neighbour DID emit still wins and nothing is duplicated.
-    recovered = []
+    # Reinstate an orphan where the neighbour did not actually emit its speech,
+    # so a segment the neighbour DID emit still wins and nothing is duplicated.
+    #
+    # This used to be all-or-nothing: any overlap at all and the orphan was
+    # dropped whole. That loses the remainder whenever the neighbour's version is
+    # SHORTER than the orphan, which is the common case -- the neighbour saw the
+    # phrase clipped by its own boundary and emitted a fragment. Measured on 13
+    # SCOTUS oral arguments at 5s context: 117 orphans were reinstated and 309.7s
+    # recovered, yet total missing speech still rose against --overlap 0, and
+    # holes of 2s or more went from 184 to 489. Fewer, bigger holes is the
+    # signature of discarding a long orphan because a short fragment touched it.
+    #
+    # So compare how much of the orphan is actually covered. Below the threshold
+    # the neighbour did not really say it and the orphan is reinstated whole;
+    # the seam trim below then removes any opening words the two genuinely
+    # share, which is what it already exists to do.
+    #
+    # But COVERAGE IN SECONDS IS NOT COVERAGE IN WORDS, and only the second one
+    # matters. A neighbour that saw the phrase clipped emits a short fragment
+    # over the same span: the seconds are covered, the words are not, and the
+    # orphan carrying the rest is discarded as redundant. Measured on 13 SCOTUS
+    # arguments, --overlap 5 against --overlap 0: total missing TIME fell 50 ->
+    # 37 min while missing WORDS rose 9,683 -> 11,111. The time metric cannot
+    # see this failure at all, because a two-word fragment covers exactly the
+    # same seconds as the ten-word segment it replaced.
+    #
+    # So when the span is covered, ask whether the CONTENT is. If what covers an
+    # orphan carries materially fewer words than the orphan does, it is a
+    # truncation rather than the same speech, and the fuller version replaces it.
+    # Exactly one survives either way, so nothing is duplicated.
+    COVERED_ENOUGH = 0.5      # of the orphan's SECONDS
+    WORDS_ENOUGH = 0.8        # of the orphan's WORDS, once the seconds are covered
+    recovered, superseded = [], set()
     if orphans:
         starts = [s["start"] for s in segments]
-        reach, m = [], float("-inf")
-        for s in segments:
-            m = max(m, s["end"])
-            reach.append(m)                  # furthest end among segments[:i+1]
+        # how far back a segment can start and still reach an orphan
+        maxdur = max((s["end"] - s["start"] for s in segments), default=0.0)
         for o in sorted(orphans, key=lambda x: x["start"]):
             # Reinstate only WELL-FORMED spans. The midpoint rule these were
             # dropped by had a side effect worth keeping: a segment whose
@@ -503,17 +660,39 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
             # and into clip extraction.
             if not (0.0 <= o["start"] < o["end"] <= dur + 0.5):
                 continue
-            k = bisect.bisect_left(starts, o["end"])
-            if k and reach[k - 1] > o["start"]:
-                continue                     # a kept segment already covers it
+            span = o["end"] - o["start"]
+            hi = bisect.bisect_left(starts, o["end"])
+            lo = bisect.bisect_left(starts, o["start"] - maxdur)
+            cov, touch = 0.0, []
+            for k in range(lo, hi):
+                s = segments[k]
+                if s["end"] > o["start"] and k not in superseded:
+                    cov += min(s["end"], o["end"]) - max(s["start"], o["start"])
+                    touch.append(k)
+            if cov >= COVERED_ENOUGH * span:
+                # The seconds are covered. Are the WORDS? A neighbour that saw
+                # the phrase clipped emits a fragment over the same span.
+                have = sum(len(segments[k]["text"].split()) for k in touch)
+                want = len(o["text"].split())
+                if not want or have >= WORDS_ENOUGH * want:
+                    continue                 # the neighbour really did emit it
+                superseded.update(touch)     # a truncation; the fuller one wins
+            # Against another ORPHAN the test stays all-or-nothing. Two orphans
+            # over the same span are two windows' cuts of the SAME speech, one
+            # disowned to the right and one to the left, so any overlap at all
+            # means duplication and the earlier one wins alone. That is not true
+            # of a kept segment, which may be a genuine short fragment.
             if any(r["end"] > o["start"] and r["start"] < o["end"] for r in recovered):
-                continue                     # an earlier orphan already filled it
+                continue
             recovered.append(o)
     if recovered:
+        kept = [s for i, s in enumerate(segments) if i not in superseded]
+        note = (f", replacing {len(superseded)} truncated"
+                if superseded else "")
         print(f"recovered {len(recovered)} segment(s) "
               f"({sum(r['end'] - r['start'] for r in recovered):.1f}s) that fell "
-              f"through a window seam", flush=True)
-        segments = sorted(segments + recovered, key=lambda x: x["start"])
+              f"through a window seam{note}", flush=True)
+        segments = sorted(kept + recovered, key=lambda x: x["start"])
 
     # --overlap gives neighbouring windows shared audio, and a segment straddling the
     # seam can restate words the previous window already emitted. Measured 0.69% of
@@ -613,6 +792,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("audio")
     ap.add_argument("--window", type=float, default=30.0)
+    ap.add_argument("--snap", type=float, default=0.0,
+                    help="search back up to this many seconds from each window "
+                         "edge for a quiet point and cut there, padding the "
+                         "window back to full length. The encoder pads anyway, "
+                         "so a short window costs nothing, and cutting in "
+                         "silence means no word is split.")
+    ap.add_argument("--slide", type=float, default=0.0,
+                    help="advance each window by --window minus this, instead of "
+                         "by a full window. Gets the same shared audio at a seam "
+                         "as --overlap without growing the window past the "
+                         "encoder's chunk size, so it decodes 1.2x the audio at "
+                         "5s rather than 1.33x, in native-sized requests. "
+                         "Mutually exclusive with --overlap.")
     ap.add_argument("--overlap", type=float, default=0.0,
                     help="seconds of extra audio given to each window on BOTH sides as "
                          "context. OFF by default: measured across 7 recordings (7.94h) "
@@ -639,9 +831,12 @@ def main():
     print(f"{args.audio}: {dur/60:.2f} min", flush=True)
 
     ctx = int(args.overlap * SR)
-    reqs, offsets, cores = plan_windows(wav, ptxt, args.window, args.overlap)
+    reqs, offsets, cores = plan_windows(wav, ptxt, args.window, args.overlap,
+                                        args.slide, args.snap)
     print(f"{len(reqs)} windows of {args.window:.0f}s"
-          + (f" (+{args.overlap:.0f}s context each side)" if ctx else ""), flush=True)
+          + (f" (+{args.overlap:.0f}s context each side)" if ctx else "")
+          + (f" (advancing {args.window - args.slide:.0f}s, {args.slide:.0f}s shared"
+             f" at each seam)" if args.slide > 0 else ""), flush=True)
 
     llm = build_engine(args.gpu_frac, window=args.window, overlap=args.overlap)
 

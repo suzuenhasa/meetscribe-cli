@@ -424,6 +424,17 @@ def build_parser():
                          "a new one, so everything decided about it survives")
     ap.add_argument("--window", type=float, default=30.0)
     ap.add_argument("--overlap", type=float, default=0.0)
+    ap.add_argument("--snap", type=float, default=0.0,
+                    help="cut each window at a quiet point up to this many "
+                         "seconds early, padding back to full length, so a "
+                         "window edge never lands mid-word")
+    ap.add_argument("--slide", type=float, default=0.0,
+                    help="advance each window by --window minus this instead of "
+                         "by a whole window, so each seam is decoded twice "
+                         "without the window growing past the encoder's chunk "
+                         "size. Cheaper than the same --overlap: 1.2x the audio "
+                         "in native-sized requests rather than 1.33x in oversized "
+                         "ones, which batch worse")
     ap.add_argument("--glossary", default="")
     ap.add_argument("--roster", default="")
     ap.add_argument("--titles", default="",
@@ -791,7 +802,8 @@ def run_job(a, resident=None):
         meetings[name] = m
         try:
             wav = load_audio_item(str(f), sampling_rate=TM.SR)
-            reqs, offsets, cores = TM.plan_windows(wav, ptxt, a.window, a.overlap)
+            reqs, offsets, cores = TM.plan_windows(wav, ptxt, a.window, a.overlap,
+                                                   a.slide, a.snap)
         except Exception as e:
             # One unreadable recording must not cost the whole queue. A truncated
             # mp3 used to raise straight out of the loop, taking the engine with
