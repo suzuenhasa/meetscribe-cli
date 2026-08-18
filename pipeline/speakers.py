@@ -81,6 +81,10 @@ LINK_ACCEPT = 0.75
 # How well a recording must match what we already store before it may become a
 # sub-profile itself. Above ACCEPT, because this feeds back: see refresh_exemplars.
 KEEP_EXEMPLAR = float(os.environ.get("MS_KEEP_EXEMPLAR", "0.72"))
+
+# How many recordings must agree with each other before they are treated as a
+# circumstance rather than as noise. One outlier never becomes a sub-profile.
+MIN_CORROBORATION = int(os.environ.get("MS_MIN_CORROBORATION", "4"))
 MIN_LINK_SEC = 60.0    # too short to enrol is too short to match
 
 
@@ -403,9 +407,27 @@ def refresh_exemplars(conn, speaker_id, keep_named=True):
     if have:
         H = np.stack([MS.unit(np.frombuffer(h[0], dtype=np.float32, count=h[1]))
                       for h in have])
-        ok = np.where((E @ H.T).max(axis=1) >= KEEP_EXEMPLAR)[0]
-        if len(ok):
-            E, w = E[ok], w[ok]
+        near = (E @ H.T).max(axis=1) >= KEEP_EXEMPLAR
+        # Recordings far from every stored profile are the interesting ones and
+        # also the dangerous ones: either this person in a circumstance we have
+        # never heard, or not this person at all. Similarity cannot tell those
+        # apart, but AGREEMENT can. One odd recording is noise and gets no vote;
+        # a dozen odd recordings that all sound like EACH OTHER are a
+        # circumstance -- a microphone, a room, a decade of ageing.
+        #
+        # Dropping them outright is what made this inert: every named voice came
+        # out with exactly one sub-profile, because the only members left were
+        # the ones already alike. Requiring corroboration keeps the drift out
+        # without throwing the feature away with it.
+        far = np.where(~near)[0]
+        keep = list(np.where(near)[0])
+        if len(far) >= MIN_CORROBORATION:
+            F = E[far]
+            agree = ((F @ F.T) >= KEEP_EXEMPLAR).sum(axis=1) - 1
+            keep += [int(far[i]) for i in np.where(agree >= MIN_CORROBORATION - 1)[0]]
+        if keep:
+            keep = sorted(set(keep))
+            E, w = E[keep], w[keep]
     picked = [int(np.argmax(w))]
     while len(picked) < 24:
         cov = (E @ E[picked].T).max(axis=1)
