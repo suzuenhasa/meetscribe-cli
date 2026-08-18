@@ -765,7 +765,7 @@ def cmd_name(a):
         raise SystemExit(
             "\nNaming creates a SECOND person and splits their voice between the\n"
             "two spellings, which nothing downstream can detect. Attach to the\n"
-            f"existing one by id:   speakers.py name {a.group_id} --speaker "
+            f"existing one by id:   ./speakers name {a.group_id} --speaker "
             f"{conn.execute('SELECT id FROM speakers WHERE name=?', (close[0][0],)).fetchone()[0]}\n"
             "or pass --new if they really are someone else.")
     if sid is None:
@@ -895,8 +895,8 @@ def cmd_review(a):
             clip = hit[0] if hit else None
         if clip:
             print(f"      listen: {clip}")
-        print(f"      name it:  speakers.py name {gid} \"Their Name\"")
-        print(f"      or attach: speakers.py name {gid} --speaker <id>   "
+        print(f"      name it:  ./speakers name {gid} \"Their Name\"")
+        print(f"      or attach: ./speakers name {gid} --speaker <id>   "
               f"(see `list`)")
         print()
 
@@ -1045,8 +1045,8 @@ def cmd_profiles(a):
         if str(cond).startswith("auto-") and share >= 0.8 and lab == "narrowband":
             print(f"  {cond} is {share:.0%} narrowband at {edge:.0f} Hz -- a "
                   f"phone or a headset.\n"
-                  f"      speakers.py profile-rename {sid} {cond} narrowband\n")
-    print("  rename one:  speakers.py profile-rename %s <condition> <new name>"
+                  f"      ./speakers profile-rename {sid} {cond} narrowband\n")
+    print("  rename one:  ./speakers profile-rename %s <condition> <new name>"
           % sid)
 
 
@@ -1235,7 +1235,7 @@ def cmd_profile_split(a):
     print(f"{name}: {a.cond} -> {len(made)} sub-profiles")
     for cond, n, secs in made:
         print(f"   {cond:<12} {secs/60:5.0f} min  {n:>3} recordings")
-    print(f"\n  look at them:  speakers.py profiles {sid} --measure")
+    print(f"\n  look at them:  ./speakers profiles {sid} --measure")
 
 
 def cmd_groups(a):
@@ -1248,7 +1248,7 @@ def cmd_groups(a):
         " WHERE g.embed_model=? GROUP BY g.id ORDER BY 4 DESC, 3 DESC",
         (EMBED_MODEL,)).fetchall()
     if not rows:
-        print("no groups yet -- run: speakers.py link --apply")
+        print("no groups yet -- run: ./speakers link --apply")
         return
     print(f"{'group':>6}  {'name':24}{'clusters':>9}{'meetings':>9}{'speech':>9}")
     for gid, name, nc, nm, secs in rows:
