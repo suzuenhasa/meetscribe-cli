@@ -261,7 +261,13 @@ def main():
             if names:
                 print(f"ROSTER meeting={name} candidates={len(bank)} "
                       f"of {len(names)} named")
-        lab, name_of, info = match_speakers.label_meeting(keys, A, secs, bank)
+        # --thr reached the legacy clustering and nothing else: the accept bar
+        # was left at match_speakers' default however the flag was set, so `--thr
+        # 0.8` ran at 0.62 and said so in the CLUSTER line. label_meeting has
+        # taken the parameter since it was written.
+        lab, name_of, info = match_speakers.label_meeting(
+            keys, A, secs, bank,
+            accept=match_speakers.ACCEPT if fixed_thr is None else fixed_thr)
         k = info["k"]
         # centroids for the sidecar, weighted by speech so a long turn counts
         # for more than a short one
