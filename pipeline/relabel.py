@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import library as LIB
+import match_speakers as MS
 import postproc
 import speakers as SPK
 
@@ -39,6 +40,49 @@ def names_in(m):
         return json.loads(m.file("names", "json").read_text())
     except (OSError, ValueError):
         return {}
+
+
+def relabel_by_matching(m, bank, condition=None):
+    """Re-label one meeting against the store, from MOSS's own labels. -> dict
+
+    The group path below can only rename CLUSTERS -- whatever the clustering
+    already decided, right or wrong -- and it compares averaged cluster
+    centroids. This goes back to the atoms: one vector per (window, local
+    label), which is the purest unit available, 93% of them >=90% one speaker.
+    Measured, that is the difference between 2.63% wrong names and 0.18%.
+
+    Rewrites the linked transcript as well as the name map, because matching can
+    conclude that two things the clustering separated are one person, and that
+    has to reach the file a reader opens.
+    """
+    import numpy as np
+
+    raw = json.loads(m.file("raw", "json").read_text())
+    z = np.load(str(m.file("embeddings", "npz")), allow_pickle=True)
+    atoms = MS.atoms_from(raw["segments"], z["emb"], z["seg_idx"])
+    if not atoms:
+        return {}
+    names, prov, sim = MS.assign(atoms, bank)
+
+    order, out, tag_of = {}, {}, {}
+    for i, a in enumerate(atoms):
+        tag = names[i] or prov[i]
+        if tag is None:
+            continue
+        if tag not in order:
+            order[tag] = "G%02d" % len(order)
+            if names[i]:
+                out[order[tag]] = names[i]
+        tag_of[a["key"]] = order[tag]
+    for seg in raw["segments"]:
+        g = tag_of.get((int(seg["window"]), seg["local_speaker"]))
+        seg["global"] = g
+        if g and g in out:
+            seg["speaker_name"] = out[g]
+        else:
+            seg.pop("speaker_name", None)
+    m.file("transcript", "json").write_text(json.dumps(raw))
+    return out
 
 
 def names_from_groups(conn, m):
@@ -62,6 +106,12 @@ def main():
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--library", default=None)
     ap.add_argument("--roster", default="")
+    ap.add_argument("--condition", default=None,
+                    help="circumstance to record for anyone recognised here")
+    ap.add_argument("--from-groups", action="store_true",
+                    help="rename clusters from the linked groups instead of "
+                         "re-matching MOSS's labels against the store. What this "
+                         "did before there was anything to match against.")
     ap.add_argument("meetings", nargs="*",
                     help="only these; default is every meeting in the library")
     a = ap.parse_args()
@@ -76,6 +126,9 @@ def main():
         return 0
 
     conn = SPK.db()
+    # The store's named voices, as sub-profiles. Empty, or --from-groups, and
+    # this falls back to renaming clusters from the linked groups.
+    bank = None if a.from_groups else MS.load_bank(conn, SPK.EMBED_MODEL)
     n_groups = conn.execute(
         "SELECT COUNT(*) FROM groups WHERE speaker_id IS NOT NULL").fetchone()[0]
     if not n_groups:
@@ -104,7 +157,10 @@ def main():
         #
         # Naming is a decision made once, in one place. Here we only write it out.
         scratch = Path(tmpdir) / f"{m.id}.json"
-        after = names_from_groups(conn, m)
+        if bank is not None and len(bank) and m.file("embeddings", "npz").exists():
+            after = relabel_by_matching(m, bank, a.condition)
+        else:
+            after = names_from_groups(conn, m)
         scratch.write_text(json.dumps(after, indent=1))
         if after != before:
             changed.append((m, before, after, scratch))

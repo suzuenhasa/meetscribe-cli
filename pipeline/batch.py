@@ -442,6 +442,11 @@ def build_parser():
                          "sanitised for the trip over ssh; this restores what "
                          "the human actually called the meeting.")
     ap.add_argument("--thr", default="auto")
+    ap.add_argument("--condition", default=None,
+                    help="what makes this batch sound the way it does -- "
+                         "'telephone', 'far-field', 'the bad conference room'. "
+                         "Anyone recognised in it is stored under that, so one "
+                         "person can be known in several circumstances.")
     # Speaker-identity knobs. These existed on link.py and embed_batched.py but
     # were never forwarded from here, so the command people actually run had one
     # reachable tunable (--thr) and the rest were frozen at whatever suited the
@@ -950,6 +955,15 @@ def run_job(a, resident=None):
                           ("--min-cluster-sec", a.min_cluster_sec)):
             if val is not None:
                 argv += [flag, str(val)]
+        # Hand link.py the store. Without it every recording is a cold start and
+        # nobody is ever recognised on the way in -- the flag existed and was
+        # never passed, so the matching happened downstream on cluster centroids
+        # instead of on MOSS's own labels, at 2.63% wrong against 0.18%.
+        db = os.environ.get("MS_SPEAKER_DB", os.path.join(WORK, "speakers.db"))
+        if os.path.exists(db):
+            argv += ["--speaker-db", db]
+        if a.condition:
+            argv += ["--condition", a.condition]
         return argv
 
     def argv_identify(name):

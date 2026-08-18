@@ -190,11 +190,12 @@ def main():
                          "is a reference, so identity carries across recordings "
                          "without a separate linking pass. Absent, this meeting "
                          "is a cold start and its identities are provisional.")
-    ap.add_argument("--era", default=None,
-                    help="which era this recording belongs to, e.g. a year. A "
-                         "person is stored once per era: one averaged vector "
-                         "cannot span a change of microphone or a decade of "
-                         "voice, and pretending otherwise names the wrong human.")
+    ap.add_argument("--condition", default=None,
+                    help="what makes this recording sound the way it does -- "
+                         "'telephone', 'far-field', a year, anything. A person "
+                         "is stored once per circumstance: one averaged vector "
+                         "cannot span a change of microphone, and pretending "
+                         "otherwise names the wrong human.")
     ap.add_argument("--legacy-cluster", action="store_true",
                     help="use the agglomerative path instead of matching. Kept "
                          "for comparison: measured over 238 arguments it put "

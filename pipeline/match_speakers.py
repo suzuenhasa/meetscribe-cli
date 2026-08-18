@@ -41,12 +41,27 @@ from collections import defaultdict
 
 import numpy as np
 
-# Least similarity at which an atom joins an existing person. Measured on this
-# corpus atoms of one speaker run a median of 0.82 and a p10 of 0.47, different
+# Least similarity at which an atom joins an existing person. Atoms of one
+# speaker run a median of 0.82 and a p10 of 0.47 on this corpus, different
 # speakers a median of 0.11 and a p90 of 0.31 -- far apart, so this sits between
 # them and nearer the impostor side: an unnamed voice costs a click, a wrong name
 # is asserted and propagates to every meeting that person appears in.
-ACCEPT = float(os.environ.get("MS_MATCH_ACCEPT", "0.55"))
+#
+# The right value depends on how COMPLETE the gallery is, which is the one thing
+# an evaluation quietly gets wrong. Named against a full gallery -- every speaker
+# enrolled -- 0.55 runs at 0.18% wrong, because the true person is present and
+# wins the comparison outright. Name four people out of thirteen and the same
+# 0.55 runs at 3.59%: an advocate who is nobody in the store lands 0.57 from a
+# justice and there is no correct answer available to beat it. Swept against the
+# reference with four of thirteen named:
+#
+#     0.55  3.59% wrong     0.68  2.05%
+#     0.62  2.19% wrong     0.74  1.91%
+#
+# 0.62 is the knee -- it cuts wrong names by 39% for almost no coverage, where
+# every step above it buys a tenth of a point and costs a dozen meetings. A
+# deployment that has enrolled everyone can lower it.
+ACCEPT = float(os.environ.get("MS_MATCH_ACCEPT", "0.62"))
 
 # Second exemplar territory. An atom this close is the person; an atom between
 # SUBPROFILE and ACCEPT is probably them in a medium we have not stored yet, and
