@@ -137,6 +137,16 @@ def db(path=None):
     # them, and the next name minted id 1 again and inherited both voiceprints.
     # With this on, a delete that misses a referencing row fails loudly instead.
     c.execute("PRAGMA foreign_keys=ON")
+    # prototypes and decisions were the legacy naming path's storage. Removing
+    # them from the schema stopped NEW stores having them and left every
+    # existing store carrying the tables, their rows, and -- the part that bites
+    # -- their FOREIGN KEY onto speakers(id). With the pragma now on, that made
+    # `forget` fail with "FOREIGN KEY constraint failed" on any store older than
+    # the change, which is every store that has ever been used. Nothing reads
+    # either table.
+    for dead in ("prototypes", "decisions"):
+        c.execute("DROP TABLE IF EXISTS %s" % dead)
+    c.commit()
     c.executescript("""
     CREATE TABLE IF NOT EXISTS speakers(
       id INTEGER PRIMARY KEY, name TEXT UNIQUE, created_at REAL);
@@ -1268,10 +1278,24 @@ def cmd_forget(a):
         raise SystemExit(f"no speaker with id {a.speaker_id} -- see `list`")
     # Order is load-bearing now that PRAGMA foreign_keys is on: speakers last,
     # or the DELETE fails on whichever row still references it.
+    #
+    # And the list of referencing tables is ASKED FOR rather than written down.
+    # Written down, it went stale the moment a table was added to the schema and
+    # forget started failing on every store older than that change -- the same
+    # shape as every other bug in this project, code holding a copy of a fact
+    # that lives somewhere else.
     n_ex = conn.execute("DELETE FROM exemplars WHERE speaker_id=?",
                         (a.speaker_id,)).rowcount
     n_gr = conn.execute("UPDATE groups SET speaker_id=NULL WHERE speaker_id=?",
                         (a.speaker_id,)).rowcount
+    for (tbl,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+        if tbl in ("speakers", "exemplars", "groups"):
+            continue
+        for fk in conn.execute("PRAGMA foreign_key_list(%s)" % tbl).fetchall():
+            if fk[2] == "speakers":
+                conn.execute("DELETE FROM %s WHERE %s=?" % (tbl, fk[3]),
+                             (a.speaker_id,))
     conn.execute("DELETE FROM speakers WHERE id=?", (a.speaker_id,))
     conn.commit()
     print(f"deleted {row[0]} (speaker {a.speaker_id}) and {n_ex} voiceprint"
