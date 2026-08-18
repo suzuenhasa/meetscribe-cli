@@ -24,3 +24,6 @@ _meetscribe_src/
 # under _inbox/ and the transcripts beside them are exactly the private data
 # this tool exists to keep on your own machine.
 library/
+
+# Working notes and architecture maps -- not part of the tool.
+plans/

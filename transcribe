@@ -276,11 +276,6 @@ if [ "$LOCAL" -eq 1 ]; then JOBLIB="$LIBRARY"; else JOBLIB="$REMOTE/library"; fi
 # Audio MOVES out of the inbox, because a worklist should empty as work
 # completes. Anywhere else it is copied: emptying a directory the caller merely
 # pointed at is not ours to do.
-MOVEAUDIO=""
-case "$(cd "$(dirname "${SRC%/}")" 2>/dev/null && pwd)/$(basename "${SRC%/}")" in
-  "$HERE/inbox") MOVEAUDIO="--move-audio" ;;
-esac
-
 # A directory means batch: the engine loads once instead of per file (~66s each),
 # and embedding overlaps the next file's transcription.
 # One argument is a file or a directory; several are a batch. The directory
@@ -296,6 +291,15 @@ if [ ${#SRCS[@]} -gt 1 ]; then
 elif [ ${#SRCS[@]} -eq 1 ]; then
   SRC="${SRCS[0]}"
 fi
+
+# Computed HERE, after SRC is resolved. It used to sit above, which was correct
+# while the argument loop assigned SRC directly; once positionals started
+# accumulating into SRCS the case ran against an unset SRC and never matched, so
+# recordings in inbox/ were copied and the inbox never drained.
+MOVEAUDIO=""
+case "$(cd "$(dirname "${SRC%/}")" 2>/dev/null && pwd)/$(basename "${SRC%/}")" in
+  "$HERE/inbox") MOVEAUDIO="--move-audio" ;;
+esac
 
 if [ -d "$SRC" ] || [ "$MULTI" -eq 1 ]; then
   # -L so a directory of SYMLINKS works: the UI stages a batch by linking rather
