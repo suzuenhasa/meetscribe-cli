@@ -272,14 +272,23 @@ def index_clusters(conn, run_dir=None):
 
     A cluster that no longer exists after a re-decode is dropped, since its id
     may now mean a different voice.
+
+    Reads the LIBRARY, not the run directory. `out/` is scratch that a run
+    empties; the library is what survives, what `./speakers meetings` lists, and
+    where --move-audio puts the audio. Centroids come from each meeting's
+    -clusters.npz via centroids_from_npz, which is the vector link.py already
+    computed for exactly this purpose rather than one rebuilt from segments.
     """
-    import glob
-    run_dir = run_dir or os.path.join(WORK, "out")
+    import library as LIB
+    try:
+        meetings = LIB.all_meetings()
+    except Exception:
+        meetings = []
     n = 0
-    for p in sorted(glob.glob(os.path.join(run_dir, "*_linked.json"))):
-        meeting = os.path.basename(p)[:-len("_linked.json")]
+    for m in meetings:
+        meeting = m.id
         try:
-            cents = cluster_centroids(meeting, run_dir)
+            cents = centroids_from_npz(str(m.file("clusters", "npz")))
         except (OSError, KeyError, ValueError):
             continue
         if cents:

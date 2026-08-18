@@ -61,6 +61,24 @@ def alice(conn):
     """
     S.enroll_centroid(conn, "Alice Anderson", at_cosine(0.98, 1), 90.0,
                       "aaa11111", "G00")
+    # A prototype is what the store knows; relabel renders what LINKING decided.
+    # Those are deliberately different since relabel stopped re-identifying at
+    # ACCEPT and started rendering group membership -- it was overturning a
+    # correct abstention by linking with a looser threshold of its own. So the
+    # group has to exist for a name to reach a transcript.
+    sid = conn.execute("SELECT id FROM speakers WHERE name=?",
+                       ("Alice Anderson",)).fetchone()[0]
+    gid = conn.execute("INSERT INTO groups(speaker_id, embed_model, linked_at)"
+                       " VALUES(?,?,?)",
+                       (sid, S.EMBED_MODEL, time.time())).lastrowid
+    v = at_cosine(0.98, 1).astype("float32")
+    for meeting in ("aaa11111", "bbb22222"):
+        conn.execute(
+            "INSERT INTO clusters(meeting, cluster, emb, dim, embed_model,"
+            " seconds, group_id, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (meeting, "G00", v.tobytes(), len(v), S.EMBED_MODEL, 90.0, gid,
+             time.time()))
+    conn.commit()
     return "Alice Anderson"
 
 

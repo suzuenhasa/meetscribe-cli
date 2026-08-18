@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import library as LIB
 import postproc
+import speakers as SPK
 
 PIPE = os.path.dirname(os.path.abspath(__file__))
 
@@ -38,6 +39,22 @@ def names_in(m):
         return json.loads(m.file("names", "json").read_text())
     except (OSError, ValueError):
         return {}
+
+
+def names_from_groups(conn, m):
+    """{cluster: name} for one meeting, from the linked groups. -> dict
+
+    A cluster is named only if linking put it in a group and a human named that
+    group. Anything else stays unnamed, which is the honest answer: the group
+    system already refused to guess, and re-deriving here would overturn that.
+    """
+    rows = conn.execute(
+        "SELECT c.cluster, s.name FROM clusters c "
+        "JOIN groups g ON g.id = c.group_id "
+        "JOIN speakers s ON s.id = g.speaker_id "
+        "WHERE c.meeting = ? AND c.embed_model = ?",
+        (m.id, SPK.EMBED_MODEL)).fetchall()
+    return {cl: nm for cl, nm in rows if nm}
 
 
 def main():
@@ -58,6 +75,13 @@ def main():
         print("no meetings in the library")
         return 0
 
+    conn = SPK.db()
+    n_groups = conn.execute(
+        "SELECT COUNT(*) FROM groups WHERE speaker_id IS NOT NULL").fetchone()[0]
+    if not n_groups:
+        print("no named groups in the store -- run: speakers.py link --apply, "
+              "then speakers.py name <group> \"Name\"")
+        return 0
     changed, skipped = [], []
     tmpdir = tempfile.mkdtemp(prefix="ms-relabel-")
     for m in ms:
@@ -65,24 +89,23 @@ def main():
             skipped.append((m, "no clusters — transcribe it again"))
             continue
         before = names_in(m)
-        # Identify into a SCRATCH names file. A dry run that rewrote the real one
-        # would leave nothing for --apply to notice, so `apply` then `apply
-        # --apply` did nothing at all and every transcript kept its old labels
-        # while the store insisted they were fine.
+        # RENDER what linking decided; do not decide again.
+        #
+        # This used to run identify.py per meeting, re-scoring every cluster
+        # against the gallery at ACCEPT (0.55). That is a second, looser opinion
+        # competing with speakers.py link, which groups clusters from the audio
+        # and only names a group at LINK_ACCEPT (0.75). The two disagreed and
+        # this one won, because it is what writes the transcript: measured on a
+        # SCOTUS argument, linking put a cluster in its own unnamed group -- 0.911
+        # to its own members, 0.586 to the nearest named one, correctly declining
+        # -- and relabel wrote that name in anyway because 0.586 clears 0.55.
+        # A wrong name on a transcript is worse than no name, and it was being
+        # applied over a correct abstention.
+        #
+        # Naming is a decision made once, in one place. Here we only write it out.
         scratch = Path(tmpdir) / f"{m.id}.json"
-        rc, out = postproc.run_module((m.id, f"{PIPE}/identify.py", [
-            f"{PIPE}/identify.py",
-            "--clusters", str(m.file("clusters", "npz")),
-            "--meeting", m.id, "--roster", a.roster,
-            "--names", str(scratch),
-        ]))[1:]
-        if rc != 0:
-            skipped.append((m, "identify failed"))
-            continue
-        try:
-            after = json.loads(scratch.read_text())
-        except (OSError, ValueError):
-            after = {}
+        after = names_from_groups(conn, m)
+        scratch.write_text(json.dumps(after, indent=1))
         if after != before:
             changed.append((m, before, after, scratch))
 
