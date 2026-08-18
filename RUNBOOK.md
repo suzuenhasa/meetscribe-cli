@@ -293,6 +293,34 @@ pins it: the automatic pass only ever redraws `auto-*`.
 either someone else the linking put there, or a circumstance so unlike the rest
 that it wants its own profile. Both need a person to look.
 
+### What the unresolved ones might be
+
+```bash
+./speakers suggest board-sync --roster "Ada Lovelace,Bob Smith"
+```
+
+```
+  UNKNOWN      3s  [6:27]  "For future payments."
+       best is 0.16 clear of the next
+       john_g_roberts_jr           0.47  #########
+       anthony_m_kennedy           0.31  ######
+       (nobody)                          accept is 0.62
+```
+
+Declining to name something is right when the evidence is thin, but the silence
+throws away what the evidence WAS. A fragment scoring 0.59 with the next
+candidate at 0.26 is a person just under the bar; one scoring 0.47 with three
+others inside 0.06 is noise. Both come out unnamed and only one is worth your
+time.
+
+No verdict is printed, deliberately. Tried as one, "looks like X" named the
+wrong justice on the first fragment it was pointed at — 0.47 to one person, 0.31
+to the one who actually spoke. The scores are evidence for you to read; a
+headline over them is a guess wearing a number.
+
+Use `--roster` here. Against a whole library the candidate list is everyone ever
+enrolled and the scores are dominated by strangers.
+
 ### Reading the link output
 
 ```

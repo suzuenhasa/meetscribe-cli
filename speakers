@@ -22,6 +22,8 @@
 #   ./speakers play <meeting> G02 [n]                 HEAR that voice
 #   ./speakers list                                   who is on file
 #   ./speakers groups                                 every voice group, named or not
+#   ./speakers suggest <meeting>                      who the UNKNOWNs might be,
+#                                                     with the scores
 #
 # One person can sound like more than one thing -- a room, a phone, a headset --
 # and is stored once per circumstance:
@@ -228,6 +230,10 @@ case "$CMD" in
     # The naming queue, ordered by how many meetings each unnamed voice spans.
     # An unnamed voice is a person nobody has introduced yet, not an error.
     run "$PIPE/speakers.py" review "$@"
+    ;;
+  suggest)
+    [ $# -ge 1 ] || { echo 'usage: ./speakers suggest <meeting>' >&2; exit 2; }
+    run "$PIPE/speakers.py" suggest "$@"
     ;;
   profiles)
     [ $# -ge 1 ] || { echo 'usage: ./speakers profiles <id-or-name> [--measure]' >&2; exit 2; }

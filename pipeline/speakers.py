@@ -26,7 +26,7 @@ Design follows what was measured, not intuition:
 * ROSTER FIRST. Acceptance is a max over N candidates, so false-accept risk
   grows with gallery size. Scoring 3 known attendees is far safer than 500.
 """
-import argparse, json, os, re, sqlite3, time
+import argparse, collections, json, os, re, sqlite3, time
 
 import numpy as np
 
@@ -1238,6 +1238,90 @@ def cmd_profile_split(a):
     print(f"\n  look at them:  ./speakers profiles {sid} --measure")
 
 
+
+def cmd_suggest(a):
+    """For everything left unresolved in a meeting, show who it might be.
+
+    Declining to name something is the right answer when the evidence is thin,
+    but it throws away what the evidence WAS. A fragment that scored 0.58 against
+    one person and 0.19 against everyone else is a very different situation from
+    one that scored 0.31 against four people, and only the first is worth a
+    human's second. So print the scores rather than the silence.
+
+    Pooled per cluster, not per atom: the cluster is what a reader sees and what
+    gets named, and pooling its speech is a better estimate of the voice than any
+    one fragment of it was.
+    """
+    import glob
+
+    import numpy as np
+
+    import library as LIB
+    import match_speakers as MS
+
+    m = LIB.find(a.meeting, None)
+    if not m:
+        raise SystemExit(f"no meeting matching {a.meeting!r} -- see `meetings`")
+    raw_p, npz_p = m.file("raw", "json"), m.file("embeddings", "npz")
+    if not raw_p.exists() or not npz_p.exists():
+        raise SystemExit(f"{m.title}: no embeddings on file -- transcribe it again")
+    raw = json.loads(raw_p.read_text())
+    z = np.load(str(npz_p), allow_pickle=True)
+    atoms = MS.atoms_from(raw["segments"], z["emb"], z["seg_idx"])
+    if not atoms:
+        raise SystemExit("nothing embeddable in that meeting")
+
+    conn = db()
+    roster = [x.strip() for x in a.roster.split(",") if x.strip()]
+    bank = MS.load_bank(conn, EMBED_MODEL, names=roster or None)
+    if not len(bank):
+        raise SystemExit("nobody enrolled yet -- name someone first")
+    names, prov, sim = MS.assign(atoms, bank)
+
+    # group the unresolved by the label a reader would see
+    segs = raw["segments"]
+    text = collections.defaultdict(list)
+    for sgm in segs:
+        text[(int(sgm["window"]), sgm["local_speaker"])].append(sgm)
+    unres = collections.defaultdict(list)
+    for i, at in enumerate(atoms):
+        if names[i] is None:
+            unres[prov[i] or "UNKNOWN"].append(i)
+    if not unres:
+        print(f"{m.title}: everything is named.")
+        return
+
+    A = MS.unit_rows(np.stack([at["v"] for at in atoms]))
+    print(f"{m.title}: {len(unres)} unresolved\n")
+    for tag, idxs in sorted(unres.items(),
+                            key=lambda kv: -sum(atoms[i]["sec"] for i in kv[1])):
+        secs = sum(atoms[i]["sec"] for i in idxs)
+        w = np.array([atoms[i]["sec"] for i in idxs], dtype=np.float32)
+        v = MS.unit((A[idxs] * w[:, None]).sum(axis=0))
+        P = bank.score(v[None, :])[0]
+        order = np.argsort(-P)[: a.top]
+        # Margin, not a verdict. It is the useful number -- a fragment at 0.59
+        # with the next candidate at 0.26 is a person, one at 0.47 with three
+        # others inside 0.06 is noise -- but it does not settle anything on its
+        # own. Tried as a verdict, "looks like X at margin 0.15" named the wrong
+        # justice on the first fragment it was pointed at: 0.47 to one person
+        # and 0.31 to the right one. Scores are evidence for a human; a headline
+        # over them is a guess wearing a number.
+        gap = float(P[order[0]] - P[order[1]]) if len(order) > 1 else float("nan")
+        first = min(idxs, key=lambda i: atoms[i]["start"])
+        said = " ".join(x["text"] for x in text[atoms[first]["key"]])[:88]
+        print(f"  {tag:<8} {secs:5.0f}s  [{int(atoms[first]['start'])//60}:"
+              f"{int(atoms[first]['start'])%60:02d}]  \"{said.strip()}\"")
+        print(f"       best is {gap:.2f} clear of the next")
+        for j in order:
+            bar = "#" * int(round(20 * max(float(P[j]), 0)))
+            flag = "  <- over the bar" if float(P[j]) >= MS.ACCEPT else ""
+            print(f"       {bank.names[j][:26]:<26} {float(P[j]):5.2f}  "
+                  f"{bar}{flag}")
+        print(f"       {'(nobody)':<26} {'':5}  accept is {MS.ACCEPT:.2f}\n")
+
+
+
 def cmd_groups(a):
     conn = db()
     rows = conn.execute(
@@ -1374,6 +1458,15 @@ def main():
                          "splitting; tighter than the discovery default, since "
                          "the point is structure that pass smoothed over")
     ps.set_defaults(fn=cmd_profile_split)
+
+    sg = sub.add_parser("suggest",
+                        help="who the unresolved voices in a meeting might be")
+    sg.add_argument("meeting")
+    sg.add_argument("--top", type=int, default=4,
+                    help="candidates to show per unresolved cluster")
+    sg.add_argument("--roster", default="",
+                    help="restrict the candidates to these names")
+    sg.set_defaults(fn=cmd_suggest)
 
     sub.add_parser("list").set_defaults(fn=cmd_list)
 
