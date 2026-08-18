@@ -40,6 +40,12 @@ FALLBACK_THR = 0.2656   # only reached when there are no cannot-link pairs at al
 # profile is too little to call a speaker.
 MIN_CLUSTER_SEC = 10.0
 
+# Least similarity at which a sub-min_core aggregate may be given to a cluster.
+# Below it the aggregate goes unassigned rather than to the nearest centroid.
+# Measured on this corpus, different-speaker pairs run median 0.104 and p90
+# 0.332, so anything under ~0.35 is indistinguishable from an impostor.
+WEAK_MIN = 0.35
+
 # Speech MOSS must have heard before "these are two different people" is taken as
 # binding. Above min_core, or it can never fire -- see cannot_link_matrix.
 DURABLE_S = float(os.environ.get("MS_CANNOT_LINK_MIN_S", "6.0"))
@@ -558,8 +564,46 @@ def cluster(A, secs, keys, min_core=2.0, refine_iters=3, thr=None,
     # never-embedded aggregate has norm 0 and came back -1, so the meeting
     # reported k=1 with nothing assigned to it.
     weak = np.setdiff1d(np.where(secs < min_core)[0], core)
+
+    # A weak aggregate used to be handed to argmax with no floor and no
+    # constraint: whichever centroid was nearest took it, however far away that
+    # was. Measured on a SCOTUS argument, a 0.81s interjection by one justice was
+    # assigned to the advocate she was interrupting at cosine 0.255, beating the
+    # runner-up by 0.018 -- and different-speaker pairs in this corpus run a
+    # median of 0.104 and a p90 of 0.332, so 0.255 is inside the impostor
+    # distribution. That is not an identification, it is the nearest point in a
+    # cloud of noise. ACCEPT (0.55) and LINK_ACCEPT (0.75) both exist in this
+    # project and neither reached this path.
+    #
+    # Two things now apply, and the first matters more.
+    #
+    # MOSS separating two locals INSIDE one window is a categorical judgment made
+    # with the whole window audible. A weak aggregate is a fraction of a second of
+    # embedding. Where they disagree the model wins: core keys already get this
+    # through cannot_link_matrix, and weak keys skipped it entirely -- so the one
+    # place the model's judgment is most needed, because the embedding is least
+    # trustworthy, was the one place it was ignored. In that SCOTUS window MOSS
+    # had it right, labelling the interjection S01 against the advocate's S02.
+    #
+    # And below WEAK_MIN nobody is claimed at all. -1 is the linker's leftover
+    # bucket, which is honest about not knowing; a wrong name is not.
+    taken = {}                      # cluster -> {(window, local)} already in it
+    for i in core:
+        taken.setdefault(int(lab[i]), set()).add(keys[i])
     for i in weak:
-        lab[i] = int(np.argmax(A[i] @ Cm.T)) if np.linalg.norm(A[i]) > 0 else -1
+        if np.linalg.norm(A[i]) <= 0:
+            lab[i] = -1
+            continue
+        w_i, loc_i = keys[i]
+        sim = A[i] @ Cm.T
+        lab[i] = -1
+        for c in np.argsort(sim)[::-1]:
+            c = int(c)
+            if any(kw == w_i and kl != loc_i for kw, kl in taken.get(c, ())):
+                continue            # MOSS heard a DIFFERENT speaker here
+            if sim[c] >= WEAK_MIN:
+                lab[i] = c
+            break
 
     # final centroids over every assigned aggregate, weighted by embedded seconds
     Cf = np.zeros_like(Cm)
