@@ -86,6 +86,11 @@ KEEP_EXEMPLAR = float(os.environ.get("MS_KEEP_EXEMPLAR", "0.72"))
 # circumstance rather than as noise. One outlier never becomes a sub-profile.
 MIN_CORROBORATION = int(os.environ.get("MS_MIN_CORROBORATION", "4"))
 
+# Share of a regrouped group's speech that must already belong to one person
+# before the group inherits their name. Below it the group is left unnamed and
+# `review` surfaces it, which is recoverable; a wrong inherited name is not.
+NAME_INHERIT_SHARE = float(os.environ.get("MS_NAME_INHERIT_SHARE", "0.5"))
+
 # How WELL every recording of a person must be covered by one of their stored
 # sub-profiles. Separate from ACCEPT, which decides whether a stranger is them:
 # this decides how finely we describe someone we already know, and at ACCEPT the
@@ -615,15 +620,27 @@ def cmd_link(a):
                                    (sid, EMBED_MODEL, stamp))
                 keep = cur.lastrowid
             matched += len(m)
-        for r in m:                              # inherit an existing name
-            if keep is not None:
-                break
-            if r[6]:
+        if keep is None:
+            # Inherit a name only if the named members are the DOMINANT share of
+            # this group's speech. Taking the first named member found is how a
+            # regroup cross-contaminates: clear group_id on a lot of clusters at
+            # once -- which the emb-changed rule above does by design -- and a
+            # new group holding ONE leftover of someone's old group takes their
+            # name, however many other members it has. Measured, that took a
+            # library from 1.78% wrong names to 34.41%.
+            by_sid = {}
+            for r in m:
+                if not r[6]:
+                    continue
                 row = conn.execute("SELECT speaker_id FROM groups WHERE id=?",
                                    (r[6],)).fetchone()
                 if row and row[0] is not None:
-                    keep = r[6]
-                    break
+                    by_sid.setdefault(row[0], [0.0, r[6]])[0] += r[5] or 0.0
+            total = sum(r[5] or 0.0 for r in m) or 1.0
+            if by_sid:
+                best = max(by_sid.values())
+                if best[0] / total >= NAME_INHERIT_SHARE:
+                    keep = best[1]
         if keep is None:
             cur = conn.execute("INSERT INTO groups(speaker_id, embed_model,"
                                " linked_at) VALUES(NULL,?,?)", (EMBED_MODEL, stamp))
@@ -1063,6 +1080,152 @@ def _resolve_speaker(conn, who):
     return row[0], row[1]
 
 
+
+def _exemplar(conn, sid, cond):
+    row = conn.execute(
+        "SELECT id, emb, dim, seconds FROM exemplars WHERE speaker_id=? AND"
+        " condition=? AND embed_model=?", (sid, cond, EMBED_MODEL)).fetchone()
+    if not row:
+        have = [str(r[0]) for r in conn.execute(
+            "SELECT condition FROM exemplars WHERE speaker_id=? AND embed_model=?"
+            " ORDER BY seconds DESC", (sid, EMBED_MODEL))]
+        raise SystemExit(f"no sub-profile {cond!r}. There is: "
+                         f"{', '.join(have) or '(none)'}")
+    return row
+
+
+def cmd_profile_merge(a):
+    """Fold two sub-profiles into one, because they are the same circumstance.
+
+    The covering set splits whenever a recording is far from everything stored,
+    which is the right default -- it cannot tell "the same room on a bad day"
+    from "a different room". Only a person can, and `profiles --measure` is what
+    shows it: two profiles measuring narrowband at the same edge are one
+    circumstance that geometry happened to cut in half.
+
+    Pooled by speech, so the longer profile dominates rather than the two being
+    averaged as equals. A human-given name survives an auto- one, since it is
+    the half somebody vouched for.
+    """
+    import numpy as np
+
+    import match_speakers as MS
+    conn = db()
+    sid, name = _resolve_speaker(conn, a.who)
+    ra, rb = _exemplar(conn, sid, a.first), _exemplar(conn, sid, a.second)
+    if ra[0] == rb[0]:
+        raise SystemExit("those are the same sub-profile")
+    va = MS.unit(np.frombuffer(ra[1], dtype=np.float32, count=ra[2]))
+    vb = MS.unit(np.frombuffer(rb[1], dtype=np.float32, count=rb[2]))
+    wa, wb = float(ra[3] or 1.0), float(rb[3] or 1.0)
+    keep = a.as_name
+    if not keep:
+        auto_a = str(a.first).startswith("auto-")
+        auto_b = str(a.second).startswith("auto-")
+        keep = (a.second if auto_a and not auto_b else
+                a.first if auto_b and not auto_a else
+                (a.first if wa >= wb else a.second))
+    sim = float(va @ vb)
+    conn.execute("DELETE FROM exemplars WHERE id IN (?,?)", (ra[0], rb[0]))
+    MS.save_exemplar(conn, sid, keep, MS.unit(va * wa + vb * wb), EMBED_MODEL,
+                     wa + wb)
+    conn.commit()
+    print(f"{name}: {a.first} + {a.second} -> {keep!r} "
+          f"({(wa + wb)/60:.0f} min, the two were {sim:.2f} apart)")
+    if sim < 0.5:
+        print("  note: those were not very alike. If matching gets worse, "
+              "`link --apply` rebuilds the auto- ones from scratch.")
+
+
+def cmd_profile_split(a):
+    """Break one sub-profile apart, because it is holding two circumstances.
+
+    Splits its own members the same way profiles are discovered in the first
+    place -- take the member least well covered by what is already picked, until
+    every member is within `--cover` of something -- but applied to one profile
+    and with a tighter bar, since the point is to find structure the original
+    pass smoothed over.
+
+    Results are auto- names: they were derived, not vouched for. Look with
+    `profiles --measure` and rename the ones that mean something.
+    """
+    import numpy as np
+
+    import match_speakers as MS
+    conn = db()
+    sid, name = _resolve_speaker(conn, a.who)
+    _exemplar(conn, sid, a.cond)
+    members, _ = _profile_members(conn, sid)
+    rows = members.get(a.cond, [])
+    if len(rows) < 2:
+        raise SystemExit(f"{a.cond!r} has {len(rows)} recording(s) -- nothing "
+                         f"to split")
+    got = []
+    for meeting, cluster, secs, _ in rows:
+        r = conn.execute(
+            "SELECT emb, dim FROM clusters WHERE meeting=? AND cluster=? AND"
+            " embed_model=?", (meeting, cluster, EMBED_MODEL)).fetchone()
+        if r:
+            got.append((MS.unit(np.frombuffer(r[0], dtype=np.float32,
+                                              count=r[1])), secs))
+    if len(got) < 2:
+        raise SystemExit("not enough of its recordings are still on file")
+    E = np.stack([v for v, _ in got])
+    w = np.array([s for _, s in got], dtype=float)
+    picked = [int(np.argmax(w))]
+    while len(picked) < min(a.into, len(got)):
+        cov = (E @ E[picked].T).max(axis=1)
+        if cov.min() >= a.cover:
+            break
+        picked.append(int(np.argmin(cov)))
+    if len(picked) < 2:
+        raise SystemExit(
+            f"{a.cond!r} does not split: every recording is within "
+            f"{a.cover:.2f} of the same one. Lower --cover to force it.")
+    owner = (E @ E[picked].T).argmax(axis=1)
+    # A sub-profile is used for MATCHING, so one built from a few seconds is a
+    # bad reference that everything gets compared against. Splitting 171
+    # recordings produced a 168 and two singletons of no duration; those are
+    # outliers worth seeing in `profiles`, not prototypes worth scoring against.
+    # Fold anything under the enrolment floor into its next-nearest pick.
+    for _ in range(len(picked)):
+        tiny = [k for k in range(len(picked))
+                if w[owner == k].sum() < MIN_ENROLL_SEC]
+        if not tiny or len(picked) - len(tiny) < 1:
+            break
+        drop = tiny[0]
+        keep = [k for k in range(len(picked)) if k != drop]
+        sub = E[[picked[k] for k in keep]]
+        for i in np.where(owner == drop)[0]:
+            owner[i] = keep[int(np.argmax(sub @ E[i]))]
+        picked = [picked[k] for k in keep]
+        owner = np.array([keep.index(o) if o in keep else o for o in owner])
+    if len(picked) < 2:
+        raise SystemExit(
+            f"{a.cond!r} does not usefully split: everything outside the main "
+            f"group is under {MIN_ENROLL_SEC:.0f}s, too little to be a profile. "
+            f"`profiles {sid}` shows those as suspects instead.")
+    nxt = 1 + max([int(str(c[0]).split("-")[-1]) for c in conn.execute(
+        "SELECT condition FROM exemplars WHERE speaker_id=? AND condition LIKE"
+        " 'auto-%'", (sid,)) if str(c[0]).split("-")[-1].isdigit()] or [0])
+    old = _exemplar(conn, sid, a.cond)
+    conn.execute("DELETE FROM exemplars WHERE id=?", (old[0],))
+    made = []
+    for k in range(len(picked)):
+        mine = np.where(owner == k)[0]
+        if not len(mine):
+            continue
+        v = MS.unit((E[mine] * w[mine][:, None]).sum(axis=0))
+        cond = "auto-%d" % (nxt + len(made))
+        MS.save_exemplar(conn, sid, cond, v, EMBED_MODEL, float(w[mine].sum()))
+        made.append((cond, len(mine), w[mine].sum()))
+    conn.commit()
+    print(f"{name}: {a.cond} -> {len(made)} sub-profiles")
+    for cond, n, secs in made:
+        print(f"   {cond:<12} {secs/60:5.0f} min  {n:>3} recordings")
+    print(f"\n  look at them:  speakers.py profiles {sid} --measure")
+
+
 def cmd_groups(a):
     conn = db()
     rows = conn.execute(
@@ -1181,6 +1344,24 @@ def main():
                         help="name a discovered sub-profile, and pin it")
     pn.add_argument("who"); pn.add_argument("old"); pn.add_argument("new")
     pn.set_defaults(fn=cmd_profile_rename)
+
+    pm = sub.add_parser("profile-merge",
+                        help="two sub-profiles are the same circumstance")
+    pm.add_argument("who"); pm.add_argument("first"); pm.add_argument("second")
+    pm.add_argument("--as", dest="as_name", default=None,
+                    help="what to call the result (default: keeps the "
+                         "human-given name, or the larger one)")
+    pm.set_defaults(fn=cmd_profile_merge)
+
+    ps = sub.add_parser("profile-split",
+                        help="one sub-profile is holding two circumstances")
+    ps.add_argument("who"); ps.add_argument("cond")
+    ps.add_argument("--into", type=int, default=2)
+    ps.add_argument("--cover", type=float, default=0.86,
+                    help="how tightly members must be covered before it stops "
+                         "splitting; tighter than the discovery default, since "
+                         "the point is structure that pass smoothed over")
+    ps.set_defaults(fn=cmd_profile_split)
 
     sub.add_parser("list").set_defaults(fn=cmd_list)
 
