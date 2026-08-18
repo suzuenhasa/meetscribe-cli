@@ -206,14 +206,21 @@ Everyone starts as `Speaker 1`, `Speaker 2`. Those are correct within a
 recording and meaningless across recordings. Name someone once and they are
 recognised everywhere, including in meetings you already have.
 
+A **group** is one person across every meeting they appear in. Naming the group
+names all of them, which is why naming is done against a group and not against a
+cluster in one recording.
+
 | command | does |
 |---|---|
+| `./speakers link --apply` | group voices across the library, and attach any that match someone already named |
+| `./speakers review` | who is worth naming next, most meetings first |
+| `./speakers name <group> "Bob Smith"` | name them, everywhere |
+| `./speakers name <group> --speaker <id>` | attach to someone already on file, by id |
+| `./speakers apply --apply` | re-label the meetings you already have |
 | `./speakers meetings` | everything in the library: folder, id, title |
 | `./speakers who <meeting>` | the voices in it, how long each spoke, samples |
 | `./speakers play <meeting> G02 [n]` | hear that voice — plays the clips |
-| `./speakers name <meeting> G02 "Bob Smith"` | remember this voice |
-| `./speakers apply` | which existing transcripts would change |
-| `./speakers apply --apply` | re-identify and re-render them |
+| `./speakers groups` | every voice group, named or not |
 | `./speakers list` | who is on file |
 | `./speakers rename <id> "New Name"` | fix a name |
 | `./speakers forget <id>` | delete a person and their voiceprints |
@@ -224,36 +231,83 @@ a path, or enough of the title to be unambiguous.
 ### The normal loop
 
 ```bash
-./speakers who platform-review                    # which cluster is who
-./speakers play platform-review G02               # confirm by ear
-./speakers name platform-review G02 "Dana Whitfield"
-./speakers apply --apply                    # backfill everything else
+./speakers link --apply                      # group voices across the library
+./speakers review                            # who is worth naming, and why
+./speakers name 12 "Dana Whitfield"          # name a group
+./speakers apply --apply                     # backfill everything else
 ```
+
+`review` orders the queue by how many meetings each unnamed voice spans, because
+naming one that appears in twelve fixes twelve transcripts and naming a one-off
+fixes one. It prints a line of what they said, which usually settles it without
+listening, and the clip to play when it does not.
 
 `apply` is the one people miss. Identification runs when a recording is
 processed, against whoever was enrolled at that moment — so naming someone
 afterwards leaves every meeting they are already in still saying Speaker 3 until
-you run it. It is cosine arithmetic over centroids already on disk: no GPU, no
+you run it. It is cosine arithmetic over vectors already on disk: no GPU, no
 re-transcription, seconds for a whole library.
 
-### Reading the identify output
+**The id is the identity, the name is a label on it.** `name <group> "Bob"`
+creates a person; `name <group> --speaker 6` attaches to one already on file.
+Retyping a name that is one character off creates a SECOND person and splits
+their voice between the two spellings, which nothing downstream can detect — so
+a near miss is refused and told to use the id.
+
+### Who could be in this recording
+
+```bash
+./transcribe meeting.m4a --roster "Ada Lovelace,Bob Smith"
+./speakers apply --apply --roster-file rosters.json      # {meeting: [names]}
+```
+
+Anyone enrolled who could not possibly be in a recording is a comparison that
+cannot be right and can only cost accuracy. Measured over 300 recordings with
+391 people on file and about twelve actually present, a roster cut wrong names
+from 2.21% to 1.78%. For a meeting the roster is the calendar invite.
+
+Nothing is forced: someone absent from the roster comes out unnamed rather than
+pushed onto the nearest listed name.
+
+### One person, more than one circumstance
+
+A voice over a conference mic and the same voice on a phone are far apart as
+vectors and are the same human being. Averaging them gives a profile that
+matches neither, so a person is stored once per circumstance.
+
+| command | does |
+|---|---|
+| `./speakers profiles <who> [--measure]` | what each sub-profile is made of |
+| `./speakers profile-rename <who> auto-3 telephone` | name one, and pin it |
+| `./speakers profile-merge <who> auto-3 auto-5` | same circumstance, one profile |
+| `./speakers profile-split <who> auto-1` | one profile holding two circumstances |
+| `./speakers name <group> "Bob" --condition phone` | declare one yourself |
+
+Sub-profiles are discovered automatically and named `auto-1`, `auto-2` — a
+counter, which says a second way of sounding was found and nothing about what it
+is. `--measure` opens a few of the recordings behind each one and reports the
+channel, so a profile can be given a name that means something. Renaming also
+pins it: the automatic pass only ever redraws `auto-*`.
+
+`profiles` also lists members that fit none of the person's profiles. Those are
+either someone else the linking put there, or a circumstance so unlike the rest
+that it wants its own profile. Both need a person to look.
+
+### Reading the link output
 
 ```
-identify: 4 voices in this meeting, 3 enrolled candidates
-  = G00      612s  Bob Smith              0.952
-  ? G01       74s  Ravi Patel             0.478  (2nd 0.443)
-    G03       31s  -                      0.201
+CLUSTER meeting=board-sync thr=0.6200 mode=match k_est=14
+NAMED   meeting=board-sync bank=391 named=9/14 share_of_speech=97.2%
+        who={'G00': 'Bob Smith', 'G03': 'Ada Lovelace', ...}
 ```
 
-`=` recognised · `?` too close to call, left numbered · blank, nobody on file.
+`k_est` is how many distinct voices came out, `named` how many of them the store
+recognised, and `share_of_speech` how much of the recording that covers — the
+last one is the number to watch, since nine named voices covering 97% is a good
+result and nine covering 40% is not.
 
-Accepting needs **0.55 and a 0.10 margin** over the runner-up. 0.40–0.55 asks a
-person. Below that is treated as a new voice. Enrolling needs 10 s of speech.
-
-If everyone comes out `?` with identical scores, the same person is probably
-enrolled twice — see [When something is wrong](#when-something-is-wrong).
-
----
+`mode=match` is the current path. `mode=max-gap` means the old clustering ran,
+which happens only with `--legacy-cluster`.
 
 ## The resident engine
 
@@ -482,10 +536,16 @@ than failing inside the allocator.
 **A voice is enrolled but old transcripts still say Speaker 3.**
 `./speakers apply --apply`.
 
-**Everyone comes out `?` with scores of 1.000.** The same person is enrolled
-twice: two identical voiceprints, so the 0.10 margin can never be met.
+**One person is on file twice.** Usually a name typed slightly differently, so
+their voice is split between the two and neither is as good as it should be.
 `./speakers list` shows it — two entries with near-identical speech time.
-`./speakers forget <id>` on the duplicate.
+`./speakers forget <id>` on the duplicate, then re-name that group with
+`--speaker <id>` pointing at the one you kept.
+
+**Someone in the transcript is not who it says.** `./speakers profiles <who>`
+lists members that fit none of that person's sub-profiles; a long recording with
+a low fit is the linking having put someone else in. `./speakers link --apply`
+re-derives the grouping.
 
 **Everyone is one speaker, or one person appears as several.** `k_est` on the
 `CLUSTER` line is the count found. `FLOOR-VIOLATION` means fewer speakers than

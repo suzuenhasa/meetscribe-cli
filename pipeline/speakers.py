@@ -50,6 +50,18 @@ EMBED_MODEL = "wespeaker-resnet34-LM"
 
 # centroid-vs-centroid operating point. Measured error-free band on ICSI was
 # [0.41, 0.86]; 0.55 sits mid-band. Not valid at any other aggregation level.
+# LEGACY. These three govern identify.py, which no longer runs unless
+# --legacy-identify is passed: it re-decided who each cluster was from averaged
+# centroids and overwrote what matching had already written. Tuning them changes
+# nothing about a normal run.
+#
+# The thresholds that ARE live, and where they live:
+#   match_speakers.ACCEPT (0.62)   an atom joins a person
+#   match_speakers.SUBPROFILE      two atoms could be the same person at all
+#   LINK_ACCEPT (0.75)             two clusters merge into one group
+#   COVER, KEEP_EXEMPLAR           how finely a known voice is described
+#   NAME_INHERIT_SHARE             a regrouped group keeps a name
+#   MIN_LINK_SEC, MIN_ENROLL_SEC   speech needed to match, and to enrol
 ACCEPT = 0.55
 MARGIN = 0.10          # best must beat second best by this much
 REVIEW = 0.40          # below ACCEPT but above this -> tentative, needs a human
