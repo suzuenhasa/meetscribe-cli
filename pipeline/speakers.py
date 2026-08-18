@@ -85,6 +85,24 @@ KEEP_EXEMPLAR = float(os.environ.get("MS_KEEP_EXEMPLAR", "0.72"))
 # How many recordings must agree with each other before they are treated as a
 # circumstance rather than as noise. One outlier never becomes a sub-profile.
 MIN_CORROBORATION = int(os.environ.get("MS_MIN_CORROBORATION", "4"))
+
+# How WELL every recording of a person must be covered by one of their stored
+# sub-profiles. Separate from ACCEPT, which decides whether a stranger is them:
+# this decides how finely we describe someone we already know, and at ACCEPT the
+# first profile covers everyone immediately so almost nobody gets a second.
+# Swept over 300 arguments with 391 people enrolled:
+#
+#     0.62   399 exemplars,  8 people with >1   2.21% wrong
+#     0.72   417            21                  2.17%
+#     0.80   458            42                  2.15%
+#     0.86   530            63                  2.35%   <- describing noise
+#
+# The gain is small HERE because these are 300 recordings of one courtroom, and
+# a person who only ever sounds one way needs only one profile. It is not what
+# the mechanism is for: the Court's two telephone terms are where a single
+# frozen reference put 22-28% of speech under the wrong name, and that is the
+# case a second profile exists to survive.
+COVER = float(os.environ.get("MS_COVER", "0.80"))
 MIN_LINK_SEC = 60.0    # too short to enrol is too short to match
 
 
@@ -431,7 +449,7 @@ def refresh_exemplars(conn, speaker_id, keep_named=True):
     picked = [int(np.argmax(w))]
     while len(picked) < 24:
         cov = (E @ E[picked].T).max(axis=1)
-        if cov.min() >= MS.ACCEPT:
+        if cov.min() >= COVER:
             break
         picked.append(int(np.argmin(cov)))
     owner = (E @ E[picked].T).argmax(axis=1)
