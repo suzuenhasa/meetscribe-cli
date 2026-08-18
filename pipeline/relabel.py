@@ -82,6 +82,28 @@ def relabel_by_matching(m, bank, condition=None):
         else:
             seg.pop("speaker_name", None)
     m.file("transcript", "json").write_text(json.dumps(raw))
+
+    # Matching renumbers `global`, so the clusters table -- written at link time
+    # -- now names different things by the same ids. Anything joining the two
+    # afterwards silently reads one meeting's G07 as another's: it put a
+    # justice's entire 15 hours under a colleague's name before this line
+    # existed. Rewrite the sidecar so re-indexing puts the store back in step.
+    cents, secs, ids = [], [], []
+    for tag, gid in sorted(order.items(), key=lambda kv: kv[1]):
+        mine = [i for i, a in enumerate(atoms)
+                if tag_of.get(a["key"]) == gid]
+        if not mine:
+            continue
+        w = np.array([atoms[i]["sec"] for i in mine], dtype=np.float32)
+        V = np.stack([atoms[i]["v"] for i in mine])
+        cents.append(MS.unit((V * w[:, None]).sum(axis=0)))
+        secs.append(float(w.sum()))
+        ids.append(gid)
+    if cents:
+        np.savez(str(m.file("clusters", "npz")),
+                 centroid=np.stack(cents).astype(np.float32),
+                 cluster=np.array(ids), secs=np.array(secs, dtype=np.float32),
+                 meeting=np.array(m.id))
     return out
 
 
