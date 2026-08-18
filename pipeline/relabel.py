@@ -2,7 +2,7 @@
 """Apply what the profile store knows to every meeting already in the library.
 
   relabel.py                 what would change, touching nothing
-  relabel.py --apply         re-identify and re-render
+  relabel.py --apply         re-render every transcript from what the store knows
 
 Identification happens once, when a recording is processed, against whoever was
 enrolled at that moment. Name someone afterwards and every meeting they are
@@ -10,8 +10,8 @@ already in keeps calling them Speaker 3 -- the store knows who they are, the
 transcripts do not, and nothing reconciles the two.
 
 That is the wrong shape for the whole point of this: a voice named ONCE should be
-recognised everywhere, including backwards. Enrolling is when the gallery
-changes, so this is what to run after it.
+recognised everywhere, including backwards. Naming is when the store changes,
+so this is what to run after it.
 
 Cheap enough not to think about: identification is cosine arithmetic over
 centroids that are already on disk. No GPU, no re-transcription, no audio -- a
@@ -195,14 +195,15 @@ def main():
         before = names_in(m)
         # RENDER what linking decided; do not decide again.
         #
-        # This used to run identify.py per meeting, re-scoring every cluster
-        # against the gallery at ACCEPT (0.55). That is a second, looser opinion
-        # competing with speakers.py link, which groups clusters from the audio
-        # and only names a group at LINK_ACCEPT (0.75). The two disagreed and
-        # this one won, because it is what writes the transcript: measured on a
-        # SCOTUS argument, linking put a cluster in its own unnamed group -- 0.911
-        # to its own members, 0.586 to the nearest named one, correctly declining
-        # -- and relabel wrote that name in anyway because 0.586 clears 0.55.
+        # This used to run a second identification pass per meeting (identify.py,
+        # since deleted), re-scoring every cluster against the enrolled profiles
+        # at 0.55. That is a second, looser opinion competing with speakers.py
+        # link, which groups clusters from the audio and only names a group at
+        # LINK_ACCEPT (0.75). The two disagreed and this one won, because it is
+        # what writes the transcript: measured on a SCOTUS argument, linking put
+        # a cluster in its own unnamed group -- 0.911 to its own members, 0.586
+        # to the nearest named one, correctly declining -- and relabel wrote that
+        # name in anyway because 0.586 clears 0.55.
         # A wrong name on a transcript is worse than no name, and it was being
         # applied over a correct abstention.
         #

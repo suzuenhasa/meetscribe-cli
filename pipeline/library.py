@@ -153,7 +153,7 @@ def glob_escape(s):
 def library_dir(work=None):
     """Where meetings live. -> Path
 
-    Precedence, matching what ./transcribe already computes at its :259 --
+    Precedence, matching what ./transcribe already computes at its :296 --
     `--out` if the run was sent somewhere, else MS_LIBRARY, else the working
     directory's library/:
 

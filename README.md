@@ -43,12 +43,18 @@ cp ~/recordings/*.mp3 inbox/
 Each recording becomes a directory in `library/` — transcript, audio, and a
 few seconds of each voice. The inbox empties as they finish.
 
+Everyone starts as `Speaker 1`. Name them once and they are recognised in every
+recording afterwards, and in the ones you already have:
+
 ```bash
-./speakers who <meeting>                  # see speaker IDs
-./speakers play <meeting> G02             # hear a voice sample
-./speakers name <meeting> G02 "Dana Whitfield"
-./speakers apply --apply                  # name them in older meetings too
+./speakers link --apply                   # group each voice across meetings
+./speakers review                         # the groups waiting for a name
+./speakers name 12 "Dana Whitfield"       # names them in every meeting at once
+./speakers apply --apply                  # backfill the transcripts you have
 ```
+
+`review` prints a line of what each voice said and a clip to play, which is
+usually enough to tell who it is: `./speakers play <meeting> G02`.
 
 **Supported formats:** `wav mp3 m4a flac ogg opus aac m4b aiff wma mp4 webm
 mkv` — any sample rate, auto-converted to 16 kHz mono.

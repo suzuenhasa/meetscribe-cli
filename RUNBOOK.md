@@ -70,21 +70,13 @@ not the total. It is how you tell a slow run from a slow machine.
 | `--replace <id>` | — | redo a meeting in place, keeping its id and history |
 | `--glossary "A,B"` | — | proper nouns the model has never heard |
 | `--roster "A,B"` | — | only match against these people |
-| `--name G02="Bob"` | — | name a cluster during the run |
 | `--window <s>` | `30` | seconds of audio per decode window |
 | `--overlap <s>` | `0` | context decoded either side of each window |
 | `--thr <n\|auto>` | `auto` | speaker-clustering cut |
 | `--accurate` | off | one decode pass per recording instead of windows |
 | `--overlap-aware` | off | embed only where a speaker has the floor alone |
-| `--embed-ckpt <path>` | bundled | swap the voice-embedding model |
-| `--embed-config <path>` | bundled | `config.yaml` for `--embed-ckpt` |
 | `--gpu-frac <n>` | auto | share of VRAM vLLM reserves |
 | `--per-speaker <n>` | `2` | segments embedded per speaker per window; `0` for all |
-| `--min-core <s>` | `2.0` | speech needed to join the clustering core |
-| `--durable <s>` | `6.0` | speech behind a binding "different people" claim |
-| `--guard <n>` | `10` | windows a "different people" claim is trusted across |
-| `--min-cluster-sec <s>` | `10` | below this a cluster is absorbed, not kept |
-| `--refine <n>` | `3` | leave-one-out refinement passes |
 
 `glossary.txt` in the directory you run from is picked up automatically, one
 term per line, `#` for comments.
@@ -155,45 +147,6 @@ WeSpeaker checkpoint.
 > not match anything the new model produces. Use it for evaluation, or start a
 > fresh store — do not point it at a library you have been naming for months.
 
-**`--durable <s>`** is how much speech MOSS must have heard before "these two are
-different people" is treated as binding. Below the bar the claim is ignored;
-above it, the pair can *never* merge, at any `--thr`.
-
-What it really controls is how much **variation within one speaker** the run will
-tolerate before calling it a second person — a sponsor read, a music bed, a mic
-change, someone leaning back from the array. It is not a close-vs-far-field
-switch, and treating it as one gets it backwards on studio audio.
-
-Measured on AliMeeting far-field, 8 sessions, same embeddings, clustering only:
-
-| `--durable` | cpCER |
-|---|---|
-| `1.0` | 37.3% |
-| `2.0` | 37.3% |
-| `6.0` | 22.1% |
-
-`1.0` and `2.0` scoring identically is not noise: `cannot_link_matrix` is handed
-`secs[core]`, already filtered to `>= --min-core` (2.0), so any value below that
-was unreachable and the parameter did nothing at all until `6.0`.
-
-Those 15 points are dominated by one session that produced 91 speakers for a
-3-speaker meeting — and the same session did not blow up on another box. Treat
-it as a robustness fix, not an average-case one; seven of eight improve or hold.
-
-Removing the claims altogether is far worse than any setting of this flag. They
-are load-bearing.
-
-On close-talking podcasts — studio audio with sponsor reads and music beds —
-that shows up directly. Speaker counts against five recordings confirmed by ear:
-
-| `--durable` | `3` | `6` | `7` | `8` | `9` | `10` | `12` |
-|---|---|---|---|---|---|---|---|
-| total error | 2 | 1 | **0** | **0** | **0** | **0** | 1 |
-
-Raise it when a recording has ads, music, or a speaker who changes register or
-microphone. Lower it toward `2` only for genuinely uniform audio — one clean
-track per speaker, no inserts.
-
 **`--replace`** is for redoing a meeting you already have — a better glossary, a
 different `--thr`. It keeps the id, so every decision ever recorded about it
 still applies. Without it, the same audio twice is two meetings.
@@ -223,7 +176,7 @@ cluster in one recording.
 | `./speakers groups` | every voice group, named or not |
 | `./speakers list` | who is on file |
 | `./speakers rename <id> "New Name"` | fix a name |
-| `./speakers forget <id>` | delete a person and their voiceprints |
+| `./speakers forget <id>` | delete a person, their voiceprints, and their claim on every group |
 
 `<meeting>` is anything that identifies one: its id (`9ajq9`), its directory,
 a path, or enough of the title to be unambiguous.
@@ -503,13 +456,6 @@ Back it up.
 | `python3 pipeline/library.py` | list meetings: folder, id, title |
 | `python3 pipeline/library.py <ref> <field>` | resolve one — `path` `id` `title` `stem` `clusters` `transcript` `text` `audio` |
 | `python3 pipeline/relabel.py` | same as `speakers apply` |
-| `python3 pipeline/migrate_ids.py` | what a filename-keyed store would become |
-| `python3 pipeline/migrate_ids.py --apply` | re-key it, backing up first |
-
-`migrate_ids.py` is a one-off for stores written before meetings had ids. It
-copies to `speakers.db.pre-ids`, keeps every old value in a `legacy_name` column,
-and **leaves alone** any row whose meeting is not in the library rather than
-dropping it.
 
 ### Tests
 
@@ -532,6 +478,64 @@ source env.sh
 
 `batch.py` also takes `--no-convert` (decode inside the run, one file at a time),
 `--no-clips`, `--move-audio`, and `--no-overlap-embed`.
+
+### The clustering knobs
+
+`--min-core`, `--refine`, `--durable`, `--guard` and `--min-cluster-sec` are
+`link.py` flags and **only** `link.py` flags. `./transcribe` and `batch.py`
+forwarded them until they were removed, which is worse than not having them:
+their values print into the `AGG` and `CLUSTER` lines, so `--durable 9` came
+back in the log as `durable=9` while `cluster_speakers.cluster()` — the only
+code that reads it — had not run. Nothing merges on the matching path, so there
+is no merge for any of these to constrain.
+
+They still work where they always worked, which is a hand-run comparison:
+
+```bash
+"$MS_PY" pipeline/link/link.py --legacy-cluster --durable 9 \
+    --run out/rec_raw.json --npz out/rec_emb.npz --out out/rec_linked.json
+```
+
+The measurements below are measurements of **that** path.
+
+**`--durable <s>`** is how much speech MOSS must have heard before "these two are
+different people" is treated as binding. Below the bar the claim is ignored;
+above it, the pair can *never* merge, at any `--thr`.
+
+What it really controls is how much **variation within one speaker** the run will
+tolerate before calling it a second person — a sponsor read, a music bed, a mic
+change, someone leaning back from the array. It is not a close-vs-far-field
+switch, and treating it as one gets it backwards on studio audio.
+
+Measured on AliMeeting far-field, 8 sessions, same embeddings, clustering only:
+
+| `--durable` | cpCER |
+|---|---|
+| `1.0` | 37.3% |
+| `2.0` | 37.3% |
+| `6.0` | 22.1% |
+
+`1.0` and `2.0` scoring identically is not noise: `cannot_link_matrix` is handed
+`secs[core]`, already filtered to `>= --min-core` (2.0), so any value below that
+was unreachable and the parameter did nothing at all until `6.0`.
+
+Those 15 points are dominated by one session that produced 91 speakers for a
+3-speaker meeting — and the same session did not blow up on another box. Treat
+it as a robustness fix, not an average-case one; seven of eight improve or hold.
+
+Removing the claims altogether is far worse than any setting of this flag. They
+are load-bearing.
+
+On close-talking podcasts — studio audio with sponsor reads and music beds —
+that shows up directly. Speaker counts against five recordings confirmed by ear:
+
+| `--durable` | `3` | `6` | `7` | `8` | `9` | `10` | `12` |
+|---|---|---|---|---|---|---|---|
+| total error | 2 | 1 | **0** | **0** | **0** | **0** | 1 |
+
+Raise it when a recording has ads, music, or a speaker who changes register or
+microphone. Lower it toward `2` only for genuinely uniform audio — one clean
+track per speaker, no inserts.
 
 ---
 
@@ -616,7 +620,8 @@ than failing inside the allocator.
 their voice is split between the two and neither is as good as it should be.
 `./speakers list` shows it — two entries with near-identical speech time.
 `./speakers forget <id>` on the duplicate, then re-name that group with
-`--speaker <id>` pointing at the one you kept.
+`--speaker <id>` pointing at the one you kept. `forget` prints how many groups
+it put back in the review queue — those are the ones to re-name.
 
 **Someone in the transcript is not who it says.** `./speakers profiles <who>`
 lists members that fit none of that person's sub-profiles; a long recording with

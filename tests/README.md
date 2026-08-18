@@ -23,7 +23,10 @@ against **the real shipped file**, never a copy:
 * `./transcribe` and `./engine` are run as **real subprocesses** against a
   stub interpreter (`MS_PY`) in a temp tree, so their `set -e` behaviour is
   bash's own. Most of the shell defects pinned here are `set -e` interactions
-  and do not exist unless bash is actually bash.
+  and do not exist unless bash is actually bash. The stub's exit code is per
+  module (`rc_for={"engined.py": 97}`), because "the daemon refused and the
+  fallback ran it" is two calls with two codes and one code for the whole run
+  cannot say it.
 
 Nothing touches the checkout's own `speakers.db`, `library/`, or `inbox/`:
 every subprocess gets `MS_SPEAKER_DB` and `MS_WORK` redirected into `tmp_path`,
@@ -51,3 +54,30 @@ the defect is fixed -- which is the signal to delete the marker, not the test.
 Run `python3 -m pytest tests/ -q -rx` to print them.
 
 Do not "fix" production code from inside this directory to turn one green.
+
+## test_wrapper_flags.py: the census, and its two lists
+
+Everything else here tests the modules, which is exactly where a dropped flag
+*works*. `test_wrapper_flags.py` reads argparse out of `batch.py`,
+`speakers.py`, `relabel.py` and `link/link.py` with `ast`, reads `./transcribe`
+and `./speakers` as text, and asserts the two sides reconcile -- plus the same
+edge one level down, where `batch.py` builds `link.py`'s argv and where
+`--speaker-db` was lost.
+
+It carries two lists, and which one a flag belongs in is the whole judgement:
+
+* `ALLOWED` -- deliberate. The wrapper *should* not carry this flag, and the
+  entry says why (a bench switch, a comparison arm that exists to lose, an
+  intermediate path the caller chooses).
+* `KNOWN_DROPS` -- a defect still on the floor, strict in the same sense as the
+  xfails above. Forward the flag and the entry becomes a failure telling you to
+  delete the line.
+
+A census that parses to nothing passes silently, so
+`test_the_parsers_still_find_both_sides` names flags and subcommands that must
+still be found on each side. It used to pin a *count* -- 25 flags out of
+batch.py, 20 case arms out of ./transcribe -- and deleting five dead tuning
+knobs moved three of those numbers at once, failing with "the ast walk has lost
+the parser" while the parser was fine. A floor you re-set to whatever the last
+deletion left is not a floor. If one of the named flags is deliberately deleted,
+delete it here too and say so; if all of them vanish at once, fix the parser.

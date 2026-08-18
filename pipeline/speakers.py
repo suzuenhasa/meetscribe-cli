@@ -1,11 +1,12 @@
 """Persistent speaker profiles: name a voice once, recognise it thereafter.
 
 The store. Most people reach it through ./speakers at the repo root, which also
-does who/play/clips (reading the transcript and audio) and routes naming through
-identify.py. This module is the sqlite layer plus a direct CLI:
+does who/play/clips (reading the transcript and audio). This module is the
+sqlite layer plus a direct CLI:
 
-  speakers.py enroll  <meeting> G03 "Bob Smith"     name a cluster from a meeting
-  speakers.py identify <meeting> [--roster "Bob Smith,Jane Doe"]
+  speakers.py link --apply                      group voices across every meeting
+  speakers.py review                            who is worth naming next
+  speakers.py name <group> "Bob Smith"          name them, in every meeting at once
   speakers.py list
   speakers.py rename  <speaker_id> "New Name"
   speakers.py forget  <speaker_id>              delete a person and their voiceprints
@@ -48,42 +49,37 @@ WORK = _default_work()
 DB = os.environ.get("MS_SPEAKER_DB", os.path.join(WORK, "speakers.db"))
 EMBED_MODEL = "wespeaker-resnet34-LM"
 
-# centroid-vs-centroid operating point. Measured error-free band on ICSI was
-# [0.41, 0.86]; 0.55 sits mid-band. Not valid at any other aggregation level.
-# LEGACY. These three govern identify.py, which no longer runs unless
-# --legacy-identify is passed: it re-decided who each cluster was from averaged
-# centroids and overwrote what matching had already written. Tuning them changes
-# nothing about a normal run.
+# Every threshold the naming path reads, and where it lives. A
+# centroid-vs-centroid ACCEPT of 0.55, a 0.10 margin and a 0.40 review floor sat
+# here too, read only by identify.py; they went with it, so nothing in this
+# module now holds a number a normal run does not use.
 #
-# The thresholds that ARE live, and where they live:
 #   match_speakers.ACCEPT (0.62)   an atom joins a person
 #   match_speakers.SUBPROFILE      two atoms could be the same person at all
 #   LINK_ACCEPT (0.75)             two clusters merge into one group
 #   COVER, KEEP_EXEMPLAR           how finely a known voice is described
 #   NAME_INHERIT_SHARE             a regrouped group keeps a name
 #   MIN_LINK_SEC, MIN_ENROLL_SEC   speech needed to match, and to enrol
-ACCEPT = 0.55
-MARGIN = 0.10          # best must beat second best by this much
-REVIEW = 0.40          # below ACCEPT but above this -> tentative, needs a human
 MIN_ENROLL_SEC = 10.0
 
-# Corpus-wide linking is a DIFFERENT level from identify and gets its own
-# numbers, for the reason in this module's header: a threshold fitted at one
-# level misfires at another. Two things make linking the harsher case. It scores
-# every cluster against every other, so acceptance is a max over the whole
-# corpus rather than over a roster -- the widest gallery there is. And a wrong
-# link is not one bad row, it is one name spread across every meeting it joins.
+# Corpus-wide linking is a DIFFERENT level from matching one recording, and
+# gets its own numbers, for the reason in this module's header: a threshold
+# fitted at one level misfires at another. Two things make linking the harsher
+# case. It scores every cluster against every other, so acceptance is a max
+# over the whole corpus rather than over a roster -- the widest gallery there
+# is. And a wrong link is not one bad row, it is one name spread across every
+# meeting it joins.
 #
 # Measured on the podcast corpus, cross-meeting centroid pairs, truth by ear:
 #
 #   same person   (across 5 recordings)   0.754 - 0.889
-#   IMPOSTOR      (a 24s cluster)         0.708 - 0.741   <- ACCEPT is 0.55
+#   IMPOSTOR      (a 24s cluster)         0.708 - 0.741
 #
-# ACCEPT would take that impostor without pausing. Duration is what made it
-# dangerous: a 53-second cluster of a different audience member scored
-# 0.521-0.547 against the same person, and every true pair came from clusters of
-# 1395s or more. Short clusters give unstable centroids that drift toward
-# whoever dominates the recording.
+# The per-recording bar -- match_speakers.ACCEPT, 0.62 -- takes that impostor
+# without pausing. Duration is what made it dangerous: a 53-second cluster of a
+# different audience member scored 0.521-0.547 against the same person, and
+# every true pair came from clusters of 1395s or more. Short clusters give
+# unstable centroids that drift toward whoever dominates the recording.
 #
 # Requiring 60s to be eligible drops the worst impostor from 0.741 to 0.458 and
 # widens the gap to the nearest true pair from 0.013 to 0.296. The gate does far
@@ -133,19 +129,19 @@ def db(path=None):
     over the one file in the project that cannot be rebuilt from the audio.
     """
     c = sqlite3.connect(path or DB)
+    # sqlite ignores every FOREIGN KEY in the DDL below unless this is set, and
+    # it is per CONNECTION, not per database file. Declared and never enabled is
+    # the worst of the three states: `forget 1` deleted the speaker and left
+    # exemplars auto-1/auto-2 still pointing at id 1 and group 2 still claiming
+    # it, so `groups` showed the person as "-- unnamed --", `review` skipped
+    # them, and the next name minted id 1 again and inherited both voiceprints.
+    # With this on, a delete that misses a referencing row fails loudly instead.
+    c.execute("PRAGMA foreign_keys=ON")
     c.executescript("""
     CREATE TABLE IF NOT EXISTS speakers(
       id INTEGER PRIMARY KEY, name TEXT UNIQUE, created_at REAL);
-    CREATE TABLE IF NOT EXISTS prototypes(
-      id INTEGER PRIMARY KEY, speaker_id INTEGER, emb BLOB, dim INTEGER,
-      embed_model TEXT, level TEXT, meeting TEXT, seconds REAL, created_at REAL,
-      FOREIGN KEY(speaker_id) REFERENCES speakers(id));
-    CREATE TABLE IF NOT EXISTS decisions(
-      id INTEGER PRIMARY KEY, meeting TEXT, cluster TEXT, speaker_id INTEGER,
-      score REAL, second REAL, threshold REAL, level TEXT, roster TEXT,
-      outcome TEXT, created_at REAL);
 
-    -- Every cluster the pipeline has ever produced, named or not. `prototypes`
+    -- Every cluster the pipeline has ever produced, named or not. `exemplars`
     -- cannot hold these: it requires a speaker_id, and the whole point of
     -- linking is that a voice belongs to a group BEFORE anyone names it.
     CREATE TABLE IF NOT EXISTS clusters(
@@ -155,9 +151,6 @@ def db(path=None):
       UNIQUE(meeting, cluster, embed_model));
     CREATE INDEX IF NOT EXISTS clusters_group ON clusters(group_id);
 
-    -- An identity discovered from audio. speaker_id stays NULL until a human
-    -- names it, and naming is then one UPDATE here rather than a rescan: every
-    -- meeting in the group inherits the name through the join.
     -- A person's voice as it actually sounds, once per CIRCUMSTANCE. One
     -- averaged vector cannot stand for someone across a change of recording
     -- condition: measured on the Court's 2020-21 telephone arguments, a
@@ -176,6 +169,9 @@ def db(path=None):
       FOREIGN KEY(speaker_id) REFERENCES speakers(id));
     CREATE INDEX IF NOT EXISTS exemplars_speaker ON exemplars(speaker_id);
 
+    -- An identity discovered from audio. speaker_id stays NULL until a human
+    -- names it, and naming is then one UPDATE here rather than a rescan: every
+    -- meeting in the group inherits the name through the join.
     CREATE TABLE IF NOT EXISTS groups(
       id INTEGER PRIMARY KEY, speaker_id INTEGER, embed_model TEXT,
       linked_at REAL,
@@ -210,122 +206,6 @@ def centroids_from_npz(path):
             continue
         out[c] = (v / n, float(z["secs"][i]))
     return out
-
-
-def cluster_centroids(meeting, run_dir=None):
-    """-> {cluster_id: (centroid, seconds)} for one meeting's linked output."""
-    run_dir = run_dir or os.path.join(WORK, "out")
-    linked = json.load(open(f"{run_dir}/{meeting}_linked.json"))
-    segs = linked["segments"] if isinstance(linked, dict) else linked
-    z = np.load(f"{run_dir}/{meeting}_emb.npz", allow_pickle=True)
-    emb = {int(i): z["emb"][r] for r, i in enumerate(z["seg_idx"])}
-
-    acc = {}
-    for i, s in enumerate(segs):
-        g = s.get("global") or s.get("speaker")
-        # G-1 is the linker's leftover bucket: segments with too little audio to
-        # cluster. It is not a person and must never be enrolled or matched.
-        if not g or g == "UNASSIGNED" or str(g).startswith("G-"):
-            continue
-        a = acc.setdefault(g, [[], 0.0])
-        a[1] += s["end"] - s["start"]
-        if i in emb:
-            a[0].append(emb[i])
-    out = {}
-    for g, (vs, secs) in acc.items():
-        if not vs:
-            continue
-        v = np.mean(vs, axis=0)
-        out[g] = (v / (np.linalg.norm(v) + 1e-9), secs)
-    return out
-
-
-def gallery(conn, roster=None):
-    """-> [(speaker_id, name, centroid)]; roster restricts the candidate pool."""
-    q = ("SELECT s.id, s.name, p.emb, p.dim FROM speakers s "
-         "JOIN prototypes p ON p.speaker_id = s.id WHERE p.embed_model = ?")
-    args = [EMBED_MODEL]
-    if roster:
-        q += " AND s.name IN (%s)" % ",".join("?" * len(roster))
-        args += roster
-    rows = {}
-    for sid, name, blob, dim in conn.execute(q, args):
-        rows.setdefault((sid, name), []).append(
-            np.frombuffer(blob, dtype=np.float32, count=dim))
-    out = []
-    for (sid, name), vs in rows.items():
-        v = np.mean(vs, axis=0)
-        out.append((sid, name, v / (np.linalg.norm(v) + 1e-9)))
-    return out
-
-
-def enroll_centroid(conn, name, v, secs, meeting, cluster):
-    """Store a voiceprint under `name`. Shared by the CLI and the folder pipeline."""
-    conn.execute("INSERT OR IGNORE INTO speakers(name, created_at) VALUES(?,?)",
-                 (name, time.time()))
-    sid = conn.execute("SELECT id FROM speakers WHERE name=?", (name,)).fetchone()[0]
-    conn.execute("INSERT INTO prototypes(speaker_id, emb, dim, embed_model, level,"
-                 " meeting, seconds, created_at) VALUES(?,?,?,?,?,?,?,?)",
-                 (sid, v.astype(np.float32).tobytes(), len(v), EMBED_MODEL,
-                  "centroid", f"{meeting}:{cluster}", secs, time.time()))
-    conn.commit()
-    return sid
-
-
-def cmd_enroll(a):
-    conn = db()
-    cents = cluster_centroids(a.meeting, a.run_dir)
-    if a.cluster not in cents:
-        raise SystemExit(f"cluster {a.cluster} not found; have {sorted(cents)}")
-    v, secs = cents[a.cluster]
-    if secs < MIN_ENROLL_SEC and not a.force:
-        raise SystemExit(f"only {secs:.1f}s of speech; need {MIN_ENROLL_SEC:.0f}s "
-                         f"(--force to override)")
-    sid = enroll_centroid(conn, a.name, v, secs, a.meeting, a.cluster)
-    n = conn.execute("SELECT COUNT(*) FROM prototypes WHERE speaker_id=?",
-                     (sid,)).fetchone()[0]
-    print(f"enrolled {a.name} from {a.meeting}:{a.cluster} "
-          f"({secs:.0f}s speech, {n} session{'s' if n > 1 else ''} on file)")
-
-
-def cmd_identify(a):
-    conn = db()
-    roster = [x.strip() for x in a.roster.split(",")] if a.roster else None
-    G = gallery(conn, roster)
-    if not G:
-        raise SystemExit("nobody enrolled yet" + (" matching that roster" if roster else ""))
-    cents = cluster_centroids(a.meeting, a.run_dir)
-    print(f"{a.meeting}: {len(cents)} speakers found, "
-          f"{len(G)} candidate{'s' if len(G) != 1 else ''}"
-          + (f" (roster: {', '.join(roster)})" if roster else " (whole database)"))
-    print(f"\n{'cluster':9}{'speech':>8}  {'identified as':22}{'score':>7}{'2nd':>7}")
-
-    taken = {}
-    for g in sorted(cents, key=lambda k: -cents[k][1]):
-        v, secs = cents[g]
-        scored = sorted(((float(v @ c), sid, name) for sid, name, c in G), reverse=True)
-        best, second = scored[0], (scored[1] if len(scored) > 1 else (0.0, None, None))
-        score, sid, name = best
-        if score < REVIEW:
-            label, outcome = "UNKNOWN", "unknown"
-        elif score < ACCEPT or (score - second[0]) < MARGIN:
-            label, outcome = f"? {name}", "review"
-        elif sid in taken:
-            # one-to-one: a person cannot be two clusters in one meeting
-            label, outcome = f"? {name} (dup)", "review"
-        else:
-            label, outcome = name, "accept"
-            taken[sid] = g
-        print(f"{g:9}{secs:7.0f}s  {label:22}{score:7.3f}{second[0]:7.3f}")
-        conn.execute("INSERT INTO decisions(meeting, cluster, speaker_id, score,"
-                     " second, threshold, level, roster, outcome, created_at)"
-                     " VALUES(?,?,?,?,?,?,?,?,?,?)",
-                     (a.meeting, g, sid if outcome == "accept" else None, score,
-                      second[0], ACCEPT, "centroid",
-                      ",".join(roster) if roster else None, outcome, time.time()))
-    conn.commit()
-    print(f"\naccept >= {ACCEPT} with margin >= {MARGIN}; "
-          f"{REVIEW}-{ACCEPT} needs review; below {REVIEW} is UNKNOWN")
 
 
 def index_clusters(conn, run_dir=None):
@@ -437,7 +317,7 @@ def refresh_exemplars(conn, speaker_id, keep_named=True):
 
     # Only CONFIDENT members may become a sub-profile. This is a self-training
     # loop -- what it learns it then matches against -- so a marginal cluster
-    # promoted to a prototype starts attracting things like itself, and the
+    # promoted to a sub-profile starts attracting things like itself, and the
     # error compounds instead of staying put. Measured: rebuilding from every
     # attached cluster took naming from 2.63% wrong to 3.31% while adding two
     # meetings of coverage, which is a bad trade in the direction that matters.
@@ -735,9 +615,10 @@ def cmd_name(a):
     """Name a group -- and with it every meeting the group already spans."""
     conn = db()
     if a.speaker_id is not None:
-        # The id IS the identity. migrate_ids.py already made this argument for
-        # meetings -- the filename used to be the key, so renaming a recording
-        # orphaned every decision about it. `name TEXT UNIQUE` plus a lookup by
+        # The id IS the identity. The store made this mistake for MEETINGS
+        # first -- the sanitised filename used to be the key, so renaming a
+        # recording orphaned everything ever decided about it, and re-keying
+        # onto meeting ids is what fixed it. `name TEXT UNIQUE` plus a lookup by
         # `WHERE name=?` puts speakers in exactly that position: two spellings
         # are two people, and the split is undetectable downstream.
         row = conn.execute("SELECT id, name FROM speakers WHERE id=?",
@@ -779,7 +660,7 @@ def cmd_name(a):
         " ORDER BY seconds DESC", (a.group_id,)).fetchall()
     if not members:
         raise SystemExit(f"group {a.group_id} has no members")
-    # a named group is also an enrolment: give identify the voiceprints too
+    # every voice in the group, as vectors, for the exemplars below
     import numpy as np
 
     import match_speakers as MS
@@ -788,11 +669,6 @@ def cmd_name(a):
         row = conn.execute("SELECT emb, dim FROM clusters WHERE meeting=? AND"
                            " cluster=? AND embed_model=?",
                            (meeting, cluster, EMBED_MODEL)).fetchone()
-        conn.execute("INSERT INTO prototypes(speaker_id, emb, dim, embed_model,"
-                     " level, meeting, seconds, created_at)"
-                     " VALUES(?,?,?,?,?,?,?,?)",
-                     (sid, row[0], row[1], EMBED_MODEL, "centroid",
-                      f"{meeting}:{cluster}", secs, time.time()))
         pool.append((np.frombuffer(row[0], dtype=np.float32, count=row[1]), secs))
     # and an exemplar for the circumstance, which is what matching reads. Naming
     # the same person again under a different --condition adds a sub-profile
@@ -1198,7 +1074,7 @@ def cmd_profile_split(a):
     # A sub-profile is used for MATCHING, so one built from a few seconds is a
     # bad reference that everything gets compared against. Splitting 171
     # recordings produced a 168 and two singletons of no duration; those are
-    # outliers worth seeing in `profiles`, not prototypes worth scoring against.
+    # outliers worth seeing in `profiles`, not references worth scoring against.
     # Fold anything under the enrolment floor into its next-nearest pick.
     for _ in range(len(picked)):
         tiny = [k for k in range(len(picked))
@@ -1341,16 +1217,23 @@ def cmd_groups(a):
 
 
 def cmd_list(a):
+    """Who is on file, and how much speech each name is standing on.
+
+    Counts EXEMPLARS. It counted prototypes, which no reader was left for -- and
+    the speech total is the column the duplicate-name check in RUNBOOK.md reads
+    ("two entries with near-identical speech time"), so it has to come from the
+    table matching actually uses.
+    """
     conn = db()
     rows = conn.execute(
-        "SELECT s.id, s.name, COUNT(p.id), SUM(p.seconds), MAX(p.created_at) "
-        "FROM speakers s LEFT JOIN prototypes p ON p.speaker_id=s.id "
+        "SELECT s.id, s.name, COUNT(e.id), SUM(e.seconds) "
+        "FROM speakers s LEFT JOIN exemplars e ON e.speaker_id=s.id "
         "GROUP BY s.id ORDER BY s.name").fetchall()
     if not rows:
         print("no speakers enrolled")
         return
-    print(f"{'id':>4}  {'name':24}{'sessions':>9}{'speech':>9}")
-    for sid, name, n, secs, _ in rows:
+    print(f"{'id':>4}  {'name':24}{'profiles':>9}{'speech':>9}")
+    for sid, name, n, secs in rows:
         print(f"{sid:>4}  {name:24}{n:>9}{(secs or 0):>8.0f}s")
 
 
@@ -1362,26 +1245,45 @@ def cmd_rename(a):
 
 
 def cmd_forget(a):
+    """Delete a person: their voiceprints, and their claim on every group.
+
+    The cascade is written out here rather than left to ON DELETE CASCADE in the
+    DDL, because the store on disk was created before any of this and CREATE
+    TABLE IF NOT EXISTS will not retrofit a clause onto it. A store that cascades
+    only if it happens to be new is the divergence, not the fix.
+
+    exemplars, not prototypes: the line here deleted the table identify.py read,
+    so forgetting someone left the voiceprints the MATCHER reads behind and the
+    next recording still recognised them.
+
+    Groups are emptied, not deleted. A group is a voice the linker found; the
+    name was a human's answer about it, and withdrawing the answer does not
+    unmake the voice. speaker_id NULL is what `review` looks for, so the group
+    goes back into the queue to be named again.
+    """
     conn = db()
-    conn.execute("DELETE FROM prototypes WHERE speaker_id=?", (a.speaker_id,))
+    row = conn.execute("SELECT name FROM speakers WHERE id=?",
+                       (a.speaker_id,)).fetchone()
+    if not row:
+        raise SystemExit(f"no speaker with id {a.speaker_id} -- see `list`")
+    # Order is load-bearing now that PRAGMA foreign_keys is on: speakers last,
+    # or the DELETE fails on whichever row still references it.
+    n_ex = conn.execute("DELETE FROM exemplars WHERE speaker_id=?",
+                        (a.speaker_id,)).rowcount
+    n_gr = conn.execute("UPDATE groups SET speaker_id=NULL WHERE speaker_id=?",
+                        (a.speaker_id,)).rowcount
     conn.execute("DELETE FROM speakers WHERE id=?", (a.speaker_id,))
     conn.commit()
-    print(f"deleted speaker {a.speaker_id} and their voiceprints")
+    print(f"deleted {row[0]} (speaker {a.speaker_id}) and {n_ex} voiceprint"
+          f"{'' if n_ex == 1 else 's'}")
+    if n_gr:
+        print(f"{n_gr} group{'' if n_gr == 1 else 's'} back in the review queue")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", default=None)
     sub = ap.add_subparsers(dest="cmd", required=True)
-
-    e = sub.add_parser("enroll"); e.add_argument("meeting"); e.add_argument("cluster")
-    e.add_argument("name"); e.add_argument("--force", action="store_true")
-    e.set_defaults(fn=cmd_enroll)
-
-    i = sub.add_parser("identify"); i.add_argument("meeting")
-    i.add_argument("--roster", default=None,
-                   help="comma-separated names known to be in this meeting")
-    i.set_defaults(fn=cmd_identify)
 
     lk = sub.add_parser("link", help="group voices across every meeting on file")
     lk.add_argument("--threshold", type=float, default=LINK_ACCEPT)

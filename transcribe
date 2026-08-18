@@ -9,7 +9,6 @@
 #   ./transcribe ~/recordings/ --gpu-frac 0.80   # override the derived VRAM split
 #   ./transcribe podcast.mp3 --glossary "Dana Whitfield,Northwind,NorthwindDA"
 #   ./transcribe interview.mp3 --glossary crypto.txt   a file of terms, one per line
-#   ./transcribe standup.mp3 --name G01="Bob Smith"    remember this voice, by name
 #   ./transcribe standup.mp3 --roster "Bob Smith,Jane Doe"   only score these people
 #   ./transcribe *.m4a --manifest week.json   a glossary AND roster per recording
 #   ./transcribe *.m4a --no-clips             skip the per-voice sample clips
@@ -68,7 +67,6 @@ provisioning_guard() {
 
 THR="auto"
 ROSTER=""
-ENROLL=()
 # Speaker-identity knobs, forwarded verbatim to batch.py. One string rather than
 # a variable each because this script has no opinion on them -- batch.py owns
 # every default, and empty means "send nothing", so those defaults stay the
@@ -143,18 +141,34 @@ while [ $# -gt 0 ]; do
       [ -f "$2" ] || { echo "no manifest at $2" >&2; exit 2; }
       MANIFEST="$2"; shift 2 ;;
     --roster)   ROSTER="$2"; shift 2 ;;
-    --name)     ENROLL+=(--enroll "$2"); shift 2 ;;
+    # Enrolling during a run only ever existed on the five-script fallback,
+    # as identify.py --enroll, and it named a CLUSTER -- one voice in one
+    # recording -- which is not the unit anything downstream names. Deleting
+    # that chain deleted the only implementation, so say so: accepting the
+    # argument and dropping it is how a voice ends up unnamed and nobody knows.
+    --name)
+      WANT="${2:-Full Name}"; WANT="${WANT#*=}"
+      echo "--name is gone: it only ran on the no-daemon fallback, never with a resident engine," >&2
+      echo "and it named one recording's cluster rather than the person. Transcribe first, then:" >&2
+      echo "    ./speakers link --apply      group the voices across meetings" >&2
+      echo "    ./speakers review            the groups waiting for a name" >&2
+      echo "    ./speakers name <group> \"$WANT\"" >&2
+      exit 2 ;;
     --window)  WINDOW="$2"; shift 2 ;;
     --overlap) OVERLAP="$2"; shift 2 ;;
     --gpu-frac) GPUFRAC="$2"; shift 2 ;;
-    --per-speaker|--min-core|--refine|--durable|--guard|--min-cluster-sec)
-                TUNE="$TUNE $1 $2"; shift 2 ;;
+    # --min-core, --refine, --durable, --guard and --min-cluster-sec used to sit
+    # on this arm too. They reach link.py and are read only inside its
+    # --legacy-cluster branch, which nothing here passes -- so they printed into
+    # the AGG and CLUSTER lines, looked honoured, and changed nothing. link.py
+    # still takes them for a direct run.
+    --per-speaker)  TUNE="$TUNE $1 $2"; shift 2 ;;
     --overlap-aware) TUNE="$TUNE --overlap-aware"; shift ;;
     --accurate)      TUNE="$TUNE --accurate"; shift ;;
     --host)   HOST="$2"; shift 2 ;;
     --out)    OUTDIR="$2"; shift 2 ;;
     --replace) REPLACE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"; exit 0 ;;
     # Accumulate. This used to be SRC="$1", so `./transcribe a.mp3 b.mp3 c.mp3`
     # -- and every glob, which is how anyone writes a batch -- silently kept only
     # the LAST file and transcribed one recording of three. It reported success.
@@ -229,8 +243,31 @@ fi
 # truncated the snippet mid-path and ran a fragment.
 PYQ="$(printf '%q' "$PY")"
 
+# THE answer to "no usable daemon", written once and spliced into both
+# branches. It used to be written twice: the batch branch re-ran batch.py in a
+# process of its own, and the single-file branch ran a hand-rolled chain of five
+# scripts that wrote a different artifact layout and named speakers a measurably
+# worse way. Both branches build an ARGS array first; this runs it.
+#
+# 97 is engined.py saying it could not use the daemon -- none running, a stale
+# socket, or an engine built for different windows -- having already printed
+# which. --release before loading one of our own: a daemon that REFUSED a job is
+# still holding the card, 17.6 of 24 GiB measured, and the load below fails for
+# want of memory unless it steps aside. Harmless when there is no daemon, and it
+# wakes for its next job in about a second.
+RUN_JOB="
+    $PYQ '$PIPE/engined.py' --submit -- \"\${ARGS[@]}\"
+    rc=\$?
+    if [ \$rc -eq 97 ]; then
+      $PYQ '$PIPE/engined.py' --release >/dev/null 2>&1 || true
+      $PYQ '$PIPE/batch.py' \"\${ARGS[@]}\"
+      rc=\$?
+    fi
+    exit \$rc
+"
+
 # The profile store follows the WORK, not the machine. Without this a --host run
-# identifies against the BOX's profiles, writes its decisions into the box's
+# matches against the BOX's profiles and everything it learns lands in the box's
 # store, and both die with the instance -- so the one thing meetscribe exists to
 # remember is the one thing a rented GPU cannot keep. Yours goes up before the
 # run and comes back after; the box borrows it for as long as it is working.
@@ -374,15 +411,7 @@ if [ -d "$SRC" ] || [ "$MULTI" -eq 1 ]; then
       --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
       ${MANIFEST:+--manifest '$REMOTE/inbox/_manifest.json'} $NOCLIPS \
       --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}$TUNE)
-    # Hand the job to the resident engine if the box is running one, which saves
-    # the ~70s load. 97 is engined.py saying it could not -- no daemon, a stale
-    # socket, or an engine built for different windows -- having already printed
-    # which. Run it here in that case, exactly as this line did before daemons.
-    $PYQ '$PIPE/engined.py' --submit -- \"\${ARGS[@]}\"
-    rc=\$?
-    [ \$rc -eq 97 ] && { $PYQ '$PIPE/batch.py' \"\${ARGS[@]}\"; rc=\$?; }
-    exit \$rc
-  " || BATCH_RC=$?
+$RUN_JOB" || BATCH_RC=$?
 
   rrun "rm -rf '$STAGE'" || true
   pull_profiles
@@ -427,106 +456,57 @@ EXT="${SRC##*.}"
 echo "==> $BASE"
 rrun "mkdir -p '$REMOTE/inbox' '$REMOTE/out'; supervisorctl stop ray >/dev/null 2>&1 || true"
 
-[ "$LOCAL" -eq 1 ] || echo "==> uploading $(du -h "$SRC" | cut -f1)"
-rput "$SRC" "$REMOTE/inbox/$SAFE.$EXT"
+# No staging when the pipeline is right here -- the batch branch stopped doing
+# it at :378-384 and this branch did not, which left the two disagreeing about
+# the user's own file. Staging exists to give a recording a name that survives
+# the trip over ssh; locally it copied every recording once for nothing, and
+# then --move-audio moved the COPY into the library and left the original in
+# inbox/, so the worklist never drained and the next run transcribed the same
+# recording again under a second name. Worse for a name that needed no
+# sanitising: `./transcribe inbox/sync.mp3` made rput cp a file onto itself and
+# died with "are the same file", rc 1, before any work at all. Both executed.
+if [ "$LOCAL" -eq 1 ]; then
+  JOBSRC=("$SRC")
+else
+  echo "==> uploading $(du -h "$SRC" | cut -f1)"
+  rput "$SRC" "$REMOTE/inbox/$SAFE.$EXT"
+  JOBSRC=("$REMOTE/inbox/$SAFE.$EXT")
+fi
 push_profiles
 
 echo "==> transcribing"
-# A single recording is where a resident engine matters most: the five steps
-# below are seconds of work behind a ~70s engine load, so a voice memo spends
-# almost all of its wall clock starting up. batch.py does all five for a queue
-# of one, so when the box has a daemon, hand it the file and skip the load.
-#
-# Not with --name: enrolling a voice is identify.py's --enroll, which the batch
-# path has no equivalent for. Rather than half-support it, take the slow path.
-SINGLE_DONE=0
-if [ ${#ENROLL[@]} -eq 0 ]; then
-  T1="$(mktemp)"
-  # batch.py names transcripts from the sanitised remote filename; this is what
-  # gives the header back the title the human actually used.
-  printf '{%s}' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1])+":"+json.dumps(sys.argv[2]), end="")' "$SAFE" "$BASE")" > "$T1"
-  rput "$T1" "$REMOTE/out/_titles.json"; rm -f "$T1"
-  [ -n "$MANIFEST" ] && rput "$MANIFEST" "$REMOTE/inbox/_manifest.json"
-  SINGLE_RC=0
-  rrun "
-    set -uo pipefail
-    cd '$REMOTE'
-    export HF_HOME='$REMOTE/.hf_home' MS_WORK='$REMOTE' VLLM_CACHE_ROOT='$REMOTE/.vllm_cache' \
-           OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
-    $PYQ '$PIPE/engined.py' --submit -- '$REMOTE/inbox/$SAFE.$EXT' \
-      --out-dir '$REMOTE/out' --window $WINDOW --overlap $OVERLAP --thr $THR \
-      --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
-      ${MANIFEST:+--manifest '$REMOTE/inbox/_manifest.json'} $NOCLIPS \
-      --library '$JOBLIB' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
-      --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}$TUNE
-  " || SINGLE_RC=$?
-  # 97 is "no usable daemon" and is the one code that means fall through; any
-  # other failure is a real one and the steps below would only repeat it.
-  if [ "$SINGLE_RC" -eq 0 ]; then SINGLE_DONE=1
-  elif [ "$SINGLE_RC" -ne 97 ]; then exit "$SINGLE_RC"
-  fi
-fi
-
-[ "$SINGLE_DONE" -eq 1 ] || rrun "
-  set -euo pipefail
+# One implementation, whichever way the run gets here. A single recording used
+# to have a second one behind it: with no daemon it ran five scripts in sequence
+# -- transcribe_meeting, embed_batched, link, identify, mktxt -- writing flat
+# files into out/ with no library entry, no meeting.json and no clips, and
+# running link.py with no --speaker-db, which is the measured-worse way to
+# decide who is talking: 2.63% of speech under a wrong name against 0.18%
+# (batch.py:957-963). Nothing chose between the two but whether a daemon
+# happened to be up, and a fresh install has none -- so the unmaintained
+# pipeline was the default for one recording while two recordings got the
+# maintained one. batch.py does all five steps for a queue of one.
+T1="$(mktemp)"
+# batch.py names transcripts from the sanitised remote filename; this is what
+# gives the header back the title the human actually used.
+printf '{%s}' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1])+":"+json.dumps(sys.argv[2]), end="")' "$SAFE" "$BASE")" > "$T1"
+rput "$T1" "$REMOTE/out/_titles.json"; rm -f "$T1"
+[ -n "$MANIFEST" ] && rput "$MANIFEST" "$REMOTE/inbox/_manifest.json"
+# Captured rather than fatal, for the batch branch's reason: the retrieval below
+# has to run whatever the job did, so a run that died after writing its meeting
+# still brings it home.
+SINGLE_RC=0
+rrun "
+  set -uo pipefail
+  export HF_HOME='$REMOTE/.hf_home' MS_WORK='$REMOTE' OMP_NUM_THREADS=4 \
+         VLLM_CACHE_ROOT='$REMOTE/.vllm_cache' \
+         TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
   cd '$REMOTE'
-  export HF_HOME='$REMOTE/.hf_home' VLLM_CACHE_ROOT='$REMOTE/.vllm_cache' \
-         OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
-         VLLM_LOGGING_LEVEL=WARNING PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-  # This path loads its OWN engine, and a resident one is holding most of the
-  # card -- 17.6 of 24 GiB measured -- so ask it to step aside first. Without
-  # this, the load below fails for want of memory. Harmless when there is no
-  # daemon, and the daemon takes about a second to wake for its next job.
-  $PYQ '$PIPE/engined.py' --release >/dev/null 2>&1 || true
-
-  # NOT piped into grep. It used to be, to keep the output tidy, with '|| true'
-  # on the end -- which meant pipefail could not see the failure and set -e could
-  # not act on it. vLLM's out-of-memory error matches none of the grep patterns,
-  # so a failed engine printed NOTHING and the script carried on to embed a
-  # transcript that did not exist. Worse, when a stale _raw.json from an earlier
-  # run happened to be lying there, every step after it succeeded against the
-  # OLD transcript and the run reported success -- observed here, enrolling a
-  # speaker against a transcript eight minutes stale.
-  rm -f '$REMOTE/out/${SAFE}_raw.json'
-  TXLOG='$REMOTE/out/${SAFE}_transcribe.log'
-  set +e
-  $PYQ '$PIPE/transcribe_meeting.py' '$REMOTE/inbox/$SAFE.$EXT' --window $WINDOW \
-      ${GPUFRAC:+--gpu-frac $GPUFRAC} \
-      --overlap $OVERLAP --glossary $(printf '%q' "$GLOSSARY") \
-      --out '$REMOTE/out/${SAFE}_raw.json' 2>&1 \
-    | tee \"\$TXLOG\" | grep -E '^gen |silence gate|repetition|windows of'
-  # PIPESTATUS[0], because grep legitimately matches nothing on a good run and
-  # its own status says nothing about whether transcription worked. Read it
-  # BEFORE anything else runs: an '|| true' on the pipeline would have reset it.
-  TX_RC=\${PIPESTATUS[0]}
-  set -e
-  if [ \"\$TX_RC\" -ne 0 ] || [ ! -s '$REMOTE/out/${SAFE}_raw.json' ]; then
-    echo '!! transcription failed. Last 25 lines:' >&2
-    tail -25 \"\$TXLOG\" >&2
-    exit 1
-  fi
-
-  echo '==> embedding speakers'
-  OMP_NUM_THREADS=4 $PYQ '$PIPE/link/embed_batched.py' \
-      --run '$REMOTE/out/${SAFE}_raw.json' --wav '$REMOTE/inbox/$SAFE.$EXT' \
-      --out '$REMOTE/out/${SAFE}_emb.npz' 2>&1 | tail -1
-
-  echo '==> linking speakers (threshold: $THR)'
-  OMP_NUM_THREADS=4 $PYQ '$PIPE/link/link.py' --run '$REMOTE/out/${SAFE}_raw.json' \
-      --npz '$REMOTE/out/${SAFE}_emb.npz' --thr $THR \
-      --out '$REMOTE/out/${SAFE}_linked.json' 2>&1 \
-    | grep -E 'k_est=|FLOOR-VIOLATION' || true
-
-  echo '==> identifying speakers'
-  MS_WORK='$REMOTE' $PYQ '$PIPE/identify.py' \
-      --clusters '$REMOTE/out/${SAFE}_linked_clusters.npz' --meeting '$SAFE' \
-      --roster $(printf '%q' "$ROSTER") \
-      --names '$REMOTE/out/${SAFE}_names.json' ${ENROLL[@]+${ENROLL[*]@Q}}
-
-  $PYQ '$PIPE/mktxt.py' '$REMOTE/out/${SAFE}_linked.json' '$REMOTE/out/${SAFE}_raw.json' \
-      '$REMOTE/out/${SAFE}.txt' $(printf '%q' "$BASE") '$REMOTE/out/${SAFE}_names.json'
-"
+  ARGS=(${JOBSRC[*]@Q} --out-dir '$REMOTE/out' \
+    --library '$JOBLIB' $MOVEAUDIO ${REPLACE:+--replace $REPLACE} \
+    --window $WINDOW --overlap $OVERLAP --thr $THR \
+    --glossary $(printf '%q' "$GLOSSARY") --roster $(printf '%q' "$ROSTER") \
+    ${MANIFEST:+--manifest '$REMOTE/inbox/_manifest.json'} $NOCLIPS \
+    --titles '$REMOTE/out/_titles.json' ${GPUFRAC:+--gpu-frac $GPUFRAC}$TUNE)$RUN_JOB" || SINGLE_RC=$?
 
 pull_profiles
 
@@ -547,3 +527,4 @@ if [ -n "$M" ]; then
 else
   echo "    !! nothing arrived in $LIBRARY" >&2
 fi
+exit "$SINGLE_RC"

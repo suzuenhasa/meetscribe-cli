@@ -10,6 +10,7 @@ below are `set -e` interactions, which only exist when bash is actually bash.
 """
 
 import re
+from pathlib import Path
 
 import pytest
 
@@ -457,3 +458,163 @@ def test_a_single_run_that_produces_nothing_says_so(tree):
     assert "nothing arrived" in p.stderr, (
         "the run left the library empty and said nothing about it "
         "(rc=%d, stdout=%r, stderr=%r)" % (p.returncode, p.stdout, p.stderr))
+
+
+# =====================================================================
+# 6. rc 97 -- "no usable daemon" -- runs ONE pipeline      (this change)
+#
+# engined.py --submit answers 97 when it could not hand the job to a daemon:
+# none running, a stale socket, an engine built for different windows. The batch
+# branch has always answered that by running batch.py -- the same implementation
+# -- in a process of its own. The single-file branch answered it with a chain of
+# five scripts (transcribe_meeting, embed_batched, link, identify, mktxt) that
+# wrote flat files into out/: no library entry, no meeting.json, no clips, and
+# link.py with no --speaker-db, which is the measured-worse way to decide who is
+# talking -- 2.63% of speech under a wrong name against 0.18%.
+#
+# A fresh install has no daemon, so that chain was the DEFAULT for a single
+# recording while two recordings got the maintained pipeline. It is deleted;
+# both branches now build one array and run it through the same two calls.
+# plans/ARCHITECTURE.md section 6.1.
+# =====================================================================
+
+#: The five scripts that were the second implementation. Any of them running
+#: from ./transcribe means it is back.
+CHAIN = ("transcribe_meeting.py", "embed_batched.py", "link.py",
+         "identify.py", "mktxt.py")
+
+
+@BOTH_PATHS
+def test_no_daemon_runs_batch_py_with_the_arguments_it_submitted(tree, kind):
+    """rc 97 -> batch.py, with the SAME array, on both branches.
+
+    Asserted as equality against what was submitted rather than flag by flag:
+    the defect this replaces was not one missing flag, it was a second command
+    line that had to be kept in step with the first by hand and never was.
+    """
+    src = source_for(tree, kind)
+
+    p = tree.run("transcribe", src,
+                 "--replace", "9ajq9", "--window", "60", "--thr", "0.70",
+                 "--glossary", "Dana Whitfield", "--roster", "Bob Smith",
+                 "--no-clips",
+                 rc_for={"engined.py": 97}, mklib=True)
+
+    assert p.returncode == 0, "stdout=%r stderr=%r" % (p.stdout, p.stderr)
+
+    submits = [a for a in tree.invocations_of("engined.py") if "--submit" in a]
+    assert len(submits) == 1, "expected one --submit, got %r" % (submits,)
+    submitted = submits[0][submits[0].index("--") + 1:]
+    ran = tree.invocation_for("batch.py")[1:]
+    assert ran == submitted, (
+        "the %s fallback ran batch.py with different arguments than it "
+        "submitted.\n  submitted: %r\n  ran:       %r" % (kind, submitted, ran))
+
+    ran_chain = [m for m in CHAIN
+                 for a in tree.invocations if a and a[0].endswith(m)]
+    assert not ran_chain, (
+        "the second implementation is back on the %s path: %r" % (kind, ran_chain))
+
+    assert tree.meetings_in(tree.path / "library"), (
+        "the fallback produced no library entry, which is the whole difference "
+        "between the two implementations. stdout=%r" % p.stdout)
+
+
+@BOTH_PATHS
+def test_the_fallback_asks_the_resident_engine_to_step_aside(tree, kind):
+    """97 also means "a daemon refused this job", and it is still holding the card.
+
+    17.6 of 24 GiB measured. The deleted chain called `engined.py --release`
+    before loading an engine of its own; the batch branch never did, and the
+    collapse would have dropped it on both paths.
+    """
+    src = source_for(tree, kind)
+    p = tree.run("transcribe", src, rc_for={"engined.py": 97}, mklib=True)
+
+    assert p.returncode == 0, "stdout=%r stderr=%r" % (p.stdout, p.stderr)
+    calls = tree.invocations_of("engined.py")
+    assert any("--release" in a for a in calls), (
+        "nothing asked the daemon for the card before batch.py loaded its own "
+        "engine (%s path): %r" % (kind, calls))
+
+
+def test_name_is_refused_and_names_the_command_that_replaced_it(tree):
+    """--name enrolled one recording's CLUSTER, through identify.py, on the chain.
+
+    Silently ignoring it would be the worst of the three outcomes: the run
+    succeeds, the voice is not named, and nothing ever says so.
+    """
+    tree.audio()
+
+    p = tree.run("transcribe", "meeting.mp3", "--name", "G01=Bob Smith")
+
+    assert p.returncode == 2, (
+        "--name has no implementation left; it has to fail. rc=%d stdout=%r"
+        % (p.returncode, p.stdout))
+    assert "./speakers name" in p.stderr, (
+        "the refusal has to say what to use instead: %r" % p.stderr)
+    assert "Bob Smith" in p.stderr, (
+        "the name the user typed should come back in the command that would "
+        "have worked: %r" % p.stderr)
+    assert not tree.invocations, (
+        "nothing should have run: %r" % (tree.invocations,))
+
+
+# =====================================================================
+# 7. A local run never copies the user's recording   (this change)
+#
+# Staging exists to give a file a name that survives the trip over ssh. The
+# batch branch stopped doing it locally and the single-file branch did not, so
+# the two disagreed about the one thing a user can see: their own audio.
+# Executed against the branch before this change, both local, both from inbox/:
+#
+#   ./transcribe "inbox/Board Sync (Oct).mp3"
+#       -> inbox/ afterwards: ['Board Sync (Oct).mp3', 'Board-Sync-Oct.mp3']
+#          batch.py was handed the COPY, so --move-audio moved the copy into
+#          the library and left the original in the worklist. Run it again and
+#          you transcribe the same recording a second time, under a second name.
+#   ./transcribe inbox/sync.mp3
+#       -> rc 1, `cp: 'inbox/sync.mp3' and '.../inbox/sync.mp3' are the same
+#          file`, before any work at all. rput's `[ "$1" = "$2" ]` guard is a
+#          string compare, and a relative path is not the absolute one.
+#
+# The assertion is on the audio, not on the absence of a cp: what must hold is
+# that the file the user pointed at is the file the pipeline is given.
+# =====================================================================
+
+@pytest.mark.parametrize("name", ["sync.mp3", "Board Sync (Oct).mp3"])
+@pytest.mark.parametrize("ref", ["relative", "absolute"])
+def test_a_local_run_hands_over_the_original_and_leaves_no_copy(tree, name, ref):
+    inbox = tree.path / "inbox"
+    inbox.mkdir()
+    src = inbox / name
+    src.write_bytes(b"\x00" * 64)
+    arg = str(src) if ref == "absolute" else "inbox/" + name
+
+    p = tree.run("transcribe", arg, rc_for={"engined.py": 97}, mklib=True)
+
+    assert p.returncode == 0, "rc=%d stdout=%r stderr=%r" % (
+        p.returncode, p.stdout, p.stderr)
+    assert sorted(f.name for f in inbox.iterdir()) == [name], (
+        "a local run staged a copy beside the original: %r"
+        % sorted(f.name for f in inbox.iterdir()))
+    argv = tree.invocation_for("batch.py")
+    assert Path(argv[1]).name == name, (
+        "batch.py was handed %r, not the file the user pointed at" % argv[1])
+
+
+def test_the_batch_branch_still_agrees_with_it(tree):
+    """The row this change was closing. Both branches, one behaviour."""
+    inbox = tree.path / "inbox"
+    inbox.mkdir()
+    for n in ("Board Sync (Oct).mp3", "standup.mp3"):
+        (inbox / n).write_bytes(b"\x00" * 64)
+
+    p = tree.run("transcribe", rc_for={"engined.py": 97}, mklib=True)
+
+    assert p.returncode == 0, "rc=%d stderr=%r" % (p.returncode, p.stderr)
+    assert sorted(f.name for f in inbox.iterdir()) == [
+        "Board Sync (Oct).mp3", "standup.mp3"]
+    argv = tree.invocation_for("batch.py")
+    assert {Path(a).name for a in argv if a.endswith(".mp3")} == {
+        "Board Sync (Oct).mp3", "standup.mp3"}

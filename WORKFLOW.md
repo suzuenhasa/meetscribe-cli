@@ -199,7 +199,7 @@ Renaming pins a profile: the automatic pass only ever redraws `auto-*`.
 | `./speakers list` | who is on file, with ids |
 | `./speakers groups` | every voice group, named or not |
 | `./speakers rename <id> "New Name"` | fix a name |
-| `./speakers forget <id>` | delete a person and their voiceprints |
+| `./speakers forget <id>` | delete a person, their voiceprints, and their claim on every group |
 
 Flags, tuning, the resident engine, running on a rented GPU, and what to do when
 something breaks are in the [runbook](RUNBOOK.md).

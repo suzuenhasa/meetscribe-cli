@@ -36,14 +36,14 @@ SCRIPTS = ("transcribe", "engine")
 # Modules the scripts reference by path. Contents are irrelevant -- MS_PY never
 # actually interprets them -- but ./transcribe decides local-vs-remote by
 # testing for pipeline/transcribe_meeting.py, so the files must EXIST.
+#
+# Three files, not seven: identify.py, mktxt.py, embed_batched.py and link.py
+# were here for the five-script chain ./transcribe ran when there was no
+# daemon, and nothing in either wrapper names them any more.
 PIPELINE_FILES = (
     "pipeline/engined.py",
     "pipeline/batch.py",
     "pipeline/transcribe_meeting.py",
-    "pipeline/identify.py",
-    "pipeline/mktxt.py",
-    "pipeline/link/embed_batched.py",
-    "pipeline/link/link.py",
 )
 
 # A stand-in for the python interpreter. Records one line per argv element,
@@ -72,7 +72,22 @@ if [ -n "${MS_STUB_MKLIB:-}" ]; then
 fi
 
 if [ -n "${MS_STUB_OUT:-}" ]; then printf '%s\n' "$MS_STUB_OUT"; fi
-exit "${MS_STUB_RC:-0}"
+
+# The exit code is per MODULE, not per run. "The daemon refused and the fallback
+# ran it" is two calls with two different codes, and one MS_STUB_RC for
+# everything cannot say it -- so a test of the rc-97 route stopped at the first
+# call, with every later step answering 97 as well. MS_STUB_RC_ENGINED=97
+# overrides MS_STUB_RC for pipeline/engined.py alone.
+RC="${MS_STUB_RC:-0}"
+for a in "$@"; do
+  case "$a" in
+    *.py)
+      v="MS_STUB_RC_$(basename "$a" .py | tr '[:lower:]-' '[:upper:]_')"
+      [ -n "${!v:-}" ] && RC="${!v}"
+      break ;;
+  esac
+done
+exit "$RC"
 """
 
 
@@ -111,8 +126,13 @@ class Tree:
 
     # -- running -----------------------------------------------------------
     def run(self, script, *args, stub_rc=0, stub_out=None, mklib=False,
-            env=None, cwd=None, timeout=60):
-        """Run ./<script> in the tree. Returns CompletedProcess (text mode)."""
+            rc_for=None, env=None, cwd=None, timeout=60):
+        """Run ./<script> in the tree. Returns CompletedProcess (text mode).
+
+        rc_for is {"engined.py": 97}: an exit code for one module, overriding
+        stub_rc for it alone. rc 97 is the whole no-daemon route and it is two
+        calls long, so a single code cannot express it.
+        """
         e = dict(os.environ)
         # Nothing from the developer's own shell may steer the scripts: MS_HOST
         # alone would turn every local test into an ssh attempt.
@@ -126,6 +146,9 @@ class Tree:
             e["MS_STUB_OUT"] = stub_out
         if mklib:
             e["MS_STUB_MKLIB"] = "1"
+        for module, rc in (rc_for or {}).items():
+            stem = module.split("/")[-1].split(".")[0].upper().replace("-", "_")
+            e["MS_STUB_RC_" + stem] = str(rc)
         e.update(env or {})
         return subprocess.run(
             [str(self.path / script)] + [str(a) for a in args],
@@ -149,9 +172,17 @@ class Tree:
         )
         return got[0]
 
+    def invocations_of(self, module):
+        """Every argv that RAN `module` -- matched on argv[0] and nothing else.
+
+        `engined.py --submit -- <the job's own argument list>` carries paths and
+        flags that are not the module being run, so which module ran is argv[0].
+        """
+        return [a for a in self.invocations if a and a[0].endswith(module)]
+
     def invocation_for(self, module):
-        """The single argv whose first path-like element ends in `module`."""
-        hits = [a for a in self.invocations if any(x.endswith(module) for x in a)]
+        """The single argv running `module`."""
+        hits = self.invocations_of(module)
         assert len(hits) == 1, "expected one %s call, got %d: %r" % (
             module, len(hits), self.invocations,
         )
@@ -220,7 +251,6 @@ def repo():
 #   agreeing with a hand-rolled copy of the layout that has since drifted.
 # =====================================================================
 import json          # noqa: E402
-import sqlite3       # noqa: E402
 import sys           # noqa: E402
 
 import numpy as np   # noqa: E402
@@ -318,17 +348,6 @@ def snapshot(root):
             for p in sorted(root.rglob("*")) if p.is_file()}
 
 
-def rows_of(db_path, table):
-    """Every row of `table` as a list of dicts, ordered by rowid."""
-    c = sqlite3.connect(str(db_path))
-    c.row_factory = sqlite3.Row
-    try:
-        return [dict(r) for r in c.execute(
-            "SELECT * FROM %s ORDER BY rowid" % table)]
-    finally:
-        c.close()
-
-
 # ----------------------------------------------------------------- fixtures
 @pytest.fixture
 def store(tmp_path):
@@ -391,26 +410,6 @@ def run_pipe(store, tmp_path):
         return p
 
     return run
-
-
-@pytest.fixture
-def decisions(store):
-    """-> {(meeting, cluster): {outcome, score, second}} from the store.
-
-    identify.py records why it did what it did, which is a steadier assertion
-    surface than the human-readable table it prints.
-    """
-    def read():
-        c = sqlite3.connect(str(store))
-        try:
-            rows = c.execute("SELECT meeting, cluster, outcome, score, second"
-                             " FROM decisions ORDER BY id").fetchall()
-        finally:
-            c.close()
-        return {(m, cl): {"outcome": o, "score": sc, "second": se}
-                for m, cl, o, sc, se in rows}
-
-    return read
 
 
 # =====================================================================

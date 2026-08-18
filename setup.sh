@@ -270,7 +270,16 @@ say "Models (~2 GB on a cold box — this is the slow part)"
 # recordings in one, find meetings in the other. They have to exist before the
 # first run, since ./transcribe with no argument means the inbox and the README
 # tells you to copy into it.
-mkdir -p "$HF_HOME" "$WORK/runs" "$WORK/out" "$WORK/inbox" "$WORK/library" \
+#
+# run/, not runs/. The engine's socket, pidfile and log live in $WORK/run
+# (engine:27-29, engined.py:49). `./engine start` and `engined.py --serve` each
+# mkdir it themselves, so a missing one is not what stops a daemon coming up --
+# but until one has started there is no run/ to look in, and `./engine log` on a
+# fresh install answered "No such file or directory" for a directory setup was
+# supposed to have made. runs/ was created here and written by nothing in this
+# repo; the two names are one character apart, which is why the missing one read
+# as present.
+mkdir -p "$HF_HOME" "$WORK/run" "$WORK/out" "$WORK/inbox" "$WORK/library" \
          "$WORK/wsp_ckpt/resnet34"
 if [ "$CHECK" -eq 1 ]; then
   "$PY" -c "
@@ -340,7 +349,7 @@ ok "embedder imports"
 say "Pipeline"
 if [ "$CHECK" -eq 1 ]; then
   for f in transcribe_meeting.py batch.py cluster_speakers.py mktxt.py speakers.py \
-           identify.py link/link.py link/embed_batched.py; do
+           link/link.py link/embed_batched.py; do
     [ -f "$PIPE/$f" ] || die "missing $PIPE/$f"
   done
   ok "scripts in place"
@@ -388,9 +397,10 @@ cat <<EOF
    sitting there has not been done.
 
      ./speakers meetings                       what is in the library
-     ./speakers who <meeting>                  the voices in it
-     ./speakers name <meeting> G02 "Bob"       remember one
-     ./speakers apply --apply                  name them in older meetings too
+     ./speakers link --apply                   group each voice across meetings
+     ./speakers review                         the groups waiting for a name
+     ./speakers name <group> "Bob Smith"       names them in every meeting at once
+     ./speakers apply --apply                  backfill the transcripts you have
 
    For names the model has never heard, put a glossary.txt next to where you
    run it (one term per line) — see glossary.txt.example.

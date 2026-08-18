@@ -94,6 +94,24 @@ def best_clips(segs, n):
     return sorted(picked, key=lambda s: s["start"])
 
 
+def meeting_ref(js: Path):
+    """What to tell someone to type at ./speakers to mean THIS meeting.
+
+    The id if there is a library entry, its folder otherwise, and the file name
+    last -- which is all a transcript sitting loose in an out/ directory has.
+    """
+    mj = js.parent / "meeting.json"
+    if mj.exists():
+        try:
+            mid = json.loads(mj.read_text()).get("id")
+            if mid:
+                return str(mid)
+        except (ValueError, OSError):
+            pass
+        return js.parent.name
+    return js.name
+
+
 def cmd_who(args):
     js, doc = load(args[0])
     groups = by_cluster(doc)
@@ -116,8 +134,18 @@ def cmd_who(args):
             print(f"       [{hms(s['start'])}] {txt}")
         print()
     g0 = next(iter(groups), "G00")
-    print(f'  hear one:  ./speakers play {shlex.quote(js.name)} {g0}')
-    print(f'  name one:  ./speakers name {shlex.quote(js.stem)} {g0} "Their Name"')
+    # A reference `./speakers` can resolve, not this file's name. Both hints used
+    # to echo back the transcript's own stem, and library.find resolves neither:
+    # the stem is <slug>-transcript, so `play` died with "no transcript at ..."
+    # and `name` with "no clusters for ... here." Executed, both.
+    ref = meeting_ref(js)
+    print(f'  hear one:  ./speakers play {shlex.quote(ref)} {g0}')
+    # And naming is by GROUP -- one person across every meeting -- not by the
+    # cluster this file happens to call G02. The three-argument
+    # `name <meeting> <cluster> <name>` this used to print is deleted; it wrote a
+    # voiceprint nothing on the transcribe path read. There is no group id to
+    # print here: `link --apply` is what mints them, and it has to run first.
+    print('  name them: ./speakers link --apply, then ./speakers review')
 
 
 def player():

@@ -125,9 +125,9 @@ case "$CMD" in
     ;;
   apply|relabel)
     # A voice named once should be recognised everywhere, INCLUDING backwards.
-    # identify.py runs when a recording is processed, against whoever was
-    # enrolled then, so naming someone afterwards left every meeting they were
-    # already in still calling them Speaker 3.
+    # Matching runs when a recording is processed, against whoever was named by
+    # then, so naming someone afterwards left every meeting they were already in
+    # still calling them Speaker 3.
     run "$PIPE/relabel.py" "$@"
     ;;
   meetings)
@@ -141,81 +141,32 @@ case "$CMD" in
     fi | awk -F'\t' '{printf "  %-46s %-7s %s\n", $1, $2, $3}'
     ;;
   name)
-    # Two forms. `name <group> "Full Name"` is the one to use: a group is one
-    # person across every meeting they appear in, so naming it names all of
-    # them. `name <group> --speaker <id>` attaches to someone already on file
-    # without retyping their name, which is how one person becomes two.
+    # `name <group> "Full Name"` names one person across every meeting they
+    # appear in; `name <group> --speaker <id>` attaches this voice to someone
+    # already on file, which is what stops one person becoming two.
     #
-    # The three-argument meeting+cluster form is kept because it is what every
-    # existing note and habit says, and it names a single recording's cluster
-    # through the older path.
-    if [ $# -ge 2 ] && printf '%s' "$1" | grep -qE '^[0-9]+$' \
-       && { [ "$2" = "--speaker" ] || [ $# -eq 2 ] || [ "$2" = "--condition" ] \
-            || ! printf '%s' "$2" | grep -qE '^G[0-9]+$'; }; then
-      run "$PIPE/speakers.py" name "$@"
-      echo
-      echo "  Backfill every transcript they are already in:  ./speakers apply --apply"
-      exit 0
-    fi
-    [ $# -ge 3 ] || { echo 'usage: ./speakers name <group> "Full Name"      (see ./speakers review)
-       or: ./speakers name <group> --speaker <id>       (someone already on file)
-       or: ./speakers name <meeting> <cluster> "Full Name"' >&2; exit 2; }
-    MEETING="$1"; CLUSTER="$2"; NAME="$3"
-    # accept the transcript path as well as the bare meeting name
-    MEETING="$(basename "$MEETING")"; MEETING="${MEETING%.json}"; MEETING="${MEETING%.txt}"
-    RAW="$MEETING"
+    # `name <meeting> <cluster> "Full Name"` is gone. It enrolled one
+    # recording's cluster through identify.py, which wrote `prototypes` -- a
+    # table the matcher that runs on every transcription never read. A name
+    # entered that way was invisible to the next recording, which is the one
+    # thing naming exists to do.
+    if ! printf '%s' "${1:-}" | grep -qE '^[0-9]+$' || [ $# -lt 2 ]; then
+      cat >&2 <<'EOF'
+usage: ./speakers name <group> "Full Name"      (see ./speakers review)
+   or: ./speakers name <group> --speaker <id>   (someone already on file)
 
-    # Ask library.py, rather than guessing at filenames. It resolves an id, a
-    # folder name, a path, or enough of the title to be unambiguous -- and it
-    # returns the meeting's ID, which is what identify.py keys on now. Naming a
-    # voice therefore survives the folder being renamed or the meeting being
-    # re-run with --replace.
-    MDIR="$(MS_WORK="$REMOTE" "$PY" "$PIPE/library.py" "$RAW" path 2>/dev/null)" || MDIR=""
-    if [ -n "$MDIR" ]; then
-      MID="$(MS_WORK="$REMOTE" "$PY" "$PIPE/library.py" "$RAW" id)"
-      CL="$(MS_WORK="$REMOTE" "$PY" "$PIPE/library.py" "$RAW" clusters)"
-      [ -f "$CL" ] || { echo "no clusters in $MDIR — transcribe it first." >&2; exit 2; }
-      run "$PIPE/identify.py" --clusters "$CL" --meeting "$MID" \
-          --enroll "${CLUSTER}=${NAME}"
-      echo
-      echo "  Re-run transcribe on that meeting to see the name in the transcript,"
-      echo "  or just transcribe the next one — they are recognised from now on."
-      exit 0
-    fi
+<group> is a number, not a meeting. Naming one recording's cluster is gone: it
+stored a voiceprint nothing on the transcribe path ever read. Instead:
 
-    MEETING="$(echo "$MEETING" | tr -cs '[:alnum:]._-' '-' | sed 's/^-*//;s/-*$//')"
-
-    # HERE first. ./transcribe brings the clusters file back with the transcript,
-    # so naming a voice is something you can do where your files are -- without a
-    # box, and without one having to still exist. Only fall through to the remote
-    # out/ when there is nothing local, which is the case where you transcribed
-    # straight on the box and never pulled anything down.
-    CL=""
-    for c in "./${RAW}.clusters.npz" "./${MEETING}.clusters.npz" \
-             "./${MEETING}_linked_clusters.npz" "./out/${MEETING}.clusters.npz" \
-             "./out/${MEETING}_linked_clusters.npz"; do
-      [ -f "$c" ] && { CL="$c"; break; }
-    done
-    if [ -n "$CL" ]; then
-      # A local file means a local run, whatever --host says: the store this
-      # writes to is the one in THIS install, which is the copy that outlives
-      # any box.
-      LOCAL=1; PIPE="$HERE/pipeline"; REMOTE="$HERE"
-      run "$PIPE/identify.py" --clusters "$CL" \
-          --meeting "$MEETING" --enroll "${CLUSTER}=${NAME}"
-    else
-      [ "$LOCAL" -eq 1 ] && [ ! -f "$REMOTE/out/${MEETING}_linked_clusters.npz" ] && {
-        echo "no clusters for $MEETING here." >&2
-        echo "Looked for ${RAW}.clusters.npz and ${MEETING}.clusters.npz in $(pwd)" >&2
-        echo "and out/ beside it. Transcribe it first, or name it on the box:" >&2
-        echo "  ./speakers name '$RAW' $CLUSTER '$NAME' --host <box>" >&2
-        exit 2; }
-      run "$PIPE/identify.py" --clusters "$REMOTE/out/${MEETING}_linked_clusters.npz" \
-          --meeting "$MEETING" --enroll "${CLUSTER}=${NAME}"
+    ./speakers link --apply      group the voices across meetings
+    ./speakers review            the groups waiting for a name
+    ./speakers name <group> "Bob Smith"
+EOF
+      exit 2
     fi
+    run "$PIPE/speakers.py" name "$@"
     echo
-    echo "  Re-run transcribe on that meeting to see the name in the transcript,"
-    echo "  or just transcribe the next one — they are recognised from now on."
+    echo "  Backfill every transcript they are already in:  ./speakers apply --apply"
     ;;
   link)
     # Group voices across every meeting on file, and attach any that match
@@ -251,9 +202,9 @@ case "$CMD" in
     run "$PIPE/speakers.py" forget "$1"
     ;;
   -h|--help|help)
-    sed -n '2,11p' "$0"
+    awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"
     ;;
   *)
-    echo "unknown command: $CMD" >&2; sed -n '2,11p' "$0" >&2; exit 2
+    echo "unknown command: $CMD" >&2; awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0" >&2; exit 2
     ;;
 esac

@@ -453,41 +453,20 @@ def build_parser():
                          "sanitised for the trip over ssh; this restores what "
                          "the human actually called the meeting.")
     ap.add_argument("--thr", default="auto")
-    ap.add_argument("--legacy-identify", action="store_true",
-                    dest="legacy_identify",
-                    help="also run identify.py, which re-decides who each "
-                         "cluster is from averaged centroids and OVERWRITES what "
-                         "matching wrote. Kept for comparison: on 300 arguments "
-                         "it put 13.8%% of speech under a wrong name against "
-                         "1.8%%.")
     ap.add_argument("--condition", default=None,
                     help="what makes this batch sound the way it does -- "
                          "'telephone', 'far-field', 'the bad conference room'. "
                          "Anyone recognised in it is stored under that, so one "
                          "person can be known in several circumstances.")
-    # Speaker-identity knobs. These existed on link.py and embed_batched.py but
-    # were never forwarded from here, so the command people actually run had one
-    # reachable tunable (--thr) and the rest were frozen at whatever suited the
-    # data they were fitted on. Defaults are read from the modules that own them
-    # so there is a single definition of each; None means "leave it alone".
+    # Forwarded to the embedder, which reads it on every run. The five link.py
+    # clustering knobs that used to sit here -- --min-core, --refine, --durable,
+    # --guard, --min-cluster-sec -- were forwarded just as faithfully and read
+    # only inside link.py's --legacy-cluster branch, which this file never
+    # passes. They are gone; link.py still takes them for a direct run.
     ap.add_argument("--per-speaker", type=int, default=None,
                     help="segments embedded per speaker per window (default 2). "
                          "0 embeds every segment. This is a per-WINDOW cap, so a "
                          "longer --window silently embeds less of the recording.")
-    ap.add_argument("--min-core", type=float, default=None,
-                    help="speech a (window, local label) needs to join the "
-                         "clustering core (default 2.0)")
-    ap.add_argument("--refine", type=int, default=None,
-                    help="leave-one-out refinement passes (default 3)")
-    ap.add_argument("--durable", type=float, default=None,
-                    help="speech behind a binding 'different people' claim "
-                         "(default 6.0). Low suits close-talking audio, high "
-                         "suits a far-field mic array.")
-    ap.add_argument("--guard", type=int, default=None,
-                    help="window span a cannot-link claim is trusted across "
-                         "(default 10)")
-    ap.add_argument("--min-cluster-sec", type=float, default=None,
-                    help="below this a cluster is absorbed, not kept (default 10)")
     ap.add_argument("--accurate", action="store_true",
                     help="one decode pass per recording instead of 30s windows. "
                          "MOSS's speaker labels stay consistent because the "
@@ -956,19 +935,15 @@ def run_job(a, resident=None):
     broken, broken_names = [], set()
     todo = [(name, f) for name, f in pending if name not in failed]
 
-    # Post-processing runs IN-PROCESS in a worker pool, in three phases, rather
-    # than as three subprocesses per recording. These scripts cost far more to
-    # start than to run, so 120 recordings meant 360 interpreter launches for a
-    # few seconds of actual work -- once the GPU work was pooled, this became the
-    # bottleneck. A worker imports numpy, scipy and sqlite3 once and then handles
-    # many files.
+    # Post-processing runs IN-PROCESS in a worker pool, phase by phase, rather
+    # than as a subprocess per step per recording. These scripts cost far more to
+    # start than to run: back when there were three steps, 120 recordings meant
+    # 360 interpreter launches for a few seconds of actual work -- once the GPU
+    # work was pooled, this became the bottleneck. A worker imports numpy, scipy
+    # and sqlite3 once and then handles many files.
     #
     # Phased rather than per-file end to end, because the steps have a dependency
-    # chain (link writes the npz identify reads, identify writes the names mktxt
-    # reads) and because identify WRITES to speakers.db on every run -- a
-    # decisions row per cluster, not only when enrolling. Running it serially in
-    # the parent keeps sqlite single-writer. It can afford to be serial: its
-    # 0.116s was 0.103s of import, so the work itself is milliseconds.
+    # chain: link writes the names.json mktxt renders.
     #
     # spawn, not fork: this process holds a CUDA context and forking one is
     # unsafe. spawn also gives each worker the clean import we want anyway.
@@ -979,13 +954,6 @@ def run_job(a, resident=None):
                 "--out", str(m.file("transcript", "json")),
                 "--clusters-out", str(m.file("clusters", "npz")),
                 "--names-out", str(m.file("names", "json"))]
-        # Only forward what was actually asked for, so link.py's own defaults
-        # stay the single source of truth for everything else.
-        for flag, val in (("--min-core", a.min_core), ("--refine", a.refine),
-                          ("--durable", a.durable), ("--guard", a.guard),
-                          ("--min-cluster-sec", a.min_cluster_sec)):
-            if val is not None:
-                argv += [flag, str(val)]
         # Hand link.py the store. Without it every recording is a cold start and
         # nobody is ever recognised on the way in -- the flag existed and was
         # never passed, so the matching happened downstream on cluster centroids
@@ -1001,16 +969,6 @@ def run_job(a, resident=None):
         if r:
             argv += ["--roster", r]
         return argv
-
-    def argv_identify(name):
-        m = meetings[name]
-        # --meeting is the ID, not the filename. That is what lets a folder be
-        # renamed, or a meeting re-run with --replace, without orphaning every
-        # decision ever recorded about it.
-        return [f"{PIPE}/identify.py",
-                "--clusters", str(m.file("clusters", "npz")),
-                "--meeting", m.id, "--roster", a.roster,
-                "--names", str(m.file("names", "json"))]
 
     def argv_render(name, f):
         m = meetings[name]
@@ -1047,51 +1005,23 @@ def run_job(a, resident=None):
 
         with phase("cluster"):
             rc_link = run_all([(n, f"{PIPE}/link/link.py", argv_link(n)) for n, _ in todo])
-        # identify in the parent: single sqlite writer, and cheap once imported
-        #
-        # OFF unless asked for. link.py matches every aggregate against the
-        # store and writes the names itself; identify.py then re-decided the
-        # same question from averaged cluster centroids and OVERWROTE that
-        # answer, because mktxt renders names.json and identify wrote it last.
-        # The matching result was computed and discarded on every run -- the
-        # measured difference between the two on 300 arguments is 1.8% of speech
-        # under a wrong name against 13.8%.
-        rc_ident = {}
-        if a.legacy_identify:
-            with phase("identify"):
-                for name, _ in todo:
-                    if rc_link.get(name, (1, ""))[0] == 0:
-                        rc_ident[name] = postproc.run_module(
-                            (name, f"{PIPE}/identify.py",
-                             argv_identify(name)))[1:]
         ready = [(n, f) for n, f in todo if rc_link.get(n, (1, ""))[0] == 0]
         with phase("render"):
             rc_render = run_all([(n, f"{PIPE}/mktxt.py", argv_render(n, f)) for n, f in ready])
-    else:
-        rc_ident = {}
 
     # Replay each recording's diagnostics together and in queue order -- link.py
     # is where CLUSTER, LOW-SEPARATION and FLOOR-VIOLATION are reported, and the
     # troubleshooting docs tell people to read exactly those.
     for name, f in todo:
-        for step, table in (("link", rc_link), ("identify", rc_ident),
-                            ("render", rc_render)):
-            rc, output = table.get(name, (0, ""))
-            if output.strip():
-                print(output.rstrip(), flush=True)
-        # link and render are load-bearing. identify only decorates the result
-        # with names it recognises, and mktxt is explicitly written to run
-        # without it -- so treating an identify failure as fatal would destroy a
-        # transcript that would have rendered fine as "Speaker N".
         bad = None
         for step, table in (("link", rc_link), ("render", rc_render)):
-            rc = table.get(name, (1, ""))[0]
-            if rc != 0:
+            # A step missing from the table never ran, which is a failure with
+            # nothing to print: link failing keeps the recording out of `ready`.
+            rc, output = table.get(name, (1, ""))
+            if output.strip():
+                print(output.rstrip(), flush=True)
+            if rc != 0 and bad is None:
                 bad = f"{name} ({step} exited {rc})"
-                break
-        if rc_ident.get(name, (0, ""))[0] != 0:
-            print(f"  !! identify failed for {name} — speakers stay numbered",
-                  flush=True)
         if bad is None:
             # Every step claimed success; confirm it actually left the artifacts
             # behind, since a step can exit 0 and still write nothing.

@@ -19,8 +19,8 @@ Pipeline
      are attached to the nearest global centroid.
   5. write the run back out with a `global` field per segment, plus a
      <out>_clusters.npz holding one centroid per speaker -- that file is what
-     identify.py matches against the profile store, and it is 17 KB, so it
-     travels back from a GPU box while the audio does not.
+     ./speakers link groups across meetings, and it is 17 KB, so it travels
+     back from a GPU box while the audio does not.
 
 Prints FLOOR-VIOLATION when the speaker count comes out below the number MOSS
 heard talking inside a single window. That contradiction sat in our own data
@@ -156,7 +156,15 @@ def cluster(A, secs, thr_cos, min_core, refine_iters):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    # The clustering-knob note goes in the epilog, not only on --min-core's help
+    # string, because argparse prints the epilog whatever a reader is looking up.
+    ap = argparse.ArgumentParser(
+        epilog="--min-core, --refine, --durable, --guard and --min-cluster-sec "
+               "are read only under --legacy-cluster and --sweep. ./transcribe "
+               "and batch.py forwarded them until they were removed from both, "
+               "which made a value that changed nothing appear in the AGG and "
+               "CLUSTER lines as though it had been honoured. Run link.py "
+               "directly to use them.")
     ap.add_argument("--run", required=True)
     ap.add_argument("--npz", required=True)
     ap.add_argument("--ref", default=None)
@@ -168,9 +176,16 @@ def main():
     ap.add_argument("--thr", default="auto",
                     help="cosine cut, or 'auto' to self-calibrate per meeting "
                          "(constrained AHC + max merge-gap; see cluster_speakers.py)")
+    # The five clustering knobs. ./transcribe and batch.py used to forward all
+    # of them and no longer do: cluster_speakers.cluster() is the only reader,
+    # and it runs only under --legacy-cluster, so forwarding them meant a value
+    # that appeared in the AGG and CLUSTER lines and changed nothing. They stay
+    # here because a direct `link.py --legacy-cluster` is where the comparison
+    # arm and the bench sweeps are run from, and that is what they are for.
     ap.add_argument("--min-core", type=float, default=2.0,
                     help="speech a (window, local label) needs before it joins "
-                         "the clustering core")
+                         "the clustering core. --legacy-cluster / --sweep only "
+                         "-- see the note at the end of this help")
     ap.add_argument("--refine", type=int, default=3)
     # Defaults come FROM cluster_speakers, so each has one definition and the
     # flag cannot drift away from the value the library uses when unset.
@@ -193,8 +208,8 @@ def main():
     ap.add_argument("--names-out", default=None, dest="names_out",
                     help="where to write {cluster: name} for mktxt. Matching "
                          "already decided who each cluster is; without this the "
-                         "answer is computed and thrown away, and the transcript "
-                         "renders whatever identify.py wrote instead.")
+                         "answer is computed and thrown away and the transcript "
+                         "renders everyone as Speaker N.")
     ap.add_argument("--roster", default="",
                     help="comma-separated names who could be in THIS recording. "
                          "Everyone else in the store is an impostor trial that "

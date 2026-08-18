@@ -1,4 +1,4 @@
-"""Run the after-the-GPU steps: link, identify, render.
+"""Run the after-the-GPU steps: link, render.
 
 This module exists to be CHEAP TO IMPORT, and that is its whole reason for
 being here rather than in batch.py.
@@ -38,9 +38,8 @@ def run_module(spec):
     in the parent, and it pays each import once and then handles many recordings
     -- the point of the exercise, since these scripts cost far more to start than
     to run. Measured per recording: link.py 0.13s of which ~0.10 is importing
-    numpy, identify.py 0.116s against 0.103s to import numpy and sqlite3,
-    mktxt.py 0.036s against 0.034s for a bare interpreter. Launching them three
-    times per file was almost entirely launch.
+    numpy, mktxt.py 0.036s against 0.034s for a bare interpreter. Launching them
+    per file was almost entirely launch.
 
     runpy rather than importing and calling main(), because mktxt.py has no
     main() -- it is top-level script code reading sys.argv. Re-executing a module

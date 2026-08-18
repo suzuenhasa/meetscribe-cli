@@ -4,7 +4,7 @@
 
 Speakers are numbered by how much they spoke, so Speaker 1 is the person who
 talked most -- the cluster IDs (G00, G07) are arbitrary and mean nothing to a
-reader. If names.json is given, anyone identify.py recognised gets their real
+reader. If names.json is given, anyone link.py recognised gets their real
 name and the rest keep their number.
 
 Consecutive segments from one speaker are printed under a single heading; a new
@@ -14,8 +14,9 @@ import json, sys
 from collections import defaultdict
 
 linked, raw, out_path, title = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-# optional 5th arg: {cluster: "Real Name"} from identify.py. Clusters it does not
-# name keep their positional label, so no store means the old behaviour exactly.
+# optional 5th arg: {cluster: "Real Name"} from link.py --names-out. Clusters it
+# does not name keep their positional label, so no store means the old behaviour
+# exactly.
 named = {}
 if len(sys.argv) > 5 and sys.argv[5]:
     try:
