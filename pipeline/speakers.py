@@ -26,7 +26,7 @@ Design follows what was measured, not intuition:
 * ROSTER FIRST. Acceptance is a max over N candidates, so false-accept risk
   grows with gallery size. Scoring 3 known attendees is far safer than 500.
 """
-import argparse, json, os, sqlite3, time
+import argparse, json, os, re, sqlite3, time
 
 import numpy as np
 
@@ -641,12 +641,101 @@ def cmd_link(a):
               f"their sub-profiles")
 
 
+
+def _fold(name):
+    """Case, punctuation and spacing removed -- what two spellings share."""
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+def _edits(a, b, cap=2):
+    """Levenshtein distance, abandoned once it exceeds `cap`. -> int"""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        if min(cur) > cap:
+            return cap + 1
+        prev = cur
+    return prev[-1]
+
+
+def near_names(conn, name, cap=2):
+    """Existing speakers whose name is a plausible misspelling of `name`.
+
+    The name string IS the identity here: `INSERT OR IGNORE INTO speakers(name)`
+    makes any distinct spelling a distinct person, silently, with that person's
+    voice evidence split across both. Nothing downstream can detect it, and it
+    gets worse every time either spelling is used again.
+
+    -> [(existing_name, why)] worst first. An exact match after folding away case
+    and punctuation is near-certain; an edit or two is worth a question.
+    """
+    rows = [r[0] for r in conn.execute("SELECT name FROM speakers WHERE name IS"
+                                       " NOT NULL")]
+    if name in rows:
+        return []
+    f = _fold(name)
+    out = []
+    for other in rows:
+        g = _fold(other)
+        if not g or not f:
+            continue
+        if g == f:
+            out.append((other, "same name, different spacing or punctuation"))
+        else:
+            d = _edits(f, g, cap)
+            if d <= cap:
+                out.append((other, f"{d} character{'s' if d != 1 else ''} apart"))
+    out.sort(key=lambda x: ("same name" not in x[1], x[0]))
+    return out
+
+
 def cmd_name(a):
     """Name a group -- and with it every meeting the group already spans."""
     conn = db()
-    conn.execute("INSERT OR IGNORE INTO speakers(name, created_at) VALUES(?,?)",
-                 (a.name, time.time()))
-    sid = conn.execute("SELECT id FROM speakers WHERE name=?", (a.name,)).fetchone()[0]
+    if a.speaker_id is not None:
+        # The id IS the identity. migrate_ids.py already made this argument for
+        # meetings -- the filename used to be the key, so renaming a recording
+        # orphaned every decision about it. `name TEXT UNIQUE` plus a lookup by
+        # `WHERE name=?` puts speakers in exactly that position: two spellings
+        # are two people, and the split is undetectable downstream.
+        row = conn.execute("SELECT id, name FROM speakers WHERE id=?",
+                           (a.speaker_id,)).fetchone()
+        if not row:
+            raise SystemExit(f"no speaker with id {a.speaker_id} -- see `list`")
+        sid, a.name = row[0], row[1]
+    elif not a.name:
+        raise SystemExit("give a name to create a new person, or --speaker <id> "
+                         "to attach this voice to one already in the store")
+    else:
+        sid = None
+    close = near_names(conn, a.name) if sid is None else []
+    if close and not a.new:
+        print(f"\"{a.name}\" is not in the store, but these are:")
+        for other, why in close[:5]:
+            n = conn.execute(
+                "SELECT COUNT(DISTINCT c.meeting) FROM clusters c JOIN groups g"
+                " ON g.id = c.group_id JOIN speakers s ON s.id = g.speaker_id"
+                " WHERE s.name = ?", (other,)).fetchone()[0]
+            oid = conn.execute("SELECT id FROM speakers WHERE name=?",
+                               (other,)).fetchone()[0]
+            print(f"   #{oid:<4} {other!r:34} {why}, in {n} meeting"
+                  f"{'s' if n != 1 else ''}")
+        raise SystemExit(
+            "\nNaming creates a SECOND person and splits their voice between the\n"
+            "two spellings, which nothing downstream can detect. Attach to the\n"
+            f"existing one by id:   speakers.py name {a.group_id} --speaker "
+            f"{conn.execute('SELECT id FROM speakers WHERE name=?', (close[0][0],)).fetchone()[0]}\n"
+            "or pass --new if they really are someone else.")
+    if sid is None:
+        conn.execute("INSERT OR IGNORE INTO speakers(name, created_at) VALUES(?,?)",
+                     (a.name, time.time()))
+        sid = conn.execute("SELECT id FROM speakers WHERE name=?",
+                           (a.name,)).fetchone()[0]
     conn.execute("UPDATE groups SET speaker_id=? WHERE id=?", (sid, a.group_id))
     members = conn.execute(
         "SELECT meeting, cluster, seconds FROM clusters WHERE group_id=?"
@@ -769,7 +858,9 @@ def cmd_review(a):
             clip = hit[0] if hit else None
         if clip:
             print(f"      listen: {clip}")
-        print(f"      name it: speakers.py name {gid} \"Their Name\"")
+        print(f"      name it:  speakers.py name {gid} \"Their Name\"")
+        print(f"      or attach: speakers.py name {gid} --speaker <id>   "
+              f"(see `list`)")
         print()
 
     if len(rows) > a.limit:
@@ -847,6 +938,9 @@ def main():
     lk.set_defaults(fn=cmd_link)
 
     nm = sub.add_parser("name", help="name a group, and every meeting it spans")
+    nm.add_argument("--new", action="store_true",
+                    help="this really is a different person, even though the "
+                         "name is close to one already in the store")
     nm.add_argument("--condition", default=None,
                     help="what made this recording sound the way it does -- "
                          "'telephone', 'far-field', '2015', 'headset', anything. "
@@ -854,7 +948,15 @@ def main():
                          "ADDS a sub-profile instead of replacing: one averaged "
                          "voiceprint cannot span a change of microphone, and "
                          "pretending it can names the wrong human.")
-    nm.add_argument("group_id", type=int); nm.add_argument("name")
+    nm.add_argument("group_id", type=int)
+    nm.add_argument("name", nargs="?", default=None,
+                    help="a name, to create a NEW person. To attach this voice "
+                         "to someone already in the store, pass --speaker with "
+                         "their id instead: the id is the identity, the name is "
+                         "only a label on it.")
+    nm.add_argument("--speaker", type=int, default=None, dest="speaker_id",
+                    help="id of an existing speaker (see `list`). Preferred over "
+                         "re-typing a name, which is how one person becomes two.")
     nm.set_defaults(fn=cmd_name)
 
     sub.add_parser("groups").set_defaults(fn=cmd_groups)

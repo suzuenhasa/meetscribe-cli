@@ -170,3 +170,42 @@ class TestLabelMeeting:
         lab, name_of, info = ms.label_meeting(keys, A, [10.0], b)
         assert name_of[int(lab[0])] == "ada"
         assert info["named_share"] == pytest.approx(1.0)
+
+
+class TestNameGuard:
+    """A misspelling creates a second person and splits their voice in half.
+
+    The name string is the identity: INSERT OR IGNORE on `name` makes any
+    distinct spelling a distinct speaker, silently, and every later use of
+    either spelling makes it worse. Nothing downstream can detect it.
+    """
+
+    def _conn(self, tmp_path):
+        import sqlite3
+        import speakers as SPK
+        c = SPK.db(str(tmp_path / "s.db"))
+        c.execute("INSERT INTO speakers(name, created_at) VALUES('Sonia "
+                  "Sotomayor', 0)")
+        c.commit()
+        return c
+
+    def test_a_one_character_slip_is_caught(self, tmp_path):
+        import speakers as SPK
+        near = SPK.near_names(self._conn(tmp_path), "Sonia Sotomayer")
+        assert near and near[0][0] == "Sonia Sotomayor"
+
+    def test_spacing_and_punctuation_are_the_same_name(self, tmp_path):
+        import speakers as SPK
+        conn = self._conn(tmp_path)
+        for variant in ("sonia sotomayor", "Sonia  Sotomayor", "Sonia-Sotomayor"):
+            near = SPK.near_names(conn, variant)
+            assert near, variant
+            assert "spacing" in near[0][1]
+
+    def test_a_genuinely_different_person_passes(self, tmp_path):
+        import speakers as SPK
+        assert SPK.near_names(self._conn(tmp_path), "Elena Kagan") == []
+
+    def test_the_exact_existing_name_is_not_flagged(self, tmp_path):
+        import speakers as SPK
+        assert SPK.near_names(self._conn(tmp_path), "Sonia Sotomayor") == []
