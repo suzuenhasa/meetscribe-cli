@@ -251,7 +251,30 @@ def main():
     # remembers to re-link.
     try:
         n = SPK.index_clusters(conn)
-        print(f"re-indexed {n} clusters so the store matches the transcripts.")
+        # Re-indexing correctly clears group_id wherever the vector changed --
+        # an identity must follow the voice, not the label. But matching just
+        # decided who each of these clusters IS, and throwing that away leaves
+        # named people with no clusters at all: `review` then reports nothing
+        # waiting while `profiles` shows sub-profiles backed by no recordings.
+        # Write the decision down instead.
+        back = 0
+        for m in ms:
+            after = json.loads(m.file("names", "json").read_text() or "{}") \
+                if m.file("names", "json").exists() else {}
+            for cluster, who in after.items():
+                row = conn.execute(
+                    "SELECT g.id FROM groups g JOIN speakers s ON s.id ="
+                    " g.speaker_id WHERE s.name=? AND g.embed_model=?",
+                    (who, SPK.EMBED_MODEL)).fetchone()
+                if not row:
+                    continue
+                back += conn.execute(
+                    "UPDATE clusters SET group_id=? WHERE meeting=? AND"
+                    " cluster=? AND embed_model=? AND group_id IS NULL",
+                    (row[0], m.id, cluster, SPK.EMBED_MODEL)).rowcount
+        conn.commit()
+        print(f"re-indexed {n} clusters, {back} re-attached to the person "
+              f"matching named them.")
     except Exception as e:
         print(f"  !! could not re-index the store: {e}")
         print("     run `speakers.py link --apply` before naming anyone.")

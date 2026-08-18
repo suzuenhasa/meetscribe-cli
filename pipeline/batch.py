@@ -442,6 +442,13 @@ def build_parser():
                          "sanitised for the trip over ssh; this restores what "
                          "the human actually called the meeting.")
     ap.add_argument("--thr", default="auto")
+    ap.add_argument("--legacy-identify", action="store_true",
+                    dest="legacy_identify",
+                    help="also run identify.py, which re-decides who each "
+                         "cluster is from averaged centroids and OVERWRITES what "
+                         "matching wrote. Kept for comparison: on 300 arguments "
+                         "it put 13.8%% of speech under a wrong name against "
+                         "1.8%%.")
     ap.add_argument("--condition", default=None,
                     help="what makes this batch sound the way it does -- "
                          "'telephone', 'far-field', 'the bad conference room'. "
@@ -947,7 +954,8 @@ def run_job(a, resident=None):
         argv = [f"{PIPE}/link/link.py", "--run", str(m.file("raw", "json")),
                 "--npz", str(m.file("embeddings", "npz")), "--thr", a.thr,
                 "--out", str(m.file("transcript", "json")),
-                "--clusters-out", str(m.file("clusters", "npz"))]
+                "--clusters-out", str(m.file("clusters", "npz")),
+                "--names-out", str(m.file("names", "json"))]
         # Only forward what was actually asked for, so link.py's own defaults
         # stay the single source of truth for everything else.
         for flag, val in (("--min-core", a.min_core), ("--refine", a.refine),
@@ -1014,11 +1022,22 @@ def run_job(a, resident=None):
         with phase("cluster"):
             rc_link = run_all([(n, f"{PIPE}/link/link.py", argv_link(n)) for n, _ in todo])
         # identify in the parent: single sqlite writer, and cheap once imported
+        #
+        # OFF unless asked for. link.py matches every aggregate against the
+        # store and writes the names itself; identify.py then re-decided the
+        # same question from averaged cluster centroids and OVERWROTE that
+        # answer, because mktxt renders names.json and identify wrote it last.
+        # The matching result was computed and discarded on every run -- the
+        # measured difference between the two on 300 arguments is 1.8% of speech
+        # under a wrong name against 13.8%.
         rc_ident = {}
-        with phase("identify"):
-            for name, _ in todo:
-                if rc_link.get(name, (1, ""))[0] == 0:
-                    rc_ident[name] = postproc.run_module((name, f"{PIPE}/identify.py", argv_identify(name)))[1:]
+        if a.legacy_identify:
+            with phase("identify"):
+                for name, _ in todo:
+                    if rc_link.get(name, (1, ""))[0] == 0:
+                        rc_ident[name] = postproc.run_module(
+                            (name, f"{PIPE}/identify.py",
+                             argv_identify(name)))[1:]
         ready = [(n, f) for n, f in todo if rc_link.get(n, (1, ""))[0] == 0]
         with phase("render"):
             rc_render = run_all([(n, f"{PIPE}/mktxt.py", argv_render(n, f)) for n, f in ready])

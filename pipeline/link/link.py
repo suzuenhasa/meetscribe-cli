@@ -190,6 +190,11 @@ def main():
                          "is a reference, so identity carries across recordings "
                          "without a separate linking pass. Absent, this meeting "
                          "is a cold start and its identities are provisional.")
+    ap.add_argument("--names-out", default=None, dest="names_out",
+                    help="where to write {cluster: name} for mktxt. Matching "
+                         "already decided who each cluster is; without this the "
+                         "answer is computed and thrown away, and the transcript "
+                         "renders whatever identify.py wrote instead.")
     ap.add_argument("--roster", default="",
                     help="comma-separated names who could be in THIS recording. "
                          "Everyone else in the store is an impostor trial that "
@@ -320,6 +325,16 @@ def main():
         # consumer reading this file should not have to re-derive who someone is.
         if g >= 0 and g in name_of:
             s["speaker_name"] = name_of[g]
+    if args.names_out:
+        # Keyed the way the transcript is, "G00", not the bare label. name_of
+        # comes back keyed by integer and json turns those into "0", which mktxt
+        # looks up as "G00" and misses -- so every name was written and none
+        # rendered, while the log line above said 13 named because it formats
+        # the keys for display.
+        with open(args.names_out, "w") as _fh:
+            json.dump({f"G{c:02d}": n for c, n in sorted(name_of.items())},
+                      _fh, indent=1)
+        print(f"WROTE {args.names_out} ({len(name_of)} named)")
     if args.out:
         with open(args.out, "w") as _fh:
             json.dump(R, _fh)
