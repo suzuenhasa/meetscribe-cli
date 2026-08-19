@@ -176,6 +176,9 @@ def library_dir(work=None):
                 Path(__file__).resolve().parent.parent) / "library"
 
 
+_TAKEN = {}          # library path -> ids already minted; see create()
+
+
 def create(title, source_name, lib=None, mid=None):
     """Make a new meeting directory. -> Meeting
 
@@ -189,13 +192,29 @@ def create(title, source_name, lib=None, mid=None):
     # paths and the old check waved both through -- while speakers.db keyed on
     # `abcde` for both and find() returned whichever it met first. The one thing
     # the id has to be is unique, and that was the one thing not being tested.
-    taken = {m.id for m in all_meetings(lib)}
+    # Scanned ONCE per process, not once per meeting. Reading every meeting.json
+    # to collect the ids is correct -- the id lives in the file so renaming a
+    # folder cannot detach it -- and doing that inside create() makes minting the
+    # Nth id cost N file reads. Transcribing LibriSpeech, 2,620 recordings, that
+    # is 3.4 million reads and the run visibly decelerates: 78s for the first 400
+    # and 129s for the sixth 400, all of it bookkeeping rather than decode.
+    #
+    # The cache is per library path and this process adds to it as it creates, so
+    # a batch stays correct against its own work. Another process creating
+    # concurrently is the case it cannot see -- and could not before either, since
+    # the old scan happened before the mkdir rather than atomically with it. The
+    # mkdir below is what actually enforces uniqueness on disk.
+    key = str(Path(lib).resolve())
+    taken = _TAKEN.get(key)
+    if taken is None:
+        taken = _TAKEN[key] = {m.id for m in all_meetings(lib)}
     mid = mid or new_id()
     while mid in taken or (lib / folder_name(title, mid)).exists():
         mid = new_id()
     m = Meeting(lib / folder_name(title, mid))
     m.path.mkdir(parents=True)
     m.write(id=mid, title=str(title), source=str(source_name))
+    taken.add(mid)
     return m
 
 

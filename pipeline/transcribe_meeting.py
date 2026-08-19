@@ -7,6 +7,13 @@ from collections import namedtuple
 
 import numpy as np
 from vllm import LLM, SamplingParams
+
+try:
+    # vLLM >= 0.27. Absent on older builds and in the test stub, and only used
+    # when MS_GUIDED asks for constrained decoding, so its absence is not fatal.
+    from vllm.sampling_params import StructuredOutputsParams
+except ImportError:                                   # pragma: no cover
+    StructuredOutputsParams = None
 from transformers import AutoProcessor
 from moss_transcribe_diarize import parse_transcript
 from moss_transcribe_diarize.inference_utils import DEFAULT_PROMPT, load_audio_item
@@ -96,7 +103,11 @@ def build_prompt(glossary=""):
     vocabulary has to reach the decoder.
     """
     proc = _processor()
-    prompt = DEFAULT_PROMPT
+    # The upstream default is Chinese (inference_utils.py:13) and is used
+    # unmodified on English audio. MS_PROMPT overrides it so the two can be
+    # compared rather than argued about: the model was probably trained with the
+    # Chinese one, so an English prompt may be off-distribution and worse.
+    prompt = os.environ.get("MS_PROMPT") or DEFAULT_PROMPT
     terms = [t.strip() for t in (glossary or "").split(",") if t.strip()]
     if terms:
         prompt += ("\n专有名词表（音频中若出现这些名称，请使用以下拼写）/ "
@@ -411,7 +422,7 @@ _TS_RE = re.compile(r"\d+(?:\.\d+)?")
 _SPK_RE = re.compile(r"S\d+")
 
 
-def repair_speaker_tags(text):
+def repair_speaker_tags(text, default="S01"):
     """Give a segment whose speaker tag the model omitted the previous speaker.
 
     MOSS emits `[start][S01] words[end]`, but it sometimes drops the `[S01]` on a
@@ -437,7 +448,18 @@ def repair_speaker_tags(text):
         i = m.end()
         if _SPK_RE.fullmatch(tok):
             last = tok
-        elif _TS_RE.fullmatch(tok) and last:
+        elif _TS_RE.fullmatch(tok):
+            # `or default` rather than `and last`. Reusing the last tag seen
+            # covers a tag the model forgot; it cannot cover a window where MOSS
+            # emitted NO tag at all, and that happens -- 20 windows of clean read
+            # English in LibriSpeech came back with timestamps, text, and no tag
+            # anywhere. With nothing to reuse, the parser discarded the whole
+            # window: 10 minutes of audio gone, surfaced only as "NO SPEECH
+            # FOUND", worth 2.6 points of that benchmark. A window credited to
+            # one speaker when it held two is a diarization error; a window
+            # thrown away is a transcription error, and the words are the part
+            # that cannot be recovered afterwards.
+            last = last or default
             # a timestamp followed by TEXT rather than by a tag is a segment
             # start; followed by "[" it is a segment end and correct as is
             rest = text[m.end():].lstrip()
@@ -576,7 +598,17 @@ def assemble(outs, offsets, cores, wav, dur, no_silence_gate=False):
         lo, hi = core
         _fixed, _added = repair_speaker_tags(o.outputs[0].text)
         retagged += _added
-        for s in parse_transcript(_fixed):
+        _got = parse_transcript(_fixed)
+        if not _got and o.outputs[0].text.strip():
+            # The model said something and the parser kept none of it. That is a
+            # different failure from silence and used to look identical: both
+            # surfaced as "NO SPEECH FOUND" with the audio discarded. Print what
+            # it actually emitted -- on LibriSpeech this is the only way to tell
+            # a malformed tag from a genuinely empty generation.
+            _raw = o.outputs[0].text.strip().replace("\n", " ")[:900]
+            print(f"WINDOW {wi} PARSED TO NOTHING from {len(o.outputs[0].text)} "
+                  f"chars: {_raw!r}", flush=True)
+        for s in _got:
             # A segment decoded inside the context padding belongs to the neighbouring
             # window, which owns it as core. Keeping both would duplicate the speech.
             rec = {

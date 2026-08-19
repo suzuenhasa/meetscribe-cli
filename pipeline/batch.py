@@ -240,6 +240,12 @@ POST_POOL_MIN = int(os.environ.get("MS_POST_POOL_MIN", "4"))
 # 32 parts 25.5s -- the same plateau at 8 the across-files pool has, which is why
 # both stop there. Below SPLIT_MIN_S there is nothing to win and a seek to get
 # wrong, so short files take the plain path.
+# Temperatures to retry a window that parsed to nothing. Ascending, stopping as
+# soon as one parses: the first nudge usually suffices and a higher temperature
+# is a worse transcript, so it is a last resort rather than a default.
+RETRY_TEMPS = [float(t) for t in
+               os.environ.get("MS_RETRY_TEMPS", "0.01,0.2,0.7").split(",") if t]
+
 SPLIT_MIN_S = float(os.environ.get("MS_SPLIT_MIN_S", "1200"))    # 20 minutes
 SPLIT_TARGET_S = float(os.environ.get("MS_SPLIT_TARGET_S", "600"))  # ~10 min a part
 SPLIT_MAX_PARTS = int(os.environ.get("MS_SPLIT_MAX_PARTS", "8"))
@@ -678,7 +684,25 @@ def run_job(a, resident=None):
 
     pending, unreadable, empty, queued = [], [], [], []
     short = []          # transcribed, but the model stopped before the speech did
-    sampling = TM.SamplingParams(temperature=0.0,
+    # MOSS's output format -- [start][Sxx]text[end], repeated -- is PLAIN TEXT.
+    # Neither the timestamps nor the speaker tags are tokens in the vocabulary:
+    # "[S01]" tokenises as ['[S','0','1',']'] and "[0.00]" as six characters.
+    # Nothing in the model requires them, so the decoder is free to open a
+    # bracket and sample whatever comes next -- measured on LibriSpeech, 19 of
+    # 785 windows produced perfect English prose with no timestamps at all, some
+    # opening with a hallucinated Chinese token where the timestamp belongs. The
+    # parser is a state machine and discards those windows entirely.
+    #
+    # Constraining the sampler to the grammar makes that unrepresentable rather
+    # than unlikely. Off by default until its cost is measured on real meetings;
+    # a mask over 151k logits per token is not free.
+    _grammar = None
+    if os.environ.get("MS_GUIDED"):
+        if TM.StructuredOutputsParams is None:
+            raise SystemExit("MS_GUIDED needs vLLM >= 0.27 for structured outputs")
+        _grammar = TM.StructuredOutputsParams(
+            regex=r"(\[\d+(\.\d+)?\]\[S\d+\][^\[]*\[\d+(\.\d+)?\]\s*)+")
+    sampling = TM.SamplingParams(structured_outputs=_grammar, temperature=0.0,
                                  max_tokens=int((a.window + 2 * a.overlap)
                                                 * TM.OUT_TOK_S))
 
@@ -788,6 +812,41 @@ def run_job(a, resident=None):
             return
         with phase("decode"):
             outs = llm.generate([r for _, _, r in pool], sampling)
+
+            # Retry the windows whose output parses to NOTHING, at a rising
+            # temperature. Not a quality knob -- a way out of one specific
+            # failure. At temperature 0 decoding is deterministic, so a window
+            # where the model abandons the output format and returns bare prose
+            # returns exactly the same bare prose however many times it is asked.
+            #
+            # Measured on LibriSpeech: 19 of 785 windows of clean read English
+            # came back as perfect transcription with no timestamps and no
+            # speaker tags at all, sometimes opening with a hallucinated Chinese
+            # token where the timestamp belongs. The parser is a state machine
+            # and discards the whole window, so the audio is lost and reported
+            # only as "NO SPEECH FOUND". A nudge off greedy decoding is the
+            # cheapest thing that can change the answer.
+            #
+            # The prompt is NOT the lever, though it looks like it: the upstream
+            # default is Chinese and this is English audio, but swapping it for
+            # an English one took the failures from 19 to 341. The model is
+            # trained on that prompt.
+            for temp in RETRY_TEMPS:
+                bad = [k for k, o in enumerate(outs)
+                       if o.outputs[0].text.strip()
+                       and not TM.parse_transcript(
+                           TM.repair_speaker_tags(o.outputs[0].text)[0])]
+                if not bad:
+                    break
+                print(f"  {len(bad)} window(s) parsed to nothing; retrying at "
+                      f"temperature {temp}", flush=True)
+                again = llm.generate([pool[k][2] for k in bad],
+                                     TM.SamplingParams(temperature=temp,
+                                                       max_tokens=sampling.max_tokens))
+                for k, o2 in zip(bad, again):
+                    if TM.parse_transcript(
+                            TM.repair_speaker_tags(o2.outputs[0].text)[0]):
+                        outs[k] = o2
         for (name, wi, _), o in zip(pool, outs):
             inflight[name]["outs"][wi] = o
         pool.clear()
