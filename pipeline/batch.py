@@ -700,8 +700,13 @@ def run_job(a, resident=None):
     if os.environ.get("MS_GUIDED"):
         if TM.StructuredOutputsParams is None:
             raise SystemExit("MS_GUIDED needs vLLM >= 0.27 for structured outputs")
+        # \d\d, not \d+: the tag is ALWAYS two digits. The tokenizer splits numbers
+        # one character at a time (pre_tokenizer Split on bare \p{N}), so S01-S09
+        # carry a mandatory leading zero and the units digit is the whole speaker
+        # choice. \d+ would let the grammar emit [S1] or [S001], which decodes fine
+        # but breaks any locator that reads the digit at a fixed offset from "[S".
         _grammar = TM.StructuredOutputsParams(
-            regex=r"(\[\d+(\.\d+)?\]\[S\d+\][^\[]*\[\d+(\.\d+)?\]\s*)+")
+            regex=r"(\[\d+(\.\d+)?\]\[S\d\d\][^\[]*\[\d+(\.\d+)?\]\s*)+")
     sampling = TM.SamplingParams(structured_outputs=_grammar, temperature=0.0,
                                  max_tokens=int((a.window + 2 * a.overlap)
                                                 * TM.OUT_TOK_S))
